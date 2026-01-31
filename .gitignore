@@ -1,6 +1,6 @@
 # Binaries
-race-monitor
-race-monitor-*
+./race-monitor
+./race-monitor-*
 *.exe
 
 # Test artifacts

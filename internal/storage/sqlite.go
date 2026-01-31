@@ -187,7 +187,7 @@ func (s *Store) InsertPeerSamples(ctx context.Context, samples []PeerSample) err
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO peer_samples (race_id, ts, peer_ip, peer_client, upload_rate, progress, uploaded)

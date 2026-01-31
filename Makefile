@@ -8,8 +8,8 @@ build:
 	go build -o $(BINARY) ./cmd/race-monitor
 
 install: build
-	mkdir -p $(INSTALL_PATH)
-	cp $(BINARY) $(INSTALL_PATH)/
+	install -d $(INSTALL_PATH)
+	install $(BINARY) $(INSTALL_PATH)/
 
 clean:
 	rm -f $(BINARY) $(COVERAGE_FILE)

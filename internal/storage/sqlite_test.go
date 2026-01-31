@@ -239,9 +239,9 @@ func TestListRecentRaces(t *testing.T) {
 	})
 
 	t.Run("returns races within period", func(t *testing.T) {
-		store.CreateRace(ctx, "hash1", "Torrent1", 100)
-		store.CreateRace(ctx, "hash2", "Torrent2", 200)
-		store.CreateRace(ctx, "hash3", "Torrent3", 300)
+		_, _ = store.CreateRace(ctx, "hash1", "Torrent1", 100)
+		_, _ = store.CreateRace(ctx, "hash2", "Torrent2", 200)
+		_, _ = store.CreateRace(ctx, "hash3", "Torrent3", 300)
 
 		races, err := store.ListRecentRaces(ctx, 7)
 		if err != nil {
@@ -284,7 +284,7 @@ func TestGetRaceSamples(t *testing.T) {
 			SeedCount:    2 + i,
 			MyRank:       5 - i,
 		}
-		store.InsertSample(ctx, sample)
+		_ = store.InsertSample(ctx, sample)
 	}
 
 	t.Run("returns samples in timestamp order", func(t *testing.T) {
@@ -376,10 +376,10 @@ func TestGetRaceStats(t *testing.T) {
 			SeedCount:    5,
 			MyRank:       s.rank,
 		}
-		store.InsertSample(ctx, sample)
+		_ = store.InsertSample(ctx, sample)
 	}
 
-	store.CompleteRace(ctx, raceID, 4)
+	_ = store.CompleteRace(ctx, raceID, 4)
 
 	t.Run("calculates correct stats", func(t *testing.T) {
 		stats, err := store.GetRaceStats(ctx, raceID)
