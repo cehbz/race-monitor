@@ -1,3 +1,5 @@
+github.com/BurntSushi/toml v1.6.0 h1:dRaEfpa2VI55EwlIW72hMRHdWouJeRF7TPYhI+AUQjk=
+github.com/BurntSushi/toml v1.6.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/cehbz/qbittorrent v1.8.0 h1:YG4O58uuHW7AJXq99BvT82z92rSl9Qfh2MAOR7TGNks=
 github.com/cehbz/qbittorrent v1.8.0/go.mod h1:ofBrlY/jYoioqZ41mrm/DES/i7TZgsG1PHoXUOjyz4c=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

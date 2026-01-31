@@ -17,6 +17,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/BurntSushi/toml"
+
 	"github.com/cehbz/qbittorrent"
 	"github.com/cehbz/race-monitor/internal/recorder"
 	"github.com/cehbz/race-monitor/internal/storage"
@@ -78,21 +80,34 @@ qBittorrent setup:
     race-monitor record %I`)
 }
 
+// Config holds the configuration for race-monitor.
+type Config struct {
+	QbtURL  string `toml:"qbt_url"`
+	QbtUser string `toml:"qbt_user"`
+	QbtPass string `toml:"qbt_pass"`
+	RaceDB  string `toml:"race_db"`
+}
+
+// getConfig reads configuration from $HOME/.config/race-monitor/config.toml.
+// It falls back to sensible defaults if fields are missing.
 func getConfig() (url, user, pass, dbPath string) {
-	url = os.Getenv("QBT_URL")
-	if url == "" {
-		url = "http://127.0.0.1:8080"
+	home, _ := os.UserHomeDir()
+	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
+	var cfg Config
+
+	// Set defaults
+	cfg.QbtURL = "http://127.0.0.1:8080"
+	cfg.RaceDB = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
+
+	// Parse the config file if it exists
+	if _, err := os.Stat(configPath); err == nil {
+		_, _ = toml.DecodeFile(configPath, &cfg)
 	}
 
-	user = os.Getenv("QBT_USER")
-	pass = os.Getenv("QBT_PASS")
-
-	dbPath = os.Getenv("RACE_DB")
-	if dbPath == "" {
-		home, _ := os.UserHomeDir()
-		dbPath = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
-	}
-
+	url = cfg.QbtURL
+	user = cfg.QbtUser
+	pass = cfg.QbtPass
+	dbPath = cfg.RaceDB
 	return
 }
 
@@ -130,10 +145,6 @@ func runRecord(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
 	url, user, pass, dbPath := getConfig()
-
-	if user == "" || pass == "" {
-		return errors.New("QBT_USER and QBT_PASS must be set")
-	}
 
 	// Ensure DB directory exists
 	if err := ensureDBDir(dbPath); err != nil {
