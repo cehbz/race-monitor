@@ -100,24 +100,6 @@ func New(dbPath string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
-	// Check if we need to migrate from old schema
-	var hasOldPeerSamples bool
-	err := s.db.QueryRow(`
-		SELECT COUNT(*) > 0 FROM sqlite_master
-		WHERE type='table' AND name='peer_samples'
-		AND sql LIKE '%peer_ip%'
-	`).Scan(&hasOldPeerSamples)
-	if err != nil {
-		return fmt.Errorf("checking schema version: %w", err)
-	}
-
-	if hasOldPeerSamples {
-		// Drop old peer_samples table - data loss is acceptable
-		if _, err := s.db.Exec("DROP TABLE IF EXISTS peer_samples"); err != nil {
-			return fmt.Errorf("dropping old peer_samples: %w", err)
-		}
-	}
-
 	schema := `
 	CREATE TABLE IF NOT EXISTS races (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +164,7 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_peer_samples_race_ts ON peer_samples(race_id, ts);
 	`
 
-	_, err = s.db.Exec(schema)
+	_, err := s.db.Exec(schema)
 	return err
 }
 
