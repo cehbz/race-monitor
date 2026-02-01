@@ -417,42 +417,115 @@ func (s *Store) GetRaceStats(ctx context.Context, raceID int64) (*RaceStats, err
 }
 
 // computeRankings calculates completion and upload rankings based on peer performance.
+// Uses linear extrapolation to infer completion for peers who disappeared before reaching 100%.
 func (s *Store) computeRankings(ctx context.Context, raceID int64, ourCompletionTime time.Time, ourTotalUpload int64) (completionRank, uploadRank int, err error) {
-	// Query to find initial swarm peers (those who appeared before we completed)
-	// and their completion times and total uploads
-	query := `
-		WITH initial_swarm AS (
-			-- Find all peers who had samples before we completed
-			SELECT DISTINCT peer_id
-			FROM peer_samples
-			WHERE race_id = ? AND ts <= ?
-		),
-		peer_completions AS (
-			-- Find when each initial swarm peer completed (first sample with progress >= 1.0)
-			SELECT
-				ps.peer_id,
-				MIN(CASE WHEN ps.progress >= 1.0 THEN ps.ts END) as completion_time,
-				MAX(ps.uploaded) as total_uploaded
-			FROM peer_samples ps
-			INNER JOIN initial_swarm iswarm ON ps.peer_id = iswarm.peer_id
-			WHERE ps.race_id = ?
-			GROUP BY ps.peer_id
-		)
-		SELECT
-			COUNT(CASE WHEN completion_time < ? THEN 1 END) as completed_before_us,
-			COUNT(CASE WHEN total_uploaded > ? THEN 1 END) as uploaded_more_than_us
-		FROM peer_completions
-	`
-
-	var completedBeforeUs, uploadedMoreThanUs int
-	err = s.db.QueryRowContext(ctx, query,
-		raceID, ourCompletionTime,
-		raceID,
-		ourCompletionTime, ourTotalUpload,
-	).Scan(&completedBeforeUs, &uploadedMoreThanUs)
-
+	// Get all initial swarm peers (those who appeared before we completed)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT peer_id
+		FROM peer_samples
+		WHERE race_id = ? AND ts <= ?
+	`, raceID, ourCompletionTime)
 	if err != nil {
-		return 0, 0, fmt.Errorf("computing rankings: %w", err)
+		return 0, 0, fmt.Errorf("querying initial swarm: %w", err)
+	}
+	defer rows.Close()
+
+	var peerIDs []int64
+	for rows.Next() {
+		var peerID int64
+		if err := rows.Scan(&peerID); err != nil {
+			return 0, 0, err
+		}
+		peerIDs = append(peerIDs, peerID)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+
+	completedBeforeUs := 0
+	uploadedMoreThanUs := 0
+
+	// For each peer, determine completion time and total upload
+	for _, peerID := range peerIDs {
+		// Get all samples for this peer, ordered by time
+		sampleRows, err := s.db.QueryContext(ctx, `
+			SELECT ts, progress, uploaded
+			FROM peer_samples
+			WHERE race_id = ? AND peer_id = ?
+			ORDER BY ts
+		`, raceID, peerID)
+		if err != nil {
+			return 0, 0, fmt.Errorf("querying peer %d samples: %w", peerID, err)
+		}
+
+		var samples []struct {
+			ts       time.Time
+			progress float64
+			uploaded int64
+		}
+		for sampleRows.Next() {
+			var s struct {
+				ts       time.Time
+				progress float64
+				uploaded int64
+			}
+			if err := sampleRows.Scan(&s.ts, &s.progress, &s.uploaded); err != nil {
+				sampleRows.Close()
+				return 0, 0, err
+			}
+			samples = append(samples, s)
+		}
+		sampleRows.Close()
+
+		if len(samples) == 0 {
+			continue
+		}
+
+		// Determine completion time
+		var completionTime *time.Time
+		maxUploaded := samples[len(samples)-1].uploaded
+
+		// Check for explicit completion (progress >= 1.0)
+		for _, s := range samples {
+			if s.progress >= 1.0 {
+				completionTime = &s.ts
+				break
+			}
+		}
+
+		// If no explicit completion, try to extrapolate from last two samples
+		if completionTime == nil && len(samples) >= 2 {
+			last := samples[len(samples)-1]
+			prev := samples[len(samples)-2]
+
+			// Extrapolate if progress was increasing and not yet complete
+			if last.progress > prev.progress && last.progress < 1.0 {
+				progressDelta := last.progress - prev.progress
+				timeDelta := last.ts.Sub(prev.ts).Seconds()
+
+				if progressDelta > 0 && timeDelta > 0 {
+					// Time to reach 100% from last sample
+					remainingProgress := 1.0 - last.progress
+					timeToComplete := remainingProgress * timeDelta / progressDelta
+					extrapolated := last.ts.Add(time.Duration(timeToComplete * float64(time.Second)))
+
+					// Only count if extrapolated completion was before our completion and they disappeared
+					if extrapolated.Before(ourCompletionTime) {
+						completionTime = &extrapolated
+					}
+				}
+			}
+		}
+
+		// Count peers who finished before us
+		if completionTime != nil && completionTime.Before(ourCompletionTime) {
+			completedBeforeUs++
+		}
+
+		// Count peers who uploaded more than us
+		if maxUploaded > ourTotalUpload {
+			uploadedMoreThanUs++
+		}
 	}
 
 	// Rank is 1 + number of peers who did better

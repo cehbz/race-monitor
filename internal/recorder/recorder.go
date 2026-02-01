@@ -180,6 +180,7 @@ func (r *Recorder) processor(ctx context.Context, raceID int64, hash string, sna
 		initialSwarmDone = make(map[string]time.Time) // Track when peers completed/disappeared
 		stillDownloading = true
 		peerLastSeen     = make(map[string]time.Time)
+		prevSample       *storage.Sample // Track previous sample to skip duplicates
 	)
 
 	const peerDisappearThreshold = 2 * time.Minute
@@ -276,7 +277,7 @@ func (r *Recorder) processor(ctx context.Context, raceID int64, hash string, sna
 			// Calculate our rank among uploaders
 			rank := r.calculateRank(torrent.UpSpeed, peers)
 
-			// Record our sample
+			// Record our sample (skip if unchanged from previous to avoid 1Hz API duplication)
 			sample := &storage.Sample{
 				RaceID:       raceID,
 				Timestamp:    now,
@@ -289,8 +290,18 @@ func (r *Recorder) processor(ctx context.Context, raceID int64, hash string, sna
 				SeedCount:    int(torrent.NumSeeds),
 				MyRank:       rank,
 			}
-			if err := r.store.InsertSample(ctx, sample); err != nil {
-				r.logger.Warn("failed to insert sample", "error", err)
+
+			// Skip if data unchanged from previous sample (qBittorrent API updates at 1Hz)
+			skipSample := prevSample != nil &&
+				prevSample.Uploaded == sample.Uploaded &&
+				prevSample.Downloaded == sample.Downloaded &&
+				prevSample.Progress == sample.Progress
+
+			if !skipSample {
+				if err := r.store.InsertSample(ctx, sample); err != nil {
+					r.logger.Warn("failed to insert sample", "error", err)
+				}
+				prevSample = sample
 			}
 
 			// Normalize and record peer samples
