@@ -2,10 +2,13 @@
 package recorder
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"time"
 
@@ -144,6 +147,14 @@ func (r *Recorder) Record(ctx context.Context, hash string) error {
 	if err != nil {
 		return err
 	}
+
+	// Notify dashboard of new race (fire-and-forget)
+	go func() {
+		payload := map[string]int64{"race_id": raceID}
+		data, _ := json.Marshal(payload)
+		client := &http.Client{Timeout: 2 * time.Second}
+		client.Post("http://10.112.227.3:8080/api/notify", "application/json", bytes.NewBuffer(data))
+	}()
 
 	// Start fetcher goroutine
 	snapshots := make(chan Snapshot, 30) // Buffer for ~15 seconds at 500ms
