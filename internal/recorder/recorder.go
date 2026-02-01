@@ -46,6 +46,8 @@ type Config struct {
 	MinUploadRate int64
 	// StopAfterLowActivity stops if upload is below MinUploadRate for this duration.
 	StopAfterLowActivity time.Duration
+	// DashboardURL is the URL to notify when a race starts (empty disables notifications).
+	DashboardURL string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -149,12 +151,14 @@ func (r *Recorder) Record(ctx context.Context, hash string) error {
 	}
 
 	// Notify dashboard of new race (fire-and-forget)
-	go func() {
-		payload := map[string]int64{"race_id": raceID}
-		data, _ := json.Marshal(payload)
-		client := &http.Client{Timeout: 2 * time.Second}
-		client.Post("http://10.112.227.3:8080/api/notify", "application/json", bytes.NewBuffer(data))
-	}()
+	if r.config.DashboardURL != "" {
+		go func() {
+			payload := map[string]int64{"race_id": raceID}
+			data, _ := json.Marshal(payload)
+			client := &http.Client{Timeout: 2 * time.Second}
+			client.Post(r.config.DashboardURL+"/api/notify", "application/json", bytes.NewBuffer(data))
+		}()
+	}
 
 	// Start fetcher goroutine
 	snapshots := make(chan Snapshot, 30) // Buffer for ~15 seconds at 500ms

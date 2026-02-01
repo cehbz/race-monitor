@@ -77,6 +77,7 @@ Configuration:
     qbt_user = "admin"
     qbt_pass = "adminpass"
     race_db = "/path/to/races.db"
+    dashboard_url = "http://localhost:8888"  # Optional, omit to disable
 
   Defaults:
     qbt_url:  http://127.0.0.1:8080
@@ -89,15 +90,16 @@ qBittorrent setup:
 
 // Config holds the configuration for race-monitor.
 type Config struct {
-	QbtURL  string `toml:"qbt_url"`
-	QbtUser string `toml:"qbt_user"`
-	QbtPass string `toml:"qbt_pass"`
-	RaceDB  string `toml:"race_db"`
+	QbtURL       string `toml:"qbt_url"`
+	QbtUser      string `toml:"qbt_user"`
+	QbtPass      string `toml:"qbt_pass"`
+	RaceDB       string `toml:"race_db"`
+	DashboardURL string `toml:"dashboard_url"`
 }
 
 // getConfig reads configuration from $HOME/.config/race-monitor/config.toml.
 // It falls back to sensible defaults if fields are missing.
-func getConfig() (url, user, pass, dbPath string) {
+func getConfig() (url, user, pass, dbPath, dashboardURL string) {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
 	var cfg Config
@@ -105,6 +107,7 @@ func getConfig() (url, user, pass, dbPath string) {
 	// Set defaults
 	cfg.QbtURL = "http://127.0.0.1:8080"
 	cfg.RaceDB = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
+	cfg.DashboardURL = "" // Empty means notifications disabled
 
 	// Parse the config file if it exists
 	if _, err := os.Stat(configPath); err == nil {
@@ -115,6 +118,7 @@ func getConfig() (url, user, pass, dbPath string) {
 	user = cfg.QbtUser
 	pass = cfg.QbtPass
 	dbPath = cfg.RaceDB
+	dashboardURL = cfg.DashboardURL
 	return
 }
 
@@ -151,7 +155,7 @@ func runRecord(args []string) error {
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	url, user, pass, dbPath := getConfig()
+	url, user, pass, dbPath, dashboardURL := getConfig()
 
 	// Ensure DB directory exists
 	if err := ensureDBDir(dbPath); err != nil {
@@ -181,6 +185,7 @@ func runRecord(args []string) error {
 	config.PollInterval = *pollInterval
 	config.MaxDuration = *maxDuration
 	config.PostCompletionDuration = *postComplete
+	config.DashboardURL = dashboardURL
 
 	rec := recorder.New(client, store, config, logger)
 
@@ -204,7 +209,7 @@ func runList(args []string) error {
 	days := fs.Int("days", 7, "show races from last N days")
 	_ = fs.Parse(args)
 
-	_, _, _, dbPath := getConfig()
+	_, _, _, dbPath, _ := getConfig()
 
 	store, err := storage.New(dbPath)
 	if err != nil {
@@ -249,7 +254,7 @@ func runStats(args []string) error {
 		return fmt.Errorf("invalid race ID: %w", err)
 	}
 
-	_, _, _, dbPath := getConfig()
+	_, _, _, dbPath, _ := getConfig()
 
 	store, err := storage.New(dbPath)
 	if err != nil {
@@ -303,7 +308,7 @@ func runExport(args []string) error {
 		return fmt.Errorf("invalid race ID: %w", err)
 	}
 
-	_, _, _, dbPath := getConfig()
+	_, _, _, dbPath, _ := getConfig()
 
 	store, err := storage.New(dbPath)
 	if err != nil {

@@ -38,9 +38,10 @@ qbt_url = "http://127.0.0.1:8080"
 qbt_user = "admin"
 qbt_pass = "adminadmin"
 race_db = "~/.local/share/race-monitor/races.db"  # Optional, this is the default
+dashboard_url = "http://localhost:8888"  # Optional, enables real-time dashboard updates
 ```
 
-If `qbt_url` is not specified, it defaults to `http://127.0.0.1:8080`. If `race_db` is not specified, it defaults to `~/.local/share/race-monitor/races.db`.
+If `qbt_url` is not specified, it defaults to `http://127.0.0.1:8080`. If `race_db` is not specified, it defaults to `~/.local/share/race-monitor/races.db`. If `dashboard_url` is not specified, dashboard notifications are disabled.
 
 ## qBittorrent Setup
 
