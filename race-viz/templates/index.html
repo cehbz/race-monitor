@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Race Monitor Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #0f1419;
+            color: #e6edf3;
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 1800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            margin-bottom: 30px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 15px;
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .subtitle {
+            color: #8b949e;
+            font-size: 14px;
+        }
+
+        #race-list {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            margin-bottom: 30px;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        .race-item {
+            padding: 16px 20px;
+            border-bottom: 1px solid #30363d;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+
+        .race-item:last-child {
+            border-bottom: none;
+        }
+
+        .race-item:hover {
+            background: #1c2128;
+        }
+
+        .race-item.selected {
+            background: #21262d;
+            border-left: 3px solid #58a6ff;
+        }
+
+        .race-item.selected:hover {
+            background: #1c2128;
+        }
+
+        .race-name {
+            font-weight: 500;
+            font-size: 14px;
+            margin-bottom: 4px;
+            color: #e6edf3;
+        }
+
+        .race-meta {
+            font-size: 12px;
+            color: #8b949e;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .race-meta span {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        #visualization {
+            display: none;
+        }
+
+        #visualization.active {
+            display: block;
+        }
+
+        .chart-container {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .chart-title {
+            font-size: 16px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #e6edf3;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #8b949e;
+        }
+
+        .error {
+            background: #2d1519;
+            border: 1px solid #da3633;
+            color: #f85149;
+            padding: 16px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .stat-card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 16px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+
+        .stat-value {
+            font-size: 20px;
+            font-weight: 600;
+            color: #e6edf3;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .stat-value.multiline {
+            font-size: 14px;
+            white-space: normal;
+            word-break: break-word;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🏁 Race Monitor Dashboard</h1>
+            <div class="subtitle">Torrent racing analytics and visualization</div>
+        </header>
+
+        <div id="race-list">
+            <div class="loading">Loading races...</div>
+        </div>
+
+        <div id="visualization">
+            <div class="stats-grid" id="race-stats"></div>
+
+            <div class="chart-container">
+                <div class="chart-title">📥 Download Rate (bytes since previous sample)</div>
+                <div id="download-chart"></div>
+            </div>
+
+            <div class="chart-container">
+                <div class="chart-title">📤 Upload Rate (bytes since previous sample)</div>
+                <div id="upload-chart"></div>
+            </div>
+
+            <div class="chart-container">
+                <div class="chart-title">📊 Progress (%)</div>
+                <div id="progress-chart"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let selectedRaceId = null;
+
+        // Restore full race list view
+        function showAllRaces() {
+            // Show all race items
+            document.querySelectorAll('.race-item').forEach(item => {
+                item.style.display = 'block';
+                item.classList.remove('selected');
+                item.onclick = function() {
+                    const raceId = parseInt(this.dataset.raceId);
+                    loadRaceData(raceId);
+                };
+            });
+
+            // Hide visualization
+            document.getElementById('visualization').classList.remove('active');
+            selectedRaceId = null;
+        }
+
+        // Fetch and display race list
+        async function loadRaces() {
+            try {
+                const response = await fetch('/api/races');
+                const races = await response.json();
+
+                const container = document.getElementById('race-list');
+
+                if (races.length === 0) {
+                    container.innerHTML = '<div class="loading">No races found</div>';
+                    return;
+                }
+
+                container.innerHTML = '';
+
+                races.forEach(race => {
+                    const item = document.createElement('div');
+                    item.className = 'race-item';
+                    item.dataset.raceId = race.id;
+                    item.onclick = () => loadRaceData(race.id);
+
+                    const startDate = new Date(race.started_at);
+
+                    item.innerHTML = `
+                        <div class="race-name">${race.name}</div>
+                        <div class="race-meta">
+                            <span>🕐 ${startDate.toLocaleString()}</span>
+                            <span>📦 ${formatBytes(race.size)}</span>
+                            <span>📊 ${race.sample_count} samples</span>
+                            ${race.total_uploaded ? `<span>📤 ${formatBytes(race.total_uploaded)}</span>` : ''}
+                            ${race.final_progress ? `<span>✅ ${(race.final_progress * 100).toFixed(1)}%</span>` : ''}
+                        </div>
+                    `;
+
+                    container.appendChild(item);
+                });
+            } catch (error) {
+                document.getElementById('race-list').innerHTML =
+                    `<div class="error">Error loading races: ${error.message}</div>`;
+            }
+        }
+
+        // Load detailed race data and visualize
+        async function loadRaceData(raceId) {
+            selectedRaceId = raceId;
+
+            // Hide all races except the selected one
+            document.querySelectorAll('.race-item').forEach(item => {
+                const itemRaceId = parseInt(item.dataset.raceId);
+                if (itemRaceId === raceId) {
+                    item.classList.add('selected');
+                    // Make selected race clickable to return to list
+                    item.onclick = showAllRaces;
+                } else {
+                    item.style.display = 'none';
+                }
+            });
+
+            const viz = document.getElementById('visualization');
+            viz.classList.add('active');
+            viz.innerHTML = '<div class="loading">Loading race data...</div>';
+
+            try {
+                const response = await fetch(`/api/race/${raceId}`);
+                const data = await response.json();
+
+                if (data.error) {
+                    viz.innerHTML = `<div class="error">${data.error}</div>`;
+                    return;
+                }
+
+                visualizeRace(data);
+            } catch (error) {
+                viz.innerHTML = `<div class="error">Error loading race data: ${error.message}</div>`;
+            }
+        }
+
+        // Visualize race data with Plotly
+        function visualizeRace(data) {
+            const { race, our_samples, peers } = data;
+
+            // Rebuild visualization container
+            document.getElementById('visualization').innerHTML = `
+                <div class="stats-grid" id="race-stats"></div>
+
+                <div class="chart-container">
+                    <div class="chart-title">📥 Download Delta (bytes since previous sample)</div>
+                    <div id="download-chart"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div class="chart-title">📤 Upload Delta (bytes since previous sample)</div>
+                    <div id="upload-chart"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div class="chart-title">📊 Progress (%)</div>
+                    <div id="progress-chart"></div>
+                </div>
+            `;
+
+            // Show race stats
+            displayRaceStats(race, our_samples);
+
+            // Calculate start time from first sample
+            const startTime = new Date(our_samples[0].ts);
+
+            // Prepare data for charts
+            const downloadTraces = [];
+            const uploadTraces = [];
+            const progressTraces = [];
+
+            // Color palette for peers
+            const colors = generateColors(peers.length + 1);
+
+            // Process "our" data
+            const ourDownloadDeltas = calculateDeltas(our_samples, 'downloaded');
+            const ourUploadDeltas = calculateDeltas(our_samples, 'uploaded');
+            const ourElapsedTimes = our_samples.map(s => (new Date(s.ts) - startTime) / 1000);
+
+            downloadTraces.push({
+                x: ourElapsedTimes,
+                y: ourDownloadDeltas,
+                mode: 'lines',
+                name: 'You',
+                line: { color: colors[0], width: 2.5 },
+                hovertemplate: '<b>You</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>'
+            });
+
+            uploadTraces.push({
+                x: ourElapsedTimes,
+                y: ourUploadDeltas,
+                mode: 'lines',
+                name: 'You',
+                line: { color: colors[0], width: 2.5 },
+                hovertemplate: '<b>You</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>'
+            });
+
+            progressTraces.push({
+                x: ourElapsedTimes,
+                y: our_samples.map(s => s.progress * 100),
+                mode: 'lines',
+                name: 'You',
+                line: { color: colors[0], width: 2.5 },
+                hovertemplate: '<b>You</b><br>%{y:.2f}%<br>%{x}s<extra></extra>'
+            });
+
+            // Process peer data
+            peers.forEach((peer, index) => {
+                const peerLabel = `${peer.ip}:${peer.port} (${peer.client})`;
+                const color = colors[index + 1];
+
+                const downloadDeltas = calculateDeltas(peer.samples, 'downloaded');
+                const uploadDeltas = calculateDeltas(peer.samples, 'uploaded');
+                const peerElapsedTimes = peer.samples.map(s => (new Date(s.ts) - startTime) / 1000);
+
+                downloadTraces.push({
+                    x: peerElapsedTimes,
+                    y: downloadDeltas,
+                    mode: 'lines',
+                    name: peerLabel,
+                    line: { color: color, width: 1.5 },
+                    hovertemplate: `<b>${peerLabel}</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>`
+                });
+
+                uploadTraces.push({
+                    x: peerElapsedTimes,
+                    y: uploadDeltas,
+                    mode: 'lines',
+                    name: peerLabel,
+                    line: { color: color, width: 1.5 },
+                    hovertemplate: `<b>${peerLabel}</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>`
+                });
+
+                progressTraces.push({
+                    x: peerElapsedTimes,
+                    y: peer.samples.map(s => s.progress * 100),
+                    mode: 'lines',
+                    name: peerLabel,
+                    line: { color: color, width: 1.5 },
+                    hovertemplate: `<b>${peerLabel}</b><br>%{y:.2f}%<br>%{x}s<extra></extra>`
+                });
+            });
+
+            // Layout configuration
+            const layout = {
+                paper_bgcolor: '#161b22',
+                plot_bgcolor: '#0d1117',
+                font: { color: '#e6edf3', family: 'monospace' },
+                margin: { l: 80, r: 40, t: 20, b: 60 },
+                hovermode: 'closest',
+                xaxis: {
+                    gridcolor: '#30363d',
+                    zerolinecolor: '#30363d',
+                    title: 'Elapsed Time (seconds)'
+                },
+                yaxis: {
+                    gridcolor: '#30363d',
+                    zerolinecolor: '#30363d'
+                },
+                legend: {
+                    bgcolor: '#0d1117',
+                    bordercolor: '#30363d',
+                    borderwidth: 1
+                }
+            };
+
+            const config = {
+                responsive: true,
+                displayModeBar: true,
+                displaylogo: false
+            };
+
+            // Render charts
+            Plotly.newPlot('download-chart', downloadTraces, {
+                ...layout,
+                yaxis: { ...layout.yaxis, title: 'Bytes Downloaded (delta)' }
+            }, config);
+
+            Plotly.newPlot('upload-chart', uploadTraces, {
+                ...layout,
+                yaxis: { ...layout.yaxis, title: 'Bytes Uploaded (delta)' }
+            }, config);
+
+            Plotly.newPlot('progress-chart', progressTraces, {
+                ...layout,
+                yaxis: { ...layout.yaxis, title: 'Progress (%)', range: [0, 105] }
+            }, config);
+        }
+
+        // Calculate deltas between consecutive samples
+        function calculateDeltas(samples, field) {
+            const deltas = [0]; // First sample has no previous, so delta is 0
+
+            for (let i = 1; i < samples.length; i++) {
+                const delta = samples[i][field] - samples[i - 1][field];
+                deltas.push(Math.max(0, delta)); // Ensure non-negative
+            }
+
+            return deltas;
+        }
+
+        // Generate distinct colors for traces
+        function generateColors(count) {
+            const colors = ['#58a6ff']; // "You" gets blue
+
+            // Generate vibrant colors for peers
+            const baseHues = [0, 30, 60, 120, 180, 210, 270, 300, 330];
+
+            for (let i = 0; i < count - 1; i++) {
+                const hue = baseHues[i % baseHues.length];
+                const saturation = 70 + (Math.floor(i / baseHues.length) * 10);
+                const lightness = 60 + ((i % 3) * 10);
+                colors.push(`hsl(${hue}, ${saturation}%, ${lightness}%)`);
+            }
+
+            return colors;
+        }
+
+        // Display race statistics
+        function displayRaceStats(race, samples) {
+            const statsContainer = document.getElementById('race-stats');
+
+            const lastSample = samples[samples.length - 1];
+            const firstSample = samples[0];
+            const duration = (new Date(lastSample.ts) - new Date(firstSample.ts)) / 1000;
+
+            statsContainer.innerHTML = `
+                <div class="stat-card">
+                    <div class="stat-label">Race Name</div>
+                    <div class="stat-value multiline">${race.name}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Size</div>
+                    <div class="stat-value">${formatBytes(race.size)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Uploaded</div>
+                    <div class="stat-value">${formatBytes(lastSample.uploaded)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Final Progress</div>
+                    <div class="stat-value">${(lastSample.progress * 100).toFixed(1)}%</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Duration</div>
+                    <div class="stat-value">${formatDuration(duration)}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Samples</div>
+                    <div class="stat-value">${samples.length}</div>
+                </div>
+            `;
+        }
+
+        // Utility: Format bytes
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // Utility: Format duration
+        function formatDuration(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+
+            if (h > 0) return `${h}h ${m}m ${s}s`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        // Server-Sent Events for real-time updates
+        function connectSSE() {
+            const eventSource = new EventSource('/api/events');
+
+            eventSource.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+
+                    if (data.type === 'race_added') {
+                        console.log('New race added, refreshing list...');
+                        // Only refresh if we're showing the full list (not viewing a race)
+                        if (!selectedRaceId) {
+                            loadRaces();
+                        }
+                    }
+                } catch (e) {
+                    // Ignore parsing errors (keepalive comments, etc.)
+                }
+            };
+
+            eventSource.onerror = function(error) {
+                console.log('SSE connection error, will auto-reconnect...');
+                // EventSource automatically reconnects
+            };
+
+            return eventSource;
+        }
+
+        // Initialize
+        loadRaces();
+        const sse = connectSSE();
+    </script>
+</body>
+</html>

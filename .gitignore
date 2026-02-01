@@ -1,6 +1,8 @@
 # Binaries
-./race-monitor
-./race-monitor-*
+race-monitor
+race-monitor-*
+!race-monitor/
+!race-monitor-*/
 *.exe
 
 # Test artifacts
@@ -14,6 +16,7 @@ coverage.html
 *.swp
 *.swo
 *~
+.direnv/
 
 # OS
 .DS_Store
@@ -23,3 +26,5 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+
+race-viz/config.toml
