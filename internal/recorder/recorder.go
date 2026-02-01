@@ -4,6 +4,7 @@ package recorder
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"time"
@@ -15,6 +16,13 @@ import (
 var (
 	ErrTorrentNotFound = errors.New("torrent not found")
 )
+
+// Snapshot represents a point-in-time capture of torrent and peer data.
+type Snapshot struct {
+	Torrent   *qbittorrent.TorrentInfo
+	PeersResp *qbittorrent.TorrentPeers
+	Timestamp time.Time
+}
 
 // QBitClient defines the interface for qBittorrent operations needed by the recorder.
 // This allows for easier testing with mock implementations.
@@ -80,6 +88,43 @@ func (r *Recorder) getTorrent(hash string) (*qbittorrent.TorrentInfo, error) {
 	return &torrents[0], nil
 }
 
+// fetcher polls qBittorrent and sends snapshots to the channel.
+// Runs in a separate goroutine.
+func (r *Recorder) fetcher(ctx context.Context, hash string, snapshots chan<- Snapshot) {
+	ticker := time.NewTicker(r.config.PollInterval)
+	defer ticker.Stop()
+	defer close(snapshots)
+
+	rid := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-ticker.C:
+			torrent, err := r.getTorrent(hash)
+			if err != nil {
+				r.logger.Warn("failed to get torrent info", "error", err)
+				continue
+			}
+
+			peersResp, err := r.client.SyncTorrentPeers(hash, rid)
+			if err != nil {
+				r.logger.Warn("failed to get peers", "error", err)
+				continue
+			}
+			rid = peersResp.Rid
+
+			snapshots <- Snapshot{
+				Torrent:   torrent,
+				PeersResp: peersResp,
+				Timestamp: time.Now(),
+			}
+		}
+	}
+}
+
 // Record starts recording a race for the given torrent hash.
 // It blocks until the race is complete or the context is cancelled.
 func (r *Recorder) Record(ctx context.Context, hash string) error {
@@ -100,19 +145,29 @@ func (r *Recorder) Record(ctx context.Context, hash string) error {
 		return err
 	}
 
-	// Track state for stop conditions
+	// Start fetcher goroutine
+	snapshots := make(chan Snapshot, 30) // Buffer for ~15 seconds at 500ms
+	fetcherCtx, cancelFetcher := context.WithCancel(ctx)
+	defer cancelFetcher()
+
+	go r.fetcher(fetcherCtx, hash, snapshots)
+
+	// Process snapshots
+	return r.processor(ctx, raceID, hash, snapshots)
+}
+
+// processor handles snapshot processing, initial swarm tracking, and termination logic.
+func (r *Recorder) processor(ctx context.Context, raceID int64, hash string, snapshots <-chan Snapshot) error {
 	var (
-		completedAt      time.Time
-		lowActivitySince time.Time
-		lastRank         int
-		rid              int // For sync API delta updates
+		startTime        = time.Now()
 		peers            = make(map[string]qbittorrent.TorrentPeer)
+		initialSwarm     = make(map[string]bool)      // Track peers seen while downloading
+		initialSwarmDone = make(map[string]time.Time) // Track when peers completed/disappeared
+		stillDownloading = true
+		peerLastSeen     = make(map[string]time.Time)
 	)
 
-	ticker := time.NewTicker(r.config.PollInterval)
-	defer ticker.Stop()
-
-	startTime := time.Now()
+	const peerDisappearThreshold = 2 * time.Minute
 
 	for {
 		select {
@@ -120,54 +175,93 @@ func (r *Recorder) Record(ctx context.Context, hash string) error {
 			r.logger.Info("recording cancelled", "hash", hash)
 			return ctx.Err()
 
-		case <-ticker.C:
-			elapsed := time.Since(startTime)
+		case snapshot, ok := <-snapshots:
+			if !ok {
+				// Fetcher closed channel (shouldn't happen normally)
+				return r.finalize(ctx, raceID)
+			}
 
-			// Check max duration
+			elapsed := time.Since(startTime)
+			torrent := snapshot.Torrent
+			now := snapshot.Timestamp
+
+			// Check max duration safety valve
 			if elapsed > r.config.MaxDuration {
 				r.logger.Info("max duration reached", "hash", hash, "elapsed", elapsed)
-				return r.finalize(ctx, raceID, lastRank)
+				return r.finalize(ctx, raceID)
 			}
-
-			// Check post-completion duration
-			if !completedAt.IsZero() && time.Since(completedAt) > r.config.PostCompletionDuration {
-				r.logger.Info("post-completion recording complete",
-					"hash", hash,
-					"time_since_complete", time.Since(completedAt))
-				return r.finalize(ctx, raceID, lastRank)
-			}
-
-			// Get current torrent state
-			torrent, err = r.getTorrent(hash)
-			if err != nil {
-				r.logger.Warn("failed to get torrent info", "error", err)
-				continue
-			}
-
-			// Get peer data using sync endpoint
-			peersResp, err := r.client.SyncTorrentPeers(hash, rid)
-			if err != nil {
-				r.logger.Warn("failed to get peers", "error", err)
-				continue
-			}
-			rid = peersResp.Rid
 
 			// Merge peer updates
-			if peersResp.FullUpdate {
-				peers = peersResp.Peers
+			if snapshot.PeersResp.FullUpdate {
+				peers = snapshot.PeersResp.Peers
 			} else {
-				for k, v := range peersResp.Peers {
+				for k, v := range snapshot.PeersResp.Peers {
 					peers[k] = v
+				}
+			}
+
+			// Update peer last seen times
+			for key := range peers {
+				peerLastSeen[key] = now
+			}
+
+			// Track initial swarm: add peers seen while we're still downloading
+			if stillDownloading {
+				for key := range peers {
+					if !initialSwarm[key] {
+						initialSwarm[key] = true
+						r.logger.Debug("added peer to initial swarm", "peer", key)
+					}
+				}
+			}
+
+			// Check if we've completed downloading
+			if torrent.Progress >= 1.0 && stillDownloading {
+				stillDownloading = false
+				r.logger.Info("download completed, initial swarm locked",
+					"hash", hash,
+					"time_to_complete", elapsed,
+					"initial_swarm_size", len(initialSwarm))
+			}
+
+			// Track initial swarm completion/disappearance
+			if !stillDownloading {
+				for peerKey := range initialSwarm {
+					if _, done := initialSwarmDone[peerKey]; done {
+						continue
+					}
+
+					peer, exists := peers[peerKey]
+					if exists {
+						// Peer still present
+						if peer.Progress >= 1.0 {
+							initialSwarmDone[peerKey] = now
+							r.logger.Debug("initial swarm peer completed", "peer", peerKey)
+						}
+					} else {
+						// Peer disappeared - check if beyond threshold
+						lastSeen, seen := peerLastSeen[peerKey]
+						if seen && now.Sub(lastSeen) > peerDisappearThreshold {
+							initialSwarmDone[peerKey] = now
+							r.logger.Debug("initial swarm peer disappeared", "peer", peerKey)
+						}
+					}
+				}
+
+				// Check if all initial swarm peers are done
+				if len(initialSwarmDone) >= len(initialSwarm) {
+					r.logger.Info("all initial swarm peers completed",
+						"hash", hash,
+						"elapsed", elapsed,
+						"initial_swarm_size", len(initialSwarm))
+					return r.finalize(ctx, raceID)
 				}
 			}
 
 			// Calculate our rank among uploaders
 			rank := r.calculateRank(torrent.UpSpeed, peers)
-			lastRank = rank
 
-			now := time.Now()
-
-			// Record sample
+			// Record our sample
 			sample := &storage.Sample{
 				RaceID:       raceID,
 				Timestamp:    now,
@@ -184,61 +278,74 @@ func (r *Recorder) Record(ctx context.Context, hash string) error {
 				r.logger.Warn("failed to insert sample", "error", err)
 			}
 
-			// Record peer samples (only seeders/uploaders matter for racing)
-			peerSamples := make([]storage.PeerSample, 0, len(peers))
-			for _, p := range peers {
-				// Only record peers that are uploading (our competition)
-				if p.UPSpeed > 0 || p.Progress >= 1.0 {
-					peerSamples = append(peerSamples, storage.PeerSample{
-						RaceID:     raceID,
-						Timestamp:  now,
-						PeerIP:     p.IP,
-						PeerClient: p.Client,
-						UploadRate: p.UPSpeed,
-						Progress:   p.Progress,
-						Uploaded:   p.Uploaded,
-					})
-				}
-			}
-			if err := r.store.InsertPeerSamples(ctx, peerSamples); err != nil {
+			// Normalize and record peer samples
+			if err := r.recordPeerSamples(ctx, raceID, now, peers); err != nil {
 				r.logger.Warn("failed to insert peer samples", "error", err)
-			}
-
-			// Track completion
-			if torrent.Progress >= 1.0 && completedAt.IsZero() {
-				completedAt = now
-				r.logger.Info("torrent completed",
-					"hash", hash,
-					"time_to_complete", elapsed,
-					"rank", rank)
-			}
-
-			// Track low activity
-			if torrent.UpSpeed < r.config.MinUploadRate {
-				if lowActivitySince.IsZero() {
-					lowActivitySince = now
-				} else if time.Since(lowActivitySince) > r.config.StopAfterLowActivity {
-					r.logger.Info("stopping due to low activity",
-						"hash", hash,
-						"upload_rate", torrent.UpSpeed)
-					return r.finalize(ctx, raceID, lastRank)
-				}
-			} else {
-				lowActivitySince = time.Time{}
 			}
 
 			// Log progress periodically (every 10 seconds)
 			if int(elapsed.Seconds())%10 == 0 && elapsed.Milliseconds()%1000 < int64(r.config.PollInterval.Milliseconds()) {
+				swarmStatus := "tracking"
+				if !stillDownloading {
+					swarmStatus = fmt.Sprintf("%d/%d done", len(initialSwarmDone), len(initialSwarm))
+				}
 				r.logger.Info("race progress",
 					"hash", truncateHash(hash),
 					"progress", torrent.Progress,
 					"upload", formatRate(torrent.UpSpeed),
 					"download", formatRate(torrent.DLSpeed),
 					"rank", rank,
-					"peers", len(peers))
+					"peers", len(peers),
+					"swarm", swarmStatus)
 			}
 		}
 	}
+}
+
+// recordPeerSamples normalizes peer data and inserts into database.
+func (r *Recorder) recordPeerSamples(ctx context.Context, raceID int64, timestamp time.Time, peers map[string]qbittorrent.TorrentPeer) error {
+	if len(peers) == 0 {
+		return nil
+	}
+
+	// Map to store peer IDs
+	peerIDs := make(map[string]int64)
+
+	// First, upsert all peers to get their IDs
+	for key, p := range peers {
+		peer := &storage.Peer{
+			IP:         p.IP,
+			Port:       p.Port,
+			Client:     p.Client,
+			Country:    p.Country,
+			Connection: p.Connection,
+			Flags:      p.Flags,
+		}
+
+		peerID, err := r.store.UpsertPeer(ctx, peer)
+		if err != nil {
+			return fmt.Errorf("upserting peer %s: %w", key, err)
+		}
+		peerIDs[key] = peerID
+	}
+
+	// Build peer samples with peer IDs
+	peerSamples := make([]storage.PeerSample, 0, len(peers))
+	for key, p := range peers {
+		// Record all peers (not just uploaders) to track download performance
+		peerSamples = append(peerSamples, storage.PeerSample{
+			RaceID:       raceID,
+			PeerID:       peerIDs[key],
+			Timestamp:    timestamp,
+			UploadRate:   p.UPSpeed,
+			DownloadRate: p.DLSpeed,
+			Progress:     p.Progress,
+			Uploaded:     p.Uploaded,
+			Downloaded:   p.Downloaded,
+		})
+	}
+
+	return r.store.InsertPeerSamples(ctx, peerSamples)
 }
 
 // CalculateRank determines our position among uploaders (exported for testing).
@@ -282,8 +389,8 @@ func (r *Recorder) calculateRank(myUploadSpeed int64, peers map[string]qbittorre
 	return rank
 }
 
-func (r *Recorder) finalize(ctx context.Context, raceID int64, finalRank int) error {
-	if err := r.store.CompleteRace(ctx, raceID, finalRank); err != nil {
+func (r *Recorder) finalize(ctx context.Context, raceID int64) error {
+	if err := r.store.CompleteRace(ctx, raceID); err != nil {
 		return err
 	}
 
@@ -300,7 +407,8 @@ func (r *Recorder) finalize(ctx context.Context, raceID int64, finalRank int) er
 		"peak_upload", formatRate(stats.PeakUploadRate),
 		"avg_upload", formatRate(stats.AvgUploadRate),
 		"best_rank", stats.BestRank,
-		"final_rank", stats.FinalRank,
+		"completion_rank", stats.CompletionRank,
+		"upload_rank", stats.UploadRank,
 		"uploaded_5m", formatBytes(stats.UploadedFirst5m),
 		"uploaded_15m", formatBytes(stats.UploadedFirst15m))
 

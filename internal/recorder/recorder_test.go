@@ -348,42 +348,6 @@ func TestRecord_PostCompletionDuration(t *testing.T) {
 	}
 }
 
-func TestRecord_LowActivity(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-
-	client := newMockClient()
-	client.setTorrent(qbittorrent.TorrentInfo{
-		Hash:     "testhash",
-		Name:     "Test Torrent",
-		Size:     1024 * 1024 * 100,
-		Progress: 0.5,
-		UpSpeed:  100, // Very low upload - below threshold
-		DLSpeed:  0,
-	})
-
-	config := recorder.DefaultConfig()
-	config.PollInterval = 10 * time.Millisecond
-	config.MinUploadRate = 1000
-	config.StopAfterLowActivity = 30 * time.Millisecond
-	config.MaxDuration = 5 * time.Second
-
-	rec := recorder.New(client, store, config, nullLogger())
-
-	start := time.Now()
-	err := rec.Record(context.Background(), "testhash")
-	duration := time.Since(start)
-
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-
-	// Should stop after ~30ms (low activity), not 5s (max duration)
-	if duration > 500*time.Millisecond {
-		t.Errorf("took too long: %v (expected ~30ms)", duration)
-	}
-}
-
 func TestRecord_SamplesRecorded(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
@@ -475,3 +439,4 @@ func BenchmarkCalculateRank(b *testing.B) {
 		rec.CalculateRank(500000, peers)
 	}
 }
+

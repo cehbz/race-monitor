@@ -69,11 +69,18 @@ Commands:
   stats <race_id>  Show detailed statistics for a race
   export <race_id> Export race data to CSV
 
-Environment variables:
-  QBT_URL          qBittorrent WebUI URL (default: http://127.0.0.1:8080)
-  QBT_USER         qBittorrent username
-  QBT_PASS         qBittorrent password
-  RACE_DB          Database path (default: ~/.local/share/race-monitor/races.db)
+Configuration:
+  Config file: ~/.config/race-monitor/config.toml
+
+  Example config.toml:
+    qbt_url = "http://127.0.0.1:8080"
+    qbt_user = "admin"
+    qbt_pass = "adminpass"
+    race_db = "/path/to/races.db"
+
+  Defaults:
+    qbt_url:  http://127.0.0.1:8080
+    race_db:  ~/.local/share/race-monitor/races.db
 
 qBittorrent setup:
   Add to Options > Downloads > "Run external program on torrent added":
@@ -216,18 +223,13 @@ func runList(args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tSTARTED\tNAME\tSIZE\tRANK")
+	fmt.Fprintln(w, "ID\tSTARTED\tNAME\tSIZE")
 	for _, r := range races {
-		rank := "-"
-		if r.FinalRank.Valid {
-			rank = fmt.Sprintf("#%d", r.FinalRank.Int64)
-		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n",
 			r.ID,
 			r.StartedAt.Local().Format("2006-01-02 15:04"),
 			truncate(r.Name, 50),
-			formatBytes(r.Size),
-			rank)
+			formatBytes(r.Size))
 	}
 	w.Flush()
 
@@ -273,7 +275,13 @@ func runStats(args []string) error {
 	fmt.Println()
 	fmt.Printf("  Best rank:           #%d\n", stats.BestRank)
 	fmt.Printf("  Average rank:        %.1f\n", stats.AvgRank)
-	fmt.Printf("  Final rank:          #%d\n", stats.FinalRank)
+	fmt.Println()
+	if stats.CompletionRank > 0 {
+		fmt.Printf("  Completion rank:     #%d (download finish order)\n", stats.CompletionRank)
+	}
+	if stats.UploadRank > 0 {
+		fmt.Printf("  Upload rank:         #%d (total uploaded in swarm)\n", stats.UploadRank)
+	}
 
 	return nil
 }

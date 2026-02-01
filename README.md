@@ -4,11 +4,16 @@ Torrent racing analytics for qBittorrent. Records high-frequency performance dat
 
 ## Features
 
-- 500ms polling interval for detailed race metrics
+- Configurable polling interval (default 500ms) for detailed race metrics
+- Asynchronous architecture with separate fetcher and processor goroutines
 - Tracks your rank among seeders in real-time
-- SQLite storage for historical analysis
+- Two success criteria:
+  - **Completion rank**: Who finished downloading first
+  - **Upload rank**: Who uploaded the most during the initial swarm
+- Normalized SQLite schema for efficient peer analysis
+- Tracks initial swarm performance (peers seen while downloading)
 - CSV export for external analysis tools
-- Automatic stop conditions (completion, low activity, max duration)
+- Automatic stop conditions (initial swarm completion, max duration)
 
 ## Installation
 
@@ -26,14 +31,16 @@ make install
 
 ## Configuration
 
-Set environment variables:
+Create `~/.config/race-monitor/config.toml`:
 
-```bash
-export QBT_URL="http://127.0.0.1:8080"   # qBittorrent WebUI URL
-export QBT_USER="admin"                   # WebUI username
-export QBT_PASS="adminadmin"              # WebUI password
-export RACE_DB="~/.local/share/race-monitor/races.db"  # Optional, this is the default
+```toml
+qbt_url = "http://127.0.0.1:8080"
+qbt_user = "admin"
+qbt_pass = "adminadmin"
+race_db = "~/.local/share/race-monitor/races.db"  # Optional, this is the default
 ```
+
+If `qbt_url` is not specified, it defaults to `http://127.0.0.1:8080`. If `race_db` is not specified, it defaults to `~/.local/share/race-monitor/races.db`.
 
 ## qBittorrent Setup
 
@@ -76,7 +83,9 @@ Race #42: Some.Torrent.2024.1080p.BluRay
 
   Best rank:           #1
   Average rank:        1.4
-  Final rank:          #2
+
+  Completion rank:     #2 (download finish order)
+  Upload rank:         #3 (total uploaded in swarm)
 ```
 
 ### Export to CSV
@@ -89,13 +98,21 @@ race-monitor export 42 -o race42.csv
 
 Each sample (every 500ms by default) captures:
 
+**Your stats:**
 - Upload/download rate
 - Progress percentage
 - Total uploaded/downloaded
 - Peer and seed counts
-- Your rank among seeders
+- Your rank among uploaders
 
-Peer data is also recorded for seeders, allowing post-race analysis of competitor performance.
+**Peer stats** (normalized in separate table):
+- IP address, port, client version
+- Upload/download rate
+- Progress percentage
+- Total uploaded/downloaded
+- Connection type, country, flags
+
+All peer data during the initial swarm is recorded, allowing detailed post-race analysis of competitor performance.
 
 ## Command-line Options
 
@@ -103,11 +120,12 @@ Peer data is also recorded for seeders, allowing post-race analysis of competito
 
 ```bash
 race-monitor record [options] <hash>
-  -poll duration         Poll interval (default 500ms)
-  -max duration          Max recording duration (default 30m)
-  -post-complete duration Time to record after 100% (default 15m)
-  -log-level string      Log level: debug, info, warn, error (default info)
+  -poll duration      Poll interval (default 500ms)
+  -max duration       Max recording duration safety valve (default 30m)
+  -log-level string   Log level: debug, info, warn, error (default info)
 ```
+
+Recording automatically stops when all peers in the initial swarm (peers seen while you were downloading) have either completed or disappeared from the swarm.
 
 ### list
 
