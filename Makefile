@@ -1,10 +1,18 @@
-.PHONY: build install clean test test-verbose test-coverage lint deps
+.PHONY: build install clean test test-verbose test-coverage lint deps generate
 
 BINARY := race-monitor
 INSTALL_PATH := $(HOME)/bin
 COVERAGE_FILE := coverage.out
 
-build:
+# Generate eBPF bytecode from C source (requires clang, linux headers)
+generate:
+	go generate ./internal/bpf/
+
+build: generate
+	go build -o $(BINARY) ./cmd/race-monitor
+
+# Build without regenerating eBPF (use pre-generated files)
+build-quick:
 	go build -o $(BINARY) ./cmd/race-monitor
 
 install: build
@@ -60,7 +68,6 @@ vet:
 # Run all checks before commit
 check: fmt vet test
 
-# Build for multiple platforms
-build-all:
+# Build for Linux amd64 (eBPF is Linux-only)
+build-linux:
 	GOOS=linux GOARCH=amd64 go build -o $(BINARY)-linux-amd64 ./cmd/race-monitor
-	GOOS=linux GOARCH=arm64 go build -o $(BINARY)-linux-arm64 ./cmd/race-monitor

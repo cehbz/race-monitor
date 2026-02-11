@@ -168,37 +168,45 @@
             white-space: normal;
             word-break: break-word;
         }
+
+        .peer-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        .peer-table th {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 2px solid #30363d;
+            color: #8b949e;
+            font-weight: 600;
+            font-size: 12px;
+        }
+
+        .peer-table td {
+            padding: 8px;
+            border-bottom: 1px solid #30363d;
+            font-size: 13px;
+        }
+
+        .peer-table tr:last-child td {
+            border-bottom: none;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>🏁 Race Monitor Dashboard</h1>
-            <div class="subtitle">Torrent racing analytics and visualization</div>
+            <h1>Race Monitor Dashboard</h1>
+            <div class="subtitle">eBPF uprobe architecture &mdash; libtorrent we_have / incoming_have events</div>
         </header>
 
         <div id="race-list">
             <div class="loading">Loading races...</div>
         </div>
 
-        <div id="visualization">
-            <div class="stats-grid" id="race-stats"></div>
-
-            <div class="chart-container">
-                <div class="chart-title">📥 Download Rate (bytes since previous sample)</div>
-                <div id="download-chart"></div>
-            </div>
-
-            <div class="chart-container">
-                <div class="chart-title">📤 Upload Rate (bytes since previous sample)</div>
-                <div id="upload-chart"></div>
-            </div>
-
-            <div class="chart-container">
-                <div class="chart-title">📊 Progress (%)</div>
-                <div id="progress-chart"></div>
-            </div>
-        </div>
+        <div id="visualization"></div>
     </div>
 
     <script>
@@ -206,7 +214,6 @@
 
         // Restore full race list view
         function showAllRaces() {
-            // Show all race items
             document.querySelectorAll('.race-item').forEach(item => {
                 item.style.display = 'block';
                 item.classList.remove('selected');
@@ -216,9 +223,15 @@
                 };
             });
 
-            // Hide visualization
             document.getElementById('visualization').classList.remove('active');
             selectedRaceId = null;
+        }
+
+        // Parse RFC 3339 timestamp (e.g. "2026-02-09T05:18:37.753Z") into Date.
+        function parseTS(ts) {
+            if (!ts) return null;
+            const d = new Date(ts);
+            return isNaN(d.getTime()) ? null : d;
         }
 
         // Fetch and display race list
@@ -230,7 +243,7 @@
                 const container = document.getElementById('race-list');
 
                 if (races.length === 0) {
-                    container.innerHTML = '<div class="loading">No races found</div>';
+                    container.innerHTML = '<div class="loading">No races found. Start a download while race-monitor daemon is running.</div>';
                     return;
                 }
 
@@ -242,16 +255,17 @@
                     item.dataset.raceId = race.id;
                     item.onclick = () => loadRaceData(race.id);
 
-                    const startDate = new Date(race.started_at);
+                    const startDate = parseTS(race.started_at);
+                    const status = race.completed_at ? 'Done' : 'Running';
 
                     item.innerHTML = `
-                        <div class="race-name">${race.name}</div>
+                        <div class="race-name">${status} &mdash; ${race.name || race.hash}</div>
                         <div class="race-meta">
-                            <span>🕐 ${startDate.toLocaleString()}</span>
-                            <span>📦 ${formatBytes(race.size)}</span>
-                            <span>📊 ${race.sample_count} samples</span>
-                            ${race.total_uploaded ? `<span>📤 ${formatBytes(race.total_uploaded)}</span>` : ''}
-                            ${race.final_progress ? `<span>✅ ${(race.final_progress * 100).toFixed(1)}%</span>` : ''}
+                            <span>${startDate ? startDate.toLocaleString() : race.started_at}</span>
+                            <span>${formatBytes(race.size)}</span>
+                            <span>${race.piece_count} pieces</span>
+                            <span>${race.peer_count} peers</span>
+                            <span>${race.event_count} events</span>
                         </div>
                     `;
 
@@ -267,12 +281,10 @@
         async function loadRaceData(raceId) {
             selectedRaceId = raceId;
 
-            // Hide all races except the selected one
             document.querySelectorAll('.race-item').forEach(item => {
                 const itemRaceId = parseInt(item.dataset.raceId);
                 if (itemRaceId === raceId) {
                     item.classList.add('selected');
-                    // Make selected race clickable to return to list
                     item.onclick = showAllRaces;
                 } else {
                     item.style.display = 'none';
@@ -292,117 +304,58 @@
                     return;
                 }
 
-                visualizeRace(data);
+                visualizeRace(data, raceId);
             } catch (error) {
                 viz.innerHTML = `<div class="error">Error loading race data: ${error.message}</div>`;
             }
         }
 
         // Visualize race data with Plotly
-        function visualizeRace(data) {
-            const { race, our_samples, peers } = data;
+        function visualizeRace(data, raceId) {
+            const { race, timeline, peers, events } = data;
 
             // Rebuild visualization container
             document.getElementById('visualization').innerHTML = `
                 <div class="stats-grid" id="race-stats"></div>
 
                 <div class="chart-container">
-                    <div class="chart-title">📥 Download Delta (bytes since previous sample)</div>
-                    <div id="download-chart"></div>
-                </div>
-
-                <div class="chart-container">
-                    <div class="chart-title">📤 Upload Delta (bytes since previous sample)</div>
-                    <div id="upload-chart"></div>
-                </div>
-
-                <div class="chart-container">
-                    <div class="chart-title">📊 Progress (%)</div>
+                    <div class="chart-title">Piece Completion Progress</div>
                     <div id="progress-chart"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div class="chart-title">Event Activity (events per 5-second window)</div>
+                    <div id="event-chart"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div class="chart-title">Peer Statistics</div>
+                    <table class="peer-table" id="peer-table">
+                        <thead>
+                            <tr>
+                                <th>IP</th>
+                                <th>Port</th>
+                                <th>Client</th>
+                                <th>Country</th>
+                                <th>Progress</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
                 </div>
             `;
 
-            // Show race stats
-            displayRaceStats(race, our_samples);
+            displayRaceStats(race, timeline, events);
+            loadAndDisplayPeers(raceId);
 
-            // Calculate start time from first sample
-            const startTime = new Date(our_samples[0].ts);
+            // Calculate start time
+            const raceStart = parseTS(race.started_at);
+            const startTime = timeline.length > 0 ? parseTS(timeline[0].ts) : raceStart;
 
-            // Prepare data for charts
-            const downloadTraces = [];
-            const uploadTraces = [];
-            const progressTraces = [];
-
-            // Color palette for peers
-            const colors = generateColors(peers.length + 1);
-
-            // Process "our" data
-            const ourDownloadDeltas = calculateDeltas(our_samples, 'downloaded');
-            const ourUploadDeltas = calculateDeltas(our_samples, 'uploaded');
-            const ourElapsedTimes = our_samples.map(s => (new Date(s.ts) - startTime) / 1000);
-
-            downloadTraces.push({
-                x: ourElapsedTimes,
-                y: ourDownloadDeltas,
-                mode: 'lines',
-                name: 'You',
-                line: { color: colors[0], width: 2.5 },
-                hovertemplate: '<b>You</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>'
-            });
-
-            uploadTraces.push({
-                x: ourElapsedTimes,
-                y: ourUploadDeltas,
-                mode: 'lines',
-                name: 'You',
-                line: { color: colors[0], width: 2.5 },
-                hovertemplate: '<b>You</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>'
-            });
-
-            progressTraces.push({
-                x: ourElapsedTimes,
-                y: our_samples.map(s => s.progress * 100),
-                mode: 'lines',
-                name: 'You',
-                line: { color: colors[0], width: 2.5 },
-                hovertemplate: '<b>You</b><br>%{y:.2f}%<br>%{x}s<extra></extra>'
-            });
-
-            // Process peer data
-            peers.forEach((peer, index) => {
-                const peerLabel = `${peer.ip}:${peer.port} (${peer.client})`;
-                const color = colors[index + 1];
-
-                const downloadDeltas = calculateDeltas(peer.samples, 'downloaded');
-                const uploadDeltas = calculateDeltas(peer.samples, 'uploaded');
-                const peerElapsedTimes = peer.samples.map(s => (new Date(s.ts) - startTime) / 1000);
-
-                downloadTraces.push({
-                    x: peerElapsedTimes,
-                    y: downloadDeltas,
-                    mode: 'lines',
-                    name: peerLabel,
-                    line: { color: color, width: 1.5 },
-                    hovertemplate: `<b>${peerLabel}</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>`
-                });
-
-                uploadTraces.push({
-                    x: peerElapsedTimes,
-                    y: uploadDeltas,
-                    mode: 'lines',
-                    name: peerLabel,
-                    line: { color: color, width: 1.5 },
-                    hovertemplate: `<b>${peerLabel}</b><br>%{y:,.0f} bytes<br>%{x}s<extra></extra>`
-                });
-
-                progressTraces.push({
-                    x: peerElapsedTimes,
-                    y: peer.samples.map(s => s.progress * 100),
-                    mode: 'lines',
-                    name: peerLabel,
-                    line: { color: color, width: 1.5 },
-                    hovertemplate: `<b>${peerLabel}</b><br>%{y:.2f}%<br>%{x}s<extra></extra>`
-                });
+            // Prepare timeline data for charts
+            const times = timeline.map(t => {
+                const d = parseTS(t.ts);
+                return d && startTime ? (d - startTime) / 1000 : 0;
             });
 
             // Layout configuration
@@ -434,91 +387,159 @@
                 displaylogo: false
             };
 
-            // Render charts
-            Plotly.newPlot('download-chart', downloadTraces, {
+            // Piece completion progress (cumulative we_have over time)
+            let cumulative = 0;
+            const cumulativePieces = timeline.map(t => {
+                cumulative += (t.piece_received || 0);
+                return cumulative;
+            });
+
+            Plotly.newPlot('progress-chart', [{
+                x: times,
+                y: cumulativePieces,
+                mode: 'lines',
+                name: 'Pieces Completed',
+                line: { color: '#58a6ff', width: 2 },
+                fill: 'tozeroy',
+                fillcolor: 'rgba(88, 166, 255, 0.1)',
+                hovertemplate: '%{y} pieces at %{x:.1f}s<extra></extra>'
+            }, {
+                x: [times[0] || 0, times[times.length - 1] || 1],
+                y: [race.piece_count, race.piece_count],
+                mode: 'lines',
+                name: 'Total Pieces',
+                line: { color: '#8b949e', width: 1, dash: 'dot' },
+                hoverinfo: 'skip'
+            }], {
                 ...layout,
-                yaxis: { ...layout.yaxis, title: 'Bytes Downloaded (delta)' }
+                yaxis: { ...layout.yaxis, title: 'Pieces Completed' }
             }, config);
 
-            Plotly.newPlot('upload-chart', uploadTraces, {
-                ...layout,
-                yaxis: { ...layout.yaxis, title: 'Bytes Uploaded (delta)' }
-            }, config);
+            // Event activity chart (stacked area)
+            const eventTraces = [
+                {
+                    x: times,
+                    y: timeline.map(t => t.piece_received || 0),
+                    mode: 'lines',
+                    name: 'Piece Received (we_have)',
+                    line: { width: 0 },
+                    fillcolor: 'rgba(86, 211, 100, 0.5)',
+                    fill: 'tozeroy',
+                    stackgroup: 'one'
+                },
+                {
+                    x: times,
+                    y: timeline.map(t => t.have_count || 0),
+                    mode: 'lines',
+                    name: 'Peer Have (incoming_have)',
+                    line: { width: 0 },
+                    fillcolor: 'rgba(88, 166, 255, 0.5)',
+                    fill: 'tozeroy',
+                    stackgroup: 'one'
+                }
+            ];
 
-            Plotly.newPlot('progress-chart', progressTraces, {
+            Plotly.newPlot('event-chart', eventTraces, {
                 ...layout,
-                yaxis: { ...layout.yaxis, title: 'Progress (%)', range: [0, 105] }
+                yaxis: { ...layout.yaxis, title: 'Event Count' }
             }, config);
         }
 
-        // Calculate deltas between consecutive samples
-        function calculateDeltas(samples, field) {
-            const deltas = [0]; // First sample has no previous, so delta is 0
-
-            for (let i = 1; i < samples.length; i++) {
-                const delta = samples[i][field] - samples[i - 1][field];
-                deltas.push(Math.max(0, delta)); // Ensure non-negative
+        // Load peer data from the new /api/race/<id>/peers endpoint
+        async function loadAndDisplayPeers(raceId) {
+            try {
+                const response = await fetch(`/api/race/${raceId}/peers`);
+                const peers = await response.json();
+                displayPeersTable(peers);
+            } catch (error) {
+                console.error('Error loading peers:', error);
+                const tbody = document.querySelector('#peer-table tbody');
+                if (tbody) {
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#f85149">Error loading peer data</td></tr>';
+                }
             }
-
-            return deltas;
         }
 
-        // Generate distinct colors for traces
-        function generateColors(count) {
-            const colors = ['#58a6ff']; // "You" gets blue
+        // Display peer statistics table with real peer data
+        function displayPeersTable(peers) {
+            const tbody = document.querySelector('#peer-table tbody');
+            if (!tbody) return;
 
-            // Generate vibrant colors for peers
-            const baseHues = [0, 30, 60, 120, 180, 210, 270, 300, 330];
+            tbody.innerHTML = '';
 
-            for (let i = 0; i < count - 1; i++) {
-                const hue = baseHues[i % baseHues.length];
-                const saturation = 70 + (Math.floor(i / baseHues.length) * 10);
-                const lightness = 60 + ((i % 3) * 10);
-                colors.push(`hsl(${hue}, ${saturation}%, ${lightness}%)`);
+            if (!peers || peers.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#8b949e">No peer data</td></tr>';
+                return;
             }
 
-            return colors;
+            peers.forEach(peer => {
+                const progressPercent = peer.progress ? (peer.progress * 100).toFixed(1) : '0.0';
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td>${peer.ip}</td>
+                    <td>${peer.port}</td>
+                    <td>${peer.client || 'Unknown'}</td>
+                    <td>${peer.country || 'Unknown'}</td>
+                    <td>${progressPercent}%</td>
+                `;
+                tbody.appendChild(row);
+            });
         }
 
         // Display race statistics
-        function displayRaceStats(race, samples) {
+        function displayRaceStats(race, timeline, events) {
             const statsContainer = document.getElementById('race-stats');
 
-            const lastSample = samples[samples.length - 1];
-            const firstSample = samples[0];
-            const duration = (new Date(lastSample.ts) - new Date(firstSample.ts)) / 1000;
+            const totalPieceReceived = timeline.reduce((sum, t) => sum + (t.piece_received || 0), 0);
+            const totalHave = timeline.reduce((sum, t) => sum + (t.have_count || 0), 0);
+            const totalEvents = totalPieceReceived + totalHave;
+
+            let duration = 'Unknown';
+            const startDate = parseTS(race.started_at);
+            const endDate = parseTS(race.completed_at);
+            if (startDate && endDate) {
+                duration = formatDuration((endDate - startDate) / 1000);
+            } else if (timeline.length >= 2) {
+                const first = parseTS(timeline[0].ts);
+                const last = parseTS(timeline[timeline.length - 1].ts);
+                if (first && last) duration = formatDuration((last - first) / 1000);
+            }
 
             statsContainer.innerHTML = `
                 <div class="stat-card">
                     <div class="stat-label">Race Name</div>
-                    <div class="stat-value multiline">${race.name}</div>
+                    <div class="stat-value multiline">${race.name || 'Unknown'}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Total Size</div>
                     <div class="stat-value">${formatBytes(race.size)}</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">Uploaded</div>
-                    <div class="stat-value">${formatBytes(lastSample.uploaded)}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Final Progress</div>
-                    <div class="stat-value">${(lastSample.progress * 100).toFixed(1)}%</div>
+                    <div class="stat-label">Pieces</div>
+                    <div class="stat-value">${totalPieceReceived} / ${race.piece_count}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Duration</div>
-                    <div class="stat-value">${formatDuration(duration)}</div>
+                    <div class="stat-value">${duration}</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">Samples</div>
-                    <div class="stat-value">${samples.length}</div>
+                    <div class="stat-label">Peer Have Events</div>
+                    <div class="stat-value">${totalHave}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Total Events</div>
+                    <div class="stat-value">${totalEvents}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Status</div>
+                    <div class="stat-value">${race.completed_at ? 'Complete' : 'Running'}</div>
                 </div>
             `;
         }
 
         // Utility: Format bytes
         function formatBytes(bytes) {
-            if (bytes === 0) return '0 B';
+            if (!bytes || bytes === 0) return '0 B';
             const k = 1024;
             const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
             const i = Math.floor(Math.log(bytes) / Math.log(k));
@@ -527,6 +548,7 @@
 
         // Utility: Format duration
         function formatDuration(seconds) {
+            if (!seconds || seconds < 0) return 'Unknown';
             const h = Math.floor(seconds / 3600);
             const m = Math.floor((seconds % 3600) / 60);
             const s = Math.floor(seconds % 60);
@@ -546,7 +568,6 @@
 
                     if (data.type === 'race_added') {
                         console.log('New race added, refreshing list...');
-                        // Only refresh if we're showing the full list (not viewing a race)
                         if (!selectedRaceId) {
                             loadRaces();
                         }
@@ -558,7 +579,6 @@
 
             eventSource.onerror = function(error) {
                 console.log('SSE connection error, will auto-reconnect...');
-                // EventSource automatically reconnects
             };
 
             return eventSource;

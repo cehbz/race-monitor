@@ -1,26 +1,22 @@
-// race-monitor records and analyzes torrent racing performance.
+// race-monitor records and analyzes torrent racing performance using eBPF uprobes.
 package main
 
 import (
 	"context"
-	"encoding/csv"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"text/tabwriter"
-	"time"
 
 	"github.com/BurntSushi/toml"
+	qbt "github.com/cehbz/qbittorrent"
 
-	"github.com/cehbz/qbittorrent"
-	"github.com/cehbz/race-monitor/internal/recorder"
+	"github.com/cehbz/race-monitor/internal/capture"
+	"github.com/cehbz/race-monitor/internal/race"
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
@@ -31,23 +27,13 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "record":
-		if err := runRecord(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-	case "stats":
-		if err := runStats(os.Args[2:]); err != nil {
+	case "daemon":
+		if err := runDaemon(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
 	case "list":
 		if err := runList(os.Args[2:]); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
-		}
-	case "export":
-		if err := runExport(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -61,65 +47,86 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`race-monitor - torrent racing analytics
+	fmt.Println(`race-monitor - eBPF-based BitTorrent race monitor
 
 Commands:
-  record <hash>    Start recording a race (called by qBittorrent hook)
-  list             List recent races
-  stats <race_id>  Show detailed statistics for a race
-  export <race_id> Export race data to CSV
+  daemon [options]          Monitor torrent races via eBPF uprobes
+                            Runs forever, tracking races as they appear
+                            --detach: Run in background
+                            --log-file: Write logs to file (recommended with --detach)
+  list                      List recent races
+
+Example:
+  race-monitor daemon --detach --log-file ~/race-monitor.log
 
 Configuration:
   Config file: ~/.config/race-monitor/config.toml
 
   Example config.toml:
-    qbt_url = "http://127.0.0.1:8080"
-    qbt_user = "admin"
-    qbt_pass = "adminpass"
-    race_db = "/path/to/races.db"
-    dashboard_url = "http://localhost:8888"  # Optional, omit to disable
+    binary = "/usr/bin/qbittorrent-nox"       # Required: path to qBittorrent binary
+    pid = 0                                   # Optional: 0 = all processes
+    webui_url = "http://localhost:8080"        # Optional
+    dashboard_url = "http://localhost:8888"    # Optional
+    race_db = "/path/to/races.db"             # Optional
+
+  Required:
+    binary: Path to the qBittorrent binary (must have symbol table)
 
   Defaults:
-    qbt_url:  http://127.0.0.1:8080
-    race_db:  ~/.local/share/race-monitor/races.db
+    pid:       0 (monitor all processes using the binary)
+    webui_url: http://localhost:8080
+    race_db:   ~/.local/share/race-monitor/races.db
+
+eBPF Probes:
+  Requires root or file capabilities for eBPF uprobe attachment.
+  Attaches uprobes to libtorrent functions inside the qBittorrent binary:
+    - torrent::we_have()               — fires when we complete a piece
+    - peer_connection::incoming_have()  — fires when a peer announces a piece
+
+  Grant capabilities (Debian/Ubuntu with kernel < 6.7):
+    sudo setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./race-monitor
+
+  Also requires: kernel.perf_event_paranoid <= 1
+    sudo sysctl -w kernel.perf_event_paranoid=1
+
+  Note: CAP_SYS_ADMIN is needed because the uprobe PMU's perf_event_open path
+  on Debian 6.1 checks CAP_SYS_ADMIN rather than CAP_PERFMON. Newer kernels
+  (>= 6.7) may only need cap_bpf,cap_perfmon,cap_sys_resource.
 
 qBittorrent setup:
-  Add to Options > Downloads > "Run external program on torrent added":
-    race-monitor record %I`)
+  Start the daemon before or after launching qBittorrent:
+    race-monitor daemon --detach`)
 }
 
 // Config holds the configuration for race-monitor.
 type Config struct {
-	QbtURL       string `toml:"qbt_url"`
-	QbtUser      string `toml:"qbt_user"`
-	QbtPass      string `toml:"qbt_pass"`
+	Binary       string `toml:"binary"`
+	PID          int    `toml:"pid"`
+	WebUIURL     string `toml:"webui_url"`
 	RaceDB       string `toml:"race_db"`
 	DashboardURL string `toml:"dashboard_url"`
 }
 
 // getConfig reads configuration from $HOME/.config/race-monitor/config.toml.
-// It falls back to sensible defaults if fields are missing.
-func getConfig() (url, user, pass, dbPath, dashboardURL string) {
+func getConfig() (binary, webUIURL, dbPath, dashboardURL string, pid int) {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
 	var cfg Config
 
-	// Set defaults
-	cfg.QbtURL = "http://127.0.0.1:8080"
+	// Defaults
+	cfg.Binary = ""
+	cfg.PID = 0
+	cfg.WebUIURL = "http://localhost:8080"
 	cfg.RaceDB = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
-	cfg.DashboardURL = "" // Empty means notifications disabled
+	cfg.DashboardURL = ""
 
-	// Parse the config file if it exists
 	if _, err := os.Stat(configPath); err == nil {
-		_, _ = toml.DecodeFile(configPath, &cfg)
+		if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to parse config file %s: %v (using defaults)\n", configPath, err)
+		}
 	}
 
-	url = cfg.QbtURL
-	user = cfg.QbtUser
-	pass = cfg.QbtPass
-	dbPath = cfg.RaceDB
-	dashboardURL = cfg.DashboardURL
-	return
+	return cfg.Binary, cfg.WebUIURL, cfg.RaceDB, cfg.DashboardURL, cfg.PID
 }
 
 func ensureDBDir(dbPath string) error {
@@ -127,22 +134,88 @@ func ensureDBDir(dbPath string) error {
 	return os.MkdirAll(dir, 0755)
 }
 
-func runRecord(args []string) error {
-	fs := flag.NewFlagSet("record", flag.ExitOnError)
-	pollInterval := fs.Duration("poll", 500*time.Millisecond, "poll interval")
-	maxDuration := fs.Duration("max", 30*time.Minute, "max recording duration")
-	postComplete := fs.Duration("post-complete", 15*time.Minute, "recording time after 100%")
-	logLevel := fs.String("log-level", "info", "log level (debug, info, warn, error)")
+// daemonize forks the process to run in the background.
+func daemonize(args []string) error {
+	var newArgs []string
+	newArgs = append(newArgs, "daemon")
+	for _, arg := range args {
+		if arg == "--detach" || arg == "-detach" {
+			continue
+		}
+		if arg == "--detach=true" || arg == "-detach=true" {
+			continue
+		}
+		if arg == "--detach=false" || arg == "-detach=false" {
+			continue
+		}
+		newArgs = append(newArgs, arg)
+	}
+
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("getting executable path: %w", err)
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("opening /dev/null: %w", err)
+	}
+	defer devNull.Close()
+
+	procAttr := &os.ProcAttr{
+		Files: []*os.File{devNull, devNull, devNull},
+		Sys: &syscall.SysProcAttr{
+			Setsid: true,
+		},
+	}
+
+	process, err := os.StartProcess(executable, append([]string{executable}, newArgs...), procAttr)
+	if err != nil {
+		return fmt.Errorf("starting detached process: %w", err)
+	}
+
+	fmt.Printf("race-monitor daemon started with PID %d\n", process.Pid)
+
+	if err := process.Release(); err != nil {
+		return fmt.Errorf("releasing process: %w", err)
+	}
+
+	return nil
+}
+
+func runDaemon(args []string) error {
+	configBinary, configWebUIURL, dbPath, dashboardURL, configPID := getConfig()
+
+	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
+	logLevel := fs.String("log-level", "info", "log level (trace, debug, info, warn, error)")
+	logFile := fs.String("log-file", "", "log file path (default: stderr)")
+	binary := fs.String("binary", configBinary, "path to qBittorrent binary")
+	pid := fs.Int("pid", configPID, "qBittorrent PID to monitor (0 = all processes)")
+	webUIURL := fs.String("webui-url", configWebUIURL, "qBittorrent Web UI URL")
+	detach := fs.Bool("detach", false, "run in background")
 	_ = fs.Parse(args)
 
-	if fs.NArg() < 1 {
-		return errors.New("missing torrent hash")
+	if *detach {
+		return daemonize(args)
 	}
-	hash := fs.Arg(0)
 
-	// Setup logging
+	// Setup logging output
+	var logOutput *os.File
+	if *logFile != "" {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("opening log file: %w", err)
+		}
+		defer f.Close()
+		logOutput = f
+	} else {
+		logOutput = os.Stderr
+	}
+
 	var level slog.Level
 	switch *logLevel {
+	case "trace":
+		level = capture.LevelTrace
 	case "debug":
 		level = slog.LevelDebug
 	case "warn":
@@ -153,24 +226,25 @@ func runRecord(args []string) error {
 		level = slog.LevelInfo
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: level}))
 
-	url, user, pass, dbPath, dashboardURL := getConfig()
+	// Validate required configuration
+	if *binary == "" {
+		return fmt.Errorf("binary must be set in config file or via --binary flag (path to qBittorrent binary)")
+	}
+
+	if _, err := os.Stat(*binary); err != nil {
+		return fmt.Errorf("binary not found: %s", *binary)
+	}
+
+	logger.Info("starting race monitor daemon",
+		"binary", *binary,
+		"pid", *pid,
+		"webui_url", *webUIURL)
 
 	// Ensure DB directory exists
 	if err := ensureDBDir(dbPath); err != nil {
 		return fmt.Errorf("creating db directory: %w", err)
-	}
-
-	// Create HTTP client with reasonable timeout
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	// Connect to qBittorrent
-	client, err := qbittorrent.NewClient(user, pass, url, httpClient)
-	if err != nil {
-		return fmt.Errorf("connecting to qBittorrent: %w", err)
 	}
 
 	// Open database
@@ -180,14 +254,11 @@ func runRecord(args []string) error {
 	}
 	defer store.Close()
 
-	// Configure recorder
-	config := recorder.DefaultConfig()
-	config.PollInterval = *pollInterval
-	config.MaxDuration = *maxDuration
-	config.PostCompletionDuration = *postComplete
-	config.DashboardURL = dashboardURL
-
-	rec := recorder.New(client, store, config, logger)
+	// Create qBittorrent client (no auth for localhost)
+	qbtClient, err := qbt.NewClient("", "", *webUIURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating qBittorrent client: %w", err)
+	}
 
 	// Handle signals for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -201,7 +272,26 @@ func runRecord(args []string) error {
 		cancel()
 	}()
 
-	return rec.Record(ctx, hash)
+	// Compute binary hash for calibration cache
+	binaryHash, err := race.ComputeBinaryHash(*binary)
+	if err != nil {
+		logger.Warn("failed to compute binary hash (calibration cache disabled)", "error", err)
+	}
+
+	// Calibration cache lives alongside the config file
+	home, _ := os.UserHomeDir()
+	calibCachePath := filepath.Join(home, ".config", "race-monitor", "calibration.json")
+
+	// Start eBPF capture — attaches uprobes to libtorrent functions
+	events, calibrations, err := capture.Capture(ctx, logger, *binary, *pid)
+	if err != nil {
+		return fmt.Errorf("starting eBPF capture: %w", err)
+	}
+
+	// Create coordinator and run (routes eBPF events to per-race trackers,
+	// calibration events enable auto-discovery of peer_connection struct offsets)
+	coordinator := race.NewCoordinator(store, qbtClient, logger, dashboardURL, binaryHash, calibCachePath)
+	return coordinator.Run(ctx, events, calibrations)
 }
 
 func runList(args []string) error {
@@ -209,7 +299,7 @@ func runList(args []string) error {
 	days := fs.Int("days", 7, "show races from last N days")
 	_ = fs.Parse(args)
 
-	_, _, _, dbPath, _ := getConfig()
+	_, _, dbPath, _, _ := getConfig()
 
 	store, err := storage.New(dbPath)
 	if err != nil {
@@ -241,138 +331,6 @@ func runList(args []string) error {
 	return nil
 }
 
-func runStats(args []string) error {
-	fs := flag.NewFlagSet("stats", flag.ExitOnError)
-	_ = fs.Parse(args)
-
-	if fs.NArg() < 1 {
-		return errors.New("missing race ID")
-	}
-
-	raceID, err := strconv.ParseInt(fs.Arg(0), 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid race ID: %w", err)
-	}
-
-	_, _, _, dbPath, _ := getConfig()
-
-	store, err := storage.New(dbPath)
-	if err != nil {
-		return fmt.Errorf("opening database: %w", err)
-	}
-	defer store.Close()
-
-	stats, err := store.GetRaceStats(context.Background(), raceID)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Race #%d: %s\n\n", stats.RaceID, stats.Name)
-	fmt.Printf("  Time to complete:    %v\n", stats.TimeToComplete.Round(time.Second))
-	fmt.Printf("  Recording duration:  %v\n", stats.Duration.Round(time.Second))
-	fmt.Println()
-	fmt.Printf("  Total uploaded:      %s\n", formatBytes(stats.TotalUploaded))
-	fmt.Printf("  Uploaded (5 min):    %s\n", formatBytes(stats.UploadedFirst5m))
-	fmt.Printf("  Uploaded (15 min):   %s\n", formatBytes(stats.UploadedFirst15m))
-	fmt.Println()
-	fmt.Printf("  Peak upload rate:    %s\n", formatRate(stats.PeakUploadRate))
-	fmt.Printf("  Avg upload rate:     %s\n", formatRate(stats.AvgUploadRate))
-	fmt.Println()
-	fmt.Printf("  Best rank:           #%d\n", stats.BestRank)
-	fmt.Printf("  Average rank:        %.1f\n", stats.AvgRank)
-	fmt.Println()
-	if stats.CompletionRank > 0 {
-		fmt.Printf("  Completion rank:     #%d (download finish order)\n", stats.CompletionRank)
-	}
-	if stats.UploadRank > 0 {
-		fmt.Printf("  Upload rank:         #%d (total uploaded in swarm)\n", stats.UploadRank)
-	}
-
-	return nil
-}
-
-func runExport(args []string) error {
-	fs := flag.NewFlagSet("export", flag.ExitOnError)
-	output := fs.String("o", "", "output file (default: stdout)")
-	includePeers := fs.Bool("peers", false, "include peer samples")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
-	if fs.NArg() < 1 {
-		return errors.New("missing race ID")
-	}
-
-	raceID, err := strconv.ParseInt(fs.Arg(0), 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid race ID: %w", err)
-	}
-
-	_, _, _, dbPath, _ := getConfig()
-
-	store, err := storage.New(dbPath)
-	if err != nil {
-		return fmt.Errorf("opening database: %w", err)
-	}
-	defer store.Close()
-
-	samples, err := store.GetRaceSamples(context.Background(), raceID)
-	if err != nil {
-		return err
-	}
-
-	var out *os.File
-	if *output != "" {
-		out, err = os.Create(*output)
-		if err != nil {
-			return fmt.Errorf("creating output file: %w", err)
-		}
-		defer out.Close()
-	} else {
-		out = os.Stdout
-	}
-
-	w := csv.NewWriter(out)
-
-	// Header
-	_ = w.Write([]string{
-		"timestamp", "elapsed_ms", "upload_rate", "download_rate",
-		"progress", "uploaded", "downloaded", "peer_count", "seed_count", "rank",
-	})
-
-	if len(samples) == 0 {
-		w.Flush()
-		return nil
-	}
-
-	start := samples[0].Timestamp
-	for _, s := range samples {
-		elapsed := s.Timestamp.Sub(start).Milliseconds()
-		_ = w.Write([]string{
-			s.Timestamp.Format(time.RFC3339Nano),
-			strconv.FormatInt(elapsed, 10),
-			strconv.FormatInt(s.UploadRate, 10),
-			strconv.FormatInt(s.DownloadRate, 10),
-			strconv.FormatFloat(s.Progress, 'f', 4, 64),
-			strconv.FormatInt(s.Uploaded, 10),
-			strconv.FormatInt(s.Downloaded, 10),
-			strconv.Itoa(s.PeerCount),
-			strconv.Itoa(s.SeedCount),
-			strconv.Itoa(s.MyRank),
-		})
-	}
-
-	w.Flush()
-
-	if *includePeers {
-		fmt.Fprintln(out)
-		fmt.Fprintln(out, "# Peer samples")
-		// TODO: Add GetPeerSamples to storage
-	}
-
-	return w.Error()
-}
-
 func formatBytes(bytes int64) string {
 	const (
 		KB = 1024
@@ -389,10 +347,6 @@ func formatBytes(bytes int64) string {
 	default:
 		return fmt.Sprintf("%d B", bytes)
 	}
-}
-
-func formatRate(bytesPerSec int64) string {
-	return formatBytes(bytesPerSec) + "/s"
 }
 
 func truncate(s string, max int) string {

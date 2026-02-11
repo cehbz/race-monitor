@@ -1,0 +1,87 @@
+// Package storage provides SQLite storage for race data.
+package storage
+
+import (
+	"database/sql"
+	"errors"
+	"time"
+)
+
+var ErrRaceNotFound = errors.New("race not found")
+
+// EventType represents the type of event as an integer matching the DB event_types.id.
+type EventType int
+
+const (
+	EventTypeHave          EventType = 1 // Peer announced piece (incoming_have probe)
+	EventTypePieceReceived EventType = 2 // We completed a piece (we_have probe)
+)
+
+// Torrent represents torrent metadata.
+type Torrent struct {
+	ID         int64
+	InfoHash   string
+	Name       string
+	Size       int64
+	PieceCount int
+}
+
+// Race represents a race instance with denormalized torrent metadata for reads.
+type Race struct {
+	ID          int64
+	TorrentID   int64
+	Name        string // denormalized from torrents
+	Size        int64  // denormalized from torrents
+	PieceCount  int    // denormalized from torrents
+	InfoHash    string // denormalized from torrents
+	StartedAt   time.Time
+	CompletedAt sql.NullTime
+}
+
+// Connection represents an eBPF-observed connection (opaque pointer identifier).
+// IP, Port, PeerID, and Client are populated by auto-calibration once the
+// struct offsets have been discovered, linking the opaque eBPF pointer to a
+// real peer endpoint and client identity.
+type Connection struct {
+	ID        int64
+	ConnPtr   string // hex of peer_connection* from eBPF
+	FirstSeen time.Time
+	IP        *string // nullable: set after calibration resolves endpoint
+	Port      *int    // nullable: set after calibration resolves endpoint
+	PeerID    *string // nullable: raw 20-byte BT peer_id (set after peer_id calibration)
+	Client    *string // nullable: decoded client name from peer_id (e.g. "qBittorrent 4530")
+}
+
+// RacePeer represents a peer observed via the qBittorrent API during a race.
+type RacePeer struct {
+	ID        int64
+	RaceID    int64
+	IP        string
+	Port      int
+	Client    string
+	PeerID    string // BT protocol peer_id string
+	Country   string
+	Progress  float64
+	DLSpeed   int64
+	UPSpeed   int64
+	FirstSeen time.Time
+	LastSeen  time.Time
+}
+
+// RacePeerAddr is a lightweight (IP, port) pair from the race_peers table.
+// Used by the calibration engine to build the known peer address set.
+type RacePeerAddr struct {
+	IP   string
+	Port int
+}
+
+// Event represents a stored packet event in the database.
+type Event struct {
+	ID           int64
+	RaceID       int64
+	ConnectionID int64 // FK to connections.id
+	Timestamp    time.Time
+	EventType    EventType // integer matching event_types.id
+	PieceIndex   int
+	Data         int64
+}

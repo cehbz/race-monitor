@@ -28,7 +28,7 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Run with default settings (binds to 10.112.227.3:8080)
+# Run with default settings (binds to 0.0.0.0:8080)
 python3 app.py
 
 # Or activate virtual environment first
@@ -36,7 +36,7 @@ source venv/bin/activate
 python3 app.py
 ```
 
-The dashboard will be accessible at: `http://10.112.227.3:8080`
+The dashboard will be accessible at: `http://localhost:8080`
 
 ## Configuration
 
@@ -48,8 +48,8 @@ race_db = "~/.local/share/race-monitor/races.db"
 
 # Network bind address (IP to listen on)
 # Use "0.0.0.0" to listen on all interfaces
-# Use specific IP like "10.112.227.3" to restrict to that interface
-bind_host = "10.112.227.3"
+# Use specific IP like "192.168.1.100" to restrict to that interface
+bind_host = "0.0.0.0"
 
 # Port to listen on
 bind_port = 8080

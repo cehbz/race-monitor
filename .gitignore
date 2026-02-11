@@ -28,3 +28,11 @@ Thumbs.db
 *.db-wal
 
 race-viz/config.toml
+race-test.log
+test-v2.sh
+test.out
+ebpf-race-monitor/
+TODO-peer-correlation.md
+DESIGN.md
+internal/bpf/headers/vmlinux.h
+qbittorrent/
