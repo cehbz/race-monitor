@@ -28,11 +28,11 @@ Thumbs.db
 *.db-wal
 
 race-viz/config.toml
+internal/bpf/headers/vmlinux.h
+race-viz/__pycache__/
 race-test.log
-test-v2.sh
+.gitignore
 test.out
-ebpf-race-monitor/
+test-v2.sh
 TODO-peer-correlation.md
 DESIGN.md
-internal/bpf/headers/vmlinux.h
-qbittorrent/

@@ -427,10 +427,15 @@ func (s *Store) GetRacePeers(ctx context.Context, raceID int64) ([]RacePeer, err
 
 // UpdateConnectionEndpoint sets the resolved IP:port on a connection record.
 // Called after auto-calibration maps a peer_connection* to a real endpoint.
+// Uses upsert because the calibration event may arrive before the tracker
+// goroutine creates the connection row (race condition between coordinator
+// and tracker goroutines).
 func (s *Store) UpdateConnectionEndpoint(ctx context.Context, connPtr string, ip string, port int) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE connections SET ip = ?, port = ? WHERE conn_ptr = ?`,
-		ip, port, connPtr)
+		`INSERT INTO connections (conn_ptr, first_seen, ip, port)
+		VALUES (?, datetime('now'), ?, ?)
+		ON CONFLICT(conn_ptr) DO UPDATE SET ip = excluded.ip, port = excluded.port`,
+		connPtr, ip, port)
 	return err
 }
 
@@ -438,10 +443,17 @@ func (s *Store) UpdateConnectionEndpoint(ctx context.Context, connPtr string, ip
 // a connection record. Called after full calibration (both sockaddr_in and
 // peer_id offsets discovered) maps a peer_connection* to a real endpoint
 // and client identity.
+// Uses upsert because the calibration event may arrive before the tracker
+// goroutine creates the connection row (race condition between coordinator
+// and tracker goroutines).
 func (s *Store) UpdateConnectionPeerInfo(ctx context.Context, connPtr string, ip string, port int, peerID string, client string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE connections SET ip = ?, port = ?, peer_id = ?, client = ? WHERE conn_ptr = ?`,
-		ip, port, peerID, client, connPtr)
+		`INSERT INTO connections (conn_ptr, first_seen, ip, port, peer_id, client)
+		VALUES (?, datetime('now'), ?, ?, ?, ?)
+		ON CONFLICT(conn_ptr) DO UPDATE SET
+			ip = excluded.ip, port = excluded.port,
+			peer_id = excluded.peer_id, client = excluded.client`,
+		connPtr, ip, port, peerID, client)
 	return err
 }
 
