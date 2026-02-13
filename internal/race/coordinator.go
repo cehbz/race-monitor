@@ -560,13 +560,9 @@ func (c *Coordinator) handleCalibration(ctx context.Context, cal bpf.Calibration
 	}
 
 	if c.calibration.isCalibrated() && !c.calibration.isFullyCalibrated() {
-		// sockaddr_in calibrated but peer_id not yet — try peer_id calibration
-		// then extract endpoint
-		addr, ok := c.calibration.extractEndpoint(cal.Data)
-		if ok {
-			c.connEndpoints[cal.ObjPtr] = addr
-			c.resolveConnToRace(ctx, cal.ObjPtr, addr)
-		}
+		// sockaddr_in calibrated but peer_id not yet — extract endpoint
+		// (writes ip/port to DB) and try peer_id calibration.
+		c.extractAndResolve(ctx, cal)
 
 		if c.calibration.tryCalibratePeerID(cal, c.knownPeerIDs) {
 			c.logger.Info("calibration: peer_id offset locked",
@@ -601,11 +597,8 @@ func (c *Coordinator) handleCalibration(ctx context.Context, cal bpf.Calibration
 			"offset", c.calibration.offset,
 			"votes", c.calibration.votes[c.calibration.offset])
 
-		// Extract endpoint from this event
-		if addr, ok := c.calibration.extractEndpoint(cal.Data); ok {
-			c.connEndpoints[cal.ObjPtr] = addr
-			c.resolveConnToRace(ctx, cal.ObjPtr, addr)
-		}
+		// Extract endpoint from this event and write to DB
+		c.extractAndResolve(ctx, cal)
 
 		// Try peer_id calibration immediately (may succeed if we have peer_id data)
 		if c.calibration.tryCalibratePeerID(cal, c.knownPeerIDs) {
@@ -613,6 +606,9 @@ func (c *Coordinator) handleCalibration(ctx context.Context, cal bpf.Calibration
 				"offset", c.calibration.peerIDOffset,
 				"votes", c.calibration.peerIDVotes[c.calibration.peerIDOffset])
 			c.onFullCalibration(ctx)
+		} else {
+			// Buffer this event for later peer_id extraction
+			c.calibration.pending = append(c.calibration.pending, cal)
 		}
 
 		// Reprocess pending calibration events
@@ -623,41 +619,55 @@ func (c *Coordinator) handleCalibration(ctx context.Context, cal bpf.Calibration
 }
 
 // extractAndResolve extracts IP:port and peer_id from a calibration event
-// after full calibration, and resolves the connection to a race.
+// after calibration, and resolves the connection to a race.
+//
+// Always updates the connection endpoint in the DB when the endpoint is
+// extractable. Peer_id/client are added when peer_id calibration is complete.
 func (c *Coordinator) extractAndResolve(ctx context.Context, cal bpf.CalibrationEvent) {
 	addr, ok := c.calibration.extractEndpoint(cal.Data)
 	if !ok {
 		return
 	}
 	c.connEndpoints[cal.ObjPtr] = addr
-	c.resolveConnToRace(ctx, cal.ObjPtr, addr)
+	c.resolveConnToRace(cal.ObjPtr, addr)
 
-	// Extract peer_id and decode client
-	peerID, ok := c.calibration.extractPeerID(cal.Data)
-	if !ok {
-		return
-	}
-	client := decodePeerClient(peerID)
-
-	// Update connection record with full peer info
 	connPtr := fmt.Sprintf("%x", cal.ObjPtr)
-	if err := c.store.UpdateConnectionPeerInfo(ctx, connPtr, addr.Addr().String(), int(addr.Port()), peerID, client); err != nil {
-		c.logger.Debug("failed to update connection peer info", "error", err)
+	ip := addr.Addr().String()
+	port := int(addr.Port())
+
+	// Extract peer_id and decode client (requires full calibration)
+	peerID, hasPeerID := c.calibration.extractPeerID(cal.Data)
+	client := ""
+	if hasPeerID {
+		client = decodePeerClient(peerID)
+	}
+
+	// Always update the connection record with at least the endpoint.
+	// When peer_id is available, include it; otherwise just set ip/port.
+	if hasPeerID {
+		if err := c.store.UpdateConnectionPeerInfo(ctx, connPtr, ip, port, peerID, client); err != nil {
+			c.logger.Debug("failed to update connection peer info", "error", err)
+		}
+	} else {
+		if err := c.store.UpdateConnectionEndpoint(ctx, connPtr, ip, port); err != nil {
+			c.logger.Debug("failed to update connection endpoint", "error", err)
+		}
 	}
 
 	// Upsert into race_peers for the dashboard
 	if hash, ok := c.connToRace[cal.ObjPtr]; ok {
 		if state, ok := c.activeRaces[hash]; ok {
-			if err := c.store.UpsertRacePeerFromCapture(ctx, state.raceID, addr.Addr().String(), int(addr.Port()), client, peerID); err != nil {
+			if err := c.store.UpsertRacePeerFromCapture(ctx, state.raceID, ip, port, client, peerID); err != nil {
 				c.logger.Debug("failed to upsert race peer from capture", "error", err)
 			}
 		}
 	}
 
-	c.logger.Debug("calibration: resolved connection (full)",
+	c.logger.Debug("calibration: resolved connection",
 		"ptr", fmt.Sprintf("0x%x", cal.ObjPtr),
 		"addr", addr.String(),
-		"client", client)
+		"client", client,
+		"has_peer_id", hasPeerID)
 }
 
 // onFullCalibration is called when both sockaddr_in and peer_id offsets have
@@ -738,7 +748,7 @@ func (c *Coordinator) handlePeerAddrsUpdate(update peerAddrsUpdate) {
 	if c.calibration.isCalibrated() {
 		for ptr, addr := range c.connEndpoints {
 			if _, resolved := c.connToRace[ptr]; !resolved {
-				c.resolveConnToRace(context.Background(), ptr, addr)
+				c.resolveConnToRace(ptr, addr)
 			}
 		}
 	}
@@ -746,34 +756,40 @@ func (c *Coordinator) handlePeerAddrsUpdate(update peerAddrsUpdate) {
 
 // reprocessPendingCalibrations extracts endpoints (and optionally peer_id)
 // from buffered calibration events after offsets have been locked in.
+//
+// Pending events are only cleared when fully calibrated. During partial
+// calibration (sockaddr_in only), events are kept so they can be
+// reprocessed through the full path once peer_id calibration completes.
 func (c *Coordinator) reprocessPendingCalibrations(ctx context.Context) {
 	pending := c.calibration.pending
-	c.calibration.pending = nil
+
+	if c.calibration.isFullyCalibrated() {
+		// Clear: all events will get the full extractAndResolve treatment.
+		c.calibration.pending = nil
+	}
+	// else: keep pending for reprocessing once peer_id calibration completes.
 
 	for _, cal := range pending {
-		if c.calibration.isFullyCalibrated() {
-			c.extractAndResolve(ctx, cal)
-		} else if c.calibration.isCalibrated() {
-			addr, ok := c.calibration.extractEndpoint(cal.Data)
-			if !ok {
-				continue
-			}
-			c.connEndpoints[cal.ObjPtr] = addr
-			c.resolveConnToRace(ctx, cal.ObjPtr, addr)
+		// extractAndResolve handles both partial (ip/port only) and full
+		// (ip/port/peer_id/client) calibration, always writing to the DB.
+		c.extractAndResolve(ctx, cal)
 
-			// Also try peer_id calibration on pending events
+		// During partial calibration, also try peer_id offset discovery.
+		if c.calibration.isCalibrated() && !c.calibration.isFullyCalibrated() {
 			c.calibration.tryCalibratePeerID(cal, c.knownPeerIDs)
 		}
 	}
 
 	c.logger.Debug("calibration: reprocessed pending events",
 		"count", len(pending),
+		"fully_calibrated", c.calibration.isFullyCalibrated(),
 		"resolved", len(c.connEndpoints))
 }
 
 // resolveConnToRace maps a peer_connection* to its owning race by looking up
-// the resolved IP:port in the known peer address map.
-func (c *Coordinator) resolveConnToRace(_ context.Context, ptr uint64, addr netip.AddrPort) {
+// the resolved IP:port in the known peer address map. This only handles
+// in-memory routing; DB updates are handled by extractAndResolve.
+func (c *Coordinator) resolveConnToRace(ptr uint64, addr netip.AddrPort) {
 	races, ok := c.knownPeerAddrs[addr]
 	if !ok || len(races) == 0 {
 		return
@@ -784,14 +800,6 @@ func (c *Coordinator) resolveConnToRace(_ context.Context, ptr uint64, addr neti
 	for hash := range races {
 		if _, active := c.activeRaces[hash]; active {
 			c.connToRace[ptr] = hash
-
-			// Also update the connection record in the DB with the resolved endpoint.
-			connPtr := fmt.Sprintf("%x", ptr)
-			ip := addr.Addr().String()
-			port := int(addr.Port())
-			if err := c.store.UpdateConnectionEndpoint(context.Background(), connPtr, ip, port); err != nil {
-				c.logger.Debug("failed to update connection endpoint", "error", err)
-			}
 			return
 		}
 	}

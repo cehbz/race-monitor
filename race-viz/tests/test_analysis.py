@@ -1,0 +1,233 @@
+"""Unit tests for analysis.py — pure function tests with no DB or Flask dependency."""
+
+import pytest
+from datetime import datetime, timezone
+
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from analysis import (
+    parse_rfc3339,
+    decode_peer_id,
+    build_cumulative_curve,
+    build_piece_count_curve,
+    classify_peer,
+    extrapolate_finish_time,
+)
+
+
+# --- parse_rfc3339 ---
+
+class TestParseRfc3339:
+    def test_valid_utc_z(self):
+        dt = parse_rfc3339('2026-02-09T05:18:37.753Z')
+        assert dt is not None
+        assert dt.year == 2026
+        assert dt.month == 2
+        assert dt.second == 37
+        assert dt.tzinfo is not None
+
+    def test_valid_offset(self):
+        dt = parse_rfc3339('2026-02-09T05:18:37+00:00')
+        assert dt is not None
+        assert dt.year == 2026
+
+    def test_none(self):
+        assert parse_rfc3339(None) is None
+
+    def test_empty_string(self):
+        assert parse_rfc3339('') is None
+
+    def test_non_string(self):
+        assert parse_rfc3339(12345) is None
+
+    def test_garbage(self):
+        assert parse_rfc3339('not-a-date') is None
+
+
+# --- decode_peer_id ---
+
+class TestDecodePeerId:
+    def test_none(self):
+        assert decode_peer_id(None) == ''
+
+    def test_str_passthrough(self):
+        assert decode_peer_id('-qB4530-abc') == '-qB4530-abc'
+
+    def test_all_ascii_bytes(self):
+        raw = b'-qB4530-abcdefgh'
+        assert decode_peer_id(raw) == '-qB4530-abcdefgh'
+
+    def test_mixed_bytes(self):
+        # ASCII prefix followed by non-printable bytes
+        raw = b'-qB4530-' + bytes([0x01, 0xFF, 0x00, 0xAB])
+        result = decode_peer_id(raw)
+        assert result == '-qB4530-01ff00ab'
+
+    def test_all_binary(self):
+        raw = bytes([0x00, 0x01, 0x02])
+        assert decode_peer_id(raw) == '000102'
+
+    def test_empty_bytes(self):
+        assert decode_peer_id(b'') == ''
+
+
+# --- build_cumulative_curve ---
+
+class TestBuildCumulativeCurve:
+    def test_basic(self):
+        # 3 pieces arriving at 1.5s, 3.2s, 5.0s; piece_count=10
+        times = [1.5, 3.2, 5.0]
+        secs, pcts = build_cumulative_curve(times, 10)
+        assert len(secs) > 0
+        assert len(secs) == len(pcts)
+        # After second 5, should have 3/10 = 30%
+        assert pcts[-1] == 30.0
+
+    def test_empty(self):
+        secs, pcts = build_cumulative_curve([], 100)
+        assert secs == []
+        assert pcts == []
+
+    def test_zero_piece_count(self):
+        secs, pcts = build_cumulative_curve([1.0], 0)
+        assert secs == []
+        assert pcts == []
+
+    def test_unsorted_input(self):
+        # Should sort internally
+        times = [5.0, 1.0, 3.0]
+        secs, pcts = build_cumulative_curve(times, 10)
+        assert pcts[-1] == 30.0
+        # Percentages should be non-decreasing
+        for i in range(1, len(pcts)):
+            assert pcts[i] >= pcts[i - 1]
+
+    def test_all_at_same_time(self):
+        times = [2.0, 2.0, 2.0]
+        secs, pcts = build_cumulative_curve(times, 3)
+        assert pcts[-1] == 100.0
+
+
+# --- build_piece_count_curve ---
+
+class TestBuildPieceCountCurve:
+    def test_basic(self):
+        times = [0.5, 1.2, 3.8]
+        curve = build_piece_count_curve(times, 5)
+        assert len(curve) == 6  # 0..5
+        assert curve[0] == 0
+        assert curve[1] == 1   # 0.5 <= 1
+        assert curve[2] == 2   # 1.2 <= 2
+        assert curve[3] == 2
+        assert curve[4] == 3   # 3.8 <= 4
+        assert curve[5] == 3
+
+    def test_empty(self):
+        curve = build_piece_count_curve([], 3)
+        assert curve == [0, 0, 0, 0]
+
+    def test_all_before_start(self):
+        times = [-2.0, -1.0]
+        curve = build_piece_count_curve(times, 3)
+        assert curve[0] == 2  # both <= 0
+        assert curve[3] == 2
+
+
+# --- classify_peer ---
+
+class TestClassifyPeer:
+    def _make_curves(self, our_pieces_per_sec, peer_pieces_per_sec, duration):
+        """Helper: build linear cumulative curves."""
+        our = [min(i * our_pieces_per_sec, 100) for i in range(duration + 1)]
+        peer = [min(i * peer_pieces_per_sec, 100) for i in range(duration + 1)]
+        return our, peer
+
+    def test_seeder(self):
+        # Peer has 90 pre-race pieces out of 100 piece_count
+        our = [i for i in range(101)]    # 0..100
+        peer = [100] * 101               # all pieces from start
+        result = classify_peer(peer, our, 100, 100, 90)
+        assert result is not None
+        assert result['category'] == 'seeder'
+
+    def test_competitive(self):
+        # Peer consistently 10% ahead for the whole race
+        our = list(range(0, 101))          # 0..100 pieces over 100 seconds
+        peer = [min(i + 10, 100) for i in range(101)]  # 10 pieces ahead
+        result = classify_peer(peer, our, 100, 100, 0)
+        assert result is not None
+        assert result['category'] == 'competitive'
+        assert result['ahead_secs'] > 0
+        assert result['avg_lead_pct'] >= 2.0
+
+    def test_same_speed_skip(self):
+        # Both at the same rate — should not be classified as faster
+        curve = list(range(0, 101))
+        result = classify_peer(curve, curve, 100, 100, 0)
+        assert result is None
+
+    def test_slower_skip(self):
+        # Peer is slower than us
+        our = list(range(0, 101))
+        peer = [i // 2 for i in range(101)]
+        result = classify_peer(peer, our, 100, 100, 0)
+        assert result is None
+
+    def test_brief_lead_skip(self):
+        # Peer leads for only 2 seconds out of 100 — below threshold
+        our = list(range(0, 101))
+        peer = list(range(0, 101))
+        peer[10] = our[10] + 5
+        peer[11] = our[11] + 5
+        result = classify_peer(peer, our, 100, 100, 0)
+        assert result is None
+
+
+# --- extrapolate_finish_time ---
+
+class TestExtrapolateFinishTime:
+    def test_nearly_done(self):
+        # 96% complete at second 50 — should return 50
+        secs = [10, 20, 30, 40, 50]
+        pcts = [20.0, 40.0, 60.0, 80.0, 96.0]
+        result = extrapolate_finish_time(secs, pcts, 100)
+        assert result == 50
+
+    def test_linear_projection(self):
+        # Linear 10%/10s rate, at 50% at second 50 → project 100% at 100s
+        secs = [10, 20, 30, 40, 50]
+        pcts = [10.0, 20.0, 30.0, 40.0, 50.0]
+        result = extrapolate_finish_time(secs, pcts, 100)
+        assert result is not None
+        assert abs(result - 100.0) < 1.0  # ~100 seconds
+
+    def test_flat_curve(self):
+        # Stuck at 30% — can't extrapolate
+        secs = [10, 20, 30, 40, 50]
+        pcts = [30.0, 30.0, 30.0, 30.0, 30.0]
+        result = extrapolate_finish_time(secs, pcts, 100)
+        assert result is None
+
+    def test_insufficient_data(self):
+        # Only 1 point
+        result = extrapolate_finish_time([10], [20.0], 100)
+        assert result is None
+
+    def test_empty(self):
+        assert extrapolate_finish_time([], [], 100) is None
+
+    def test_decreasing_curve(self):
+        # Regression — shouldn't extrapolate forward
+        secs = [10, 20, 30, 40, 50]
+        pcts = [50.0, 45.0, 40.0, 35.0, 30.0]
+        result = extrapolate_finish_time(secs, pcts, 100)
+        assert result is None
+
+    def test_slow_peer(self):
+        # 2%/10s rate, at 20% at 100s → project 100% at 500s
+        secs = list(range(10, 110, 10))
+        pcts = [2.0 * i for i in range(1, 11)]  # 2, 4, ..., 20
+        result = extrapolate_finish_time(secs, pcts, 100)
+        assert result is not None
+        assert abs(result - 500.0) < 5.0

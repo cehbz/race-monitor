@@ -6,11 +6,7 @@
     <title>Race Monitor Dashboard</title>
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
@@ -19,28 +15,15 @@
             line-height: 1.6;
         }
 
-        .container {
-            max-width: 1800px;
-            margin: 0 auto;
-            padding: 20px;
-        }
+        .container { max-width: 1800px; margin: 0 auto; padding: 20px; }
 
         header {
             margin-bottom: 30px;
             border-bottom: 1px solid #30363d;
             padding-bottom: 15px;
         }
-
-        h1 {
-            font-size: 24px;
-            font-weight: 600;
-            margin-bottom: 5px;
-        }
-
-        .subtitle {
-            color: #8b949e;
-            font-size: 14px;
-        }
+        h1 { font-size: 24px; font-weight: 600; margin-bottom: 5px; }
+        .subtitle { color: #8b949e; font-size: 14px; }
 
         #race-list {
             background: #161b22;
@@ -57,31 +40,13 @@
             cursor: pointer;
             transition: background 0.15s;
         }
+        .race-item:last-child { border-bottom: none; }
+        .race-item:hover { background: #1c2128; }
+        .race-item.selected { background: #21262d; border-left: 3px solid #58a6ff; }
+        .race-item.selected:hover { background: #1c2128; }
 
-        .race-item:last-child {
-            border-bottom: none;
-        }
-
-        .race-item:hover {
-            background: #1c2128;
-        }
-
-        .race-item.selected {
-            background: #21262d;
-            border-left: 3px solid #58a6ff;
-        }
-
-        .race-item.selected:hover {
-            background: #1c2128;
-        }
-
-        .race-name {
-            font-weight: 500;
-            font-size: 14px;
-            margin-bottom: 4px;
-            color: #e6edf3;
-        }
-
+        .race-name { font-weight: 500; font-size: 14px; margin-bottom: 4px; color: #e6edf3; }
+        .race-hash { font-size: 11px; color: #6e7681; font-family: monospace; margin-bottom: 4px; }
         .race-meta {
             font-size: 12px;
             color: #8b949e;
@@ -89,20 +54,10 @@
             gap: 20px;
             flex-wrap: wrap;
         }
+        .race-meta span { display: inline-flex; align-items: center; gap: 4px; }
 
-        .race-meta span {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-        }
-
-        #visualization {
-            display: none;
-        }
-
-        #visualization.active {
-            display: block;
-        }
+        #visualization { display: none; }
+        #visualization.active { display: block; }
 
         .chart-container {
             background: #161b22;
@@ -111,26 +66,10 @@
             padding: 20px;
             margin-bottom: 20px;
         }
+        .chart-title { font-size: 16px; font-weight: 600; margin-bottom: 15px; color: #e6edf3; }
+        .chart-info { font-size: 12px; color: #8b949e; font-weight: 400; margin-left: 10px; }
 
-        .chart-title {
-            font-size: 16px;
-            font-weight: 600;
-            margin-bottom: 15px;
-            color: #e6edf3;
-        }
-
-        .chart-info {
-            font-size: 12px;
-            color: #8b949e;
-            font-weight: 400;
-            margin-left: 10px;
-        }
-
-        .loading {
-            text-align: center;
-            padding: 40px;
-            color: #8b949e;
-        }
+        .loading { text-align: center; padding: 40px; color: #8b949e; }
 
         .error {
             background: #2d1519;
@@ -147,20 +86,13 @@
             gap: 15px;
             margin-bottom: 20px;
         }
-
         .stat-card {
             background: #161b22;
             border: 1px solid #30363d;
             border-radius: 6px;
             padding: 16px;
         }
-
-        .stat-label {
-            font-size: 12px;
-            color: #8b949e;
-            margin-bottom: 4px;
-        }
-
+        .stat-label { font-size: 12px; color: #8b949e; margin-bottom: 4px; }
         .stat-value {
             font-size: 20px;
             font-weight: 600;
@@ -169,42 +101,23 @@
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+        .stat-value.multiline { font-size: 14px; white-space: normal; word-break: break-word; }
+        .stat-value.mono { font-family: monospace; font-size: 12px; white-space: normal; word-break: break-all; }
 
-        .stat-value.multiline {
-            font-size: 14px;
-            white-space: normal;
-            word-break: break-word;
-        }
-
-        .analysis-stats {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 20px;
-        }
-
+        .analysis-stats { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; }
         .stat-mini {
             flex: 1;
+            min-width: 120px;
             background: #0d1117;
             border: 1px solid #30363d;
             border-radius: 6px;
             padding: 12px;
             text-align: center;
         }
+        .stat-mini .stat-label { font-size: 11px; }
+        .stat-mini .stat-value { font-size: 18px; }
 
-        .stat-mini .stat-label {
-            font-size: 11px;
-        }
-
-        .stat-mini .stat-value {
-            font-size: 18px;
-        }
-
-        .peer-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-
+        .peer-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
         .peer-table th {
             text-align: left;
             padding: 8px;
@@ -213,21 +126,9 @@
             font-weight: 600;
             font-size: 12px;
         }
-
-        .peer-table td {
-            padding: 8px;
-            border-bottom: 1px solid #30363d;
-            font-size: 13px;
-        }
-
-        .peer-table tr:last-child td {
-            border-bottom: none;
-        }
-
-        .peer-table .num {
-            text-align: right;
-            font-variant-numeric: tabular-nums;
-        }
+        .peer-table td { padding: 8px; border-bottom: 1px solid #30363d; font-size: 13px; }
+        .peer-table tr:last-child td { border-bottom: none; }
+        .peer-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 
         .badge {
             display: inline-block;
@@ -236,20 +137,10 @@
             font-size: 11px;
             font-weight: 600;
         }
-
-        .badge.seeder {
-            background: rgba(63, 185, 80, 0.2);
-            color: #3fb950;
-        }
-
-        .badge.competitive {
-            background: rgba(248, 81, 73, 0.2);
-            color: #f85149;
-        }
-
-        .seeder-row td {
-            opacity: 0.7;
-        }
+        .badge.seeder { background: rgba(63, 185, 80, 0.2); color: #3fb950; }
+        .badge.competitive { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+        .beat-us { color: #3fb950; font-weight: 600; font-size: 12px; }
+        .seeder-row td { opacity: 0.7; }
     </style>
 </head>
 <body>
@@ -269,59 +160,35 @@
     <script>
         let selectedRaceId = null;
 
-        // Restore full race list view
         function showAllRaces() {
             document.querySelectorAll('.race-item').forEach(item => {
                 item.style.display = 'block';
                 item.classList.remove('selected');
-                item.onclick = function() {
-                    const raceId = parseInt(this.dataset.raceId);
-                    loadRaceData(raceId);
-                };
+                item.onclick = function() { loadRaceData(parseInt(this.dataset.raceId)); };
             });
-
             document.getElementById('visualization').classList.remove('active');
             selectedRaceId = null;
         }
 
-        // Parse RFC 3339 timestamp (e.g. "2026-02-09T05:18:37.753Z") into Date.
         function parseTS(ts) {
             if (!ts) return null;
             const d = new Date(ts);
             return isNaN(d.getTime()) ? null : d;
         }
 
-        // Plotly layout configuration (shared)
         const commonLayout = {
             paper_bgcolor: '#161b22',
             plot_bgcolor: '#0d1117',
             font: { color: '#e6edf3', family: 'monospace' },
             margin: { l: 80, r: 40, t: 20, b: 60 },
             hovermode: 'closest',
-            xaxis: {
-                gridcolor: '#30363d',
-                zerolinecolor: '#30363d',
-                title: 'Elapsed Time (seconds)'
-            },
-            yaxis: {
-                gridcolor: '#30363d',
-                zerolinecolor: '#30363d'
-            },
-            legend: {
-                bgcolor: '#0d1117',
-                bordercolor: '#30363d',
-                borderwidth: 1
-            }
+            xaxis: { gridcolor: '#30363d', zerolinecolor: '#30363d', title: 'Elapsed Time (seconds)' },
+            yaxis: { gridcolor: '#30363d', zerolinecolor: '#30363d' },
+            legend: { bgcolor: '#0d1117', bordercolor: '#30363d', borderwidth: 1 }
         };
 
-        const plotlyConfig = {
-            responsive: true,
-            displayModeBar: true,
-            displaylogo: false,
-            scrollZoom: true
-        };
+        const plotlyConfig = { responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true };
 
-        // Color palette for peers
         const peerColors = [
             '#3fb950', '#d29922', '#f85149', '#a371f7', '#f778ba',
             '#79c0ff', '#ffa657', '#7ee787', '#d2a8ff', '#ff7b72',
@@ -329,12 +196,12 @@
             '#b392f0', '#fddf68', '#f692ce', '#8ddb8c', '#e09b13'
         ];
 
-        // Fetch and display race list
+        // --- Race list with async count enrichment ---
+
         async function loadRaces() {
             try {
                 const response = await fetch('/api/races');
                 const races = await response.json();
-
                 const container = document.getElementById('race-list');
 
                 if (races.length === 0) {
@@ -343,7 +210,6 @@
                 }
 
                 container.innerHTML = '';
-
                 races.forEach(race => {
                     const item = document.createElement('div');
                     item.className = 'race-item';
@@ -352,27 +218,44 @@
 
                     const startDate = parseTS(race.started_at);
                     const status = race.completed_at ? 'Done' : 'Running';
+                    const shortHash = race.info_hash ? race.info_hash.slice(0, 12) + '\u2026' : '';
 
                     item.innerHTML = `
-                        <div class="race-name">${status} &mdash; ${race.name || race.hash}</div>
+                        <div class="race-name">${status} &mdash; ${race.name || race.info_hash || 'Unknown'}</div>
+                        ${shortHash ? `<div class="race-hash" title="${race.info_hash}">${shortHash}</div>` : ''}
                         <div class="race-meta">
                             <span>${startDate ? startDate.toLocaleString() : race.started_at}</span>
                             <span>${formatBytes(race.size)}</span>
                             <span>${race.piece_count} pieces</span>
-                            <span>${race.peer_count} peers</span>
-                            <span>${numberWithCommas(race.event_count)} events</span>
+                            <span data-count="peers-${race.id}">&mdash; peers</span>
+                            <span data-count="events-${race.id}">&mdash; events</span>
                         </div>
                     `;
-
                     container.appendChild(item);
                 });
+
+                // Async enrichment: fetch counts in background
+                const ids = races.map(r => r.id);
+                try {
+                    const countsResp = await fetch(`/api/races/counts?ids=${ids.join(',')}`);
+                    const counts = await countsResp.json();
+                    for (const [raceId, data] of Object.entries(counts)) {
+                        const peersEl = document.querySelector(`[data-count="peers-${raceId}"]`);
+                        const eventsEl = document.querySelector(`[data-count="events-${raceId}"]`);
+                        if (peersEl) peersEl.textContent = `${data.peer_count} peers`;
+                        if (eventsEl) eventsEl.textContent = `${numberWithCommas(data.event_count)} events`;
+                    }
+                } catch (e) {
+                    console.warn('Failed to load race counts:', e);
+                }
             } catch (error) {
                 document.getElementById('race-list').innerHTML =
                     `<div class="error">Error loading races: ${error.message}</div>`;
             }
         }
 
-        // Load detailed race data and visualize
+        // --- Race detail view ---
+
         async function loadRaceData(raceId) {
             selectedRaceId = raceId;
 
@@ -391,7 +274,6 @@
             viz.innerHTML = '<div class="loading">Loading race data...</div>';
 
             try {
-                // Fetch race metadata + timeline first (fastest)
                 const raceResp = await fetch(`/api/race/${raceId}`);
                 const raceData = await raceResp.json();
 
@@ -400,7 +282,6 @@
                     return;
                 }
 
-                // Build visualization container
                 viz.innerHTML = `
                     <div class="stats-grid" id="race-stats"></div>
 
@@ -426,13 +307,21 @@
                         <div class="chart-title">Faster Peers Analysis</div>
                         <div id="faster-peers-section"><div class="loading">Analyzing peer performance...</div></div>
                     </div>
+
+                    ${raceData.race_peers && raceData.race_peers.length > 0 ? `
+                    <div class="chart-container">
+                        <div class="chart-title">Known Peers <span class="chart-info">(from qBittorrent API polling)</span></div>
+                        <div id="race-peers-section"></div>
+                    </div>
+                    ` : ''}
                 `;
 
-                // Render stats and timeline charts immediately
                 displayRaceStats(raceData);
                 renderTimelineCharts(raceData);
+                if (raceData.race_peers && raceData.race_peers.length > 0) {
+                    renderRacePeers(raceData.race_peers);
+                }
 
-                // Fetch peer_progress and faster_peers in parallel
                 const [progressResp, fasterResp] = await Promise.all([
                     fetch(`/api/race/${raceId}/peer_progress`),
                     fetch(`/api/race/${raceId}/faster_peers`)
@@ -449,13 +338,12 @@
             }
         }
 
-        // Render timeline-based charts (progress + event activity)
+        // --- Charts ---
+
         function renderTimelineCharts(data) {
             const { race, timeline } = data;
-
             const times = timeline.map(t => t.elapsed_sec);
 
-            // Piece completion progress (cumulative we_have over time)
             let cumulative = 0;
             const cumulativePieces = timeline.map(t => {
                 cumulative += (t.piece_received || 0);
@@ -463,19 +351,15 @@
             });
 
             Plotly.newPlot('progress-chart', [{
-                x: times,
-                y: cumulativePieces,
-                mode: 'lines',
-                name: 'Pieces Completed',
+                x: times, y: cumulativePieces,
+                mode: 'lines', name: 'Pieces Completed',
                 line: { color: '#58a6ff', width: 2 },
-                fill: 'tozeroy',
-                fillcolor: 'rgba(88, 166, 255, 0.1)',
+                fill: 'tozeroy', fillcolor: 'rgba(88, 166, 255, 0.1)',
                 hovertemplate: '%{y} pieces at %{x}s<extra></extra>'
             }, {
                 x: [times[0] || 0, times[times.length - 1] || 1],
                 y: [race.piece_count, race.piece_count],
-                mode: 'lines',
-                name: 'Total Pieces',
+                mode: 'lines', name: 'Total Pieces',
                 line: { color: '#8b949e', width: 1, dash: 'dot' },
                 hoverinfo: 'skip'
             }], {
@@ -483,27 +367,18 @@
                 yaxis: { ...commonLayout.yaxis, title: 'Pieces Completed' }
             }, plotlyConfig);
 
-            // Event activity chart (stacked area)
             Plotly.newPlot('event-chart', [
                 {
-                    x: times,
-                    y: timeline.map(t => t.piece_received || 0),
-                    mode: 'lines',
-                    name: 'Piece Received (we_have)',
-                    line: { width: 0 },
-                    fillcolor: 'rgba(86, 211, 100, 0.5)',
-                    fill: 'tozeroy',
-                    stackgroup: 'one'
+                    x: times, y: timeline.map(t => t.piece_received || 0),
+                    mode: 'lines', name: 'Piece Received (we_have)',
+                    line: { width: 0 }, fillcolor: 'rgba(86, 211, 100, 0.5)',
+                    fill: 'tozeroy', stackgroup: 'one'
                 },
                 {
-                    x: times,
-                    y: timeline.map(t => t.have_count || 0),
-                    mode: 'lines',
-                    name: 'Peer Have (incoming_have)',
-                    line: { width: 0 },
-                    fillcolor: 'rgba(88, 166, 255, 0.5)',
-                    fill: 'tozeroy',
-                    stackgroup: 'one'
+                    x: times, y: timeline.map(t => t.have_count || 0),
+                    mode: 'lines', name: 'Peer Have (incoming_have)',
+                    line: { width: 0 }, fillcolor: 'rgba(88, 166, 255, 0.5)',
+                    fill: 'tozeroy', stackgroup: 'one'
                 }
             ], {
                 ...commonLayout,
@@ -511,71 +386,50 @@
             }, plotlyConfig);
         }
 
-        // Render per-peer completion chart
         function renderPeerProgressChart(data, pieceCount) {
             const container = document.getElementById('peer-progress-chart');
-
             if (!data.self && data.peers.length === 0) {
                 container.innerHTML = '<div class="loading">No peer progress data available.</div>';
                 return;
             }
 
             const traces = [];
-
-            // "Us" trace — thick, always visible
             if (data.self) {
                 traces.push({
-                    x: data.self.elapsed_secs,
-                    y: data.self.completion_pcts,
-                    mode: 'lines',
-                    name: 'Us',
+                    x: data.self.elapsed_secs, y: data.self.completion_pcts,
+                    mode: 'lines', name: 'Us',
                     line: { color: '#58a6ff', width: 3 },
                     hovertemplate: 'Us: %{y:.1f}% at %{x}s<extra></extra>'
                 });
             }
 
-            // Peer traces — thin, semi-transparent, legend-toggleable
             data.peers.forEach((peer, idx) => {
                 const color = peerColors[idx % peerColors.length];
                 traces.push({
-                    x: peer.elapsed_secs,
-                    y: peer.completion_pcts,
-                    mode: 'lines',
-                    name: peer.label,
-                    line: { color: color, width: 1 },
-                    opacity: 0.6,
+                    x: peer.elapsed_secs, y: peer.completion_pcts,
+                    mode: 'lines', name: peer.label,
+                    line: { color: color, width: 1 }, opacity: 0.6,
                     hovertemplate: peer.label + ': %{y:.1f}% at %{x}s<extra></extra>',
-                    // Hide peers beyond top 30 by default (toggle via legend)
                     visible: idx < 30 ? true : 'legendonly'
                 });
             });
 
             container.innerHTML = '';
-
             Plotly.newPlot('peer-progress-chart', traces, {
                 ...commonLayout,
-                yaxis: {
-                    ...commonLayout.yaxis,
-                    title: 'Completion %',
-                    range: [0, 105]
-                },
-                xaxis: {
-                    ...commonLayout.xaxis,
-                    title: 'Elapsed Time (seconds)'
-                },
+                yaxis: { ...commonLayout.yaxis, title: 'Completion %', range: [0, 105] },
+                xaxis: { ...commonLayout.xaxis, title: 'Elapsed Time (seconds)' },
                 hovermode: 'x unified',
                 legend: {
                     ...commonLayout.legend,
-                    y: 1,
-                    yanchor: 'top',
-                    x: 1.02,
-                    xanchor: 'left',
+                    y: 1, yanchor: 'top', x: 1.02, xanchor: 'left',
                     font: { size: 10, color: '#8b949e' }
                 }
             }, plotlyConfig);
         }
 
-        // Render faster peers analysis
+        // --- Faster peers ---
+
         function renderFasterPeers(data) {
             const container = document.getElementById('faster-peers-section');
 
@@ -602,6 +456,10 @@
                         <div class="stat-label">Competitive</div>
                         <div class="stat-value" style="color: #f85149">${data.stats.competitive_peers}</div>
                     </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">Finished Before Us</div>
+                        <div class="stat-value" style="color: #d29922">${data.stats.finished_before_us_count}</div>
+                    </div>
                 </div>
             `;
 
@@ -620,6 +478,8 @@
                                 <th class="num">Avg Lead %</th>
                                 <th class="num">Peak Lead %</th>
                                 <th class="num">Pieces</th>
+                                <th class="num">Proj. Finish</th>
+                                <th>vs Us</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -630,6 +490,13 @@
                     const peerLabel = peer.ip
                         ? peer.ip
                         : `<code title="${peer.conn_ptr}">${shortHex(peer.conn_ptr)}</code>`;
+                    const projFinish = peer.projected_finish_sec != null
+                        ? formatDuration(peer.projected_finish_sec)
+                        : '\u2014';
+                    const vsUs = peer.finished_before_us
+                        ? '<span class="beat-us">\u2713 beat us</span>'
+                        : '\u2014';
+
                     html += `
                         <tr class="${rowClass}">
                             <td>${peerLabel}</td>
@@ -640,6 +507,8 @@
                             <td class="num">${peer.avg_lead_pct.toFixed(1)}%</td>
                             <td class="num">${peer.max_lead_pct.toFixed(1)}%</td>
                             <td class="num">${peer.total_pieces}</td>
+                            <td class="num">${projFinish}</td>
+                            <td>${vsUs}</td>
                         </tr>
                     `;
                 });
@@ -650,7 +519,73 @@
             container.innerHTML = html;
         }
 
-        // Display race statistics
+        function renderRacePeers(peers) {
+            const container = document.getElementById('race-peers-section');
+            if (!container) return;
+
+            if (!peers || peers.length === 0) {
+                container.innerHTML = '<div class="loading">No API-polled peers recorded.</div>';
+                return;
+            }
+
+            const seeders = peers.filter(p => p.progress >= 1.0).length;
+            const avgProgress = peers.reduce((s, p) => s + (p.progress || 0), 0) / peers.length;
+
+            let html = `
+                <div class="analysis-stats">
+                    <div class="stat-mini">
+                        <div class="stat-label">Known Peers</div>
+                        <div class="stat-value">${peers.length}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">Seeders</div>
+                        <div class="stat-value" style="color: #3fb950">${seeders}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">Avg Progress</div>
+                        <div class="stat-value">${(avgProgress * 100).toFixed(1)}%</div>
+                    </div>
+                </div>
+                <table class="peer-table">
+                    <thead>
+                        <tr>
+                            <th>IP</th>
+                            <th class="num">Port</th>
+                            <th>Client</th>
+                            <th>Country</th>
+                            <th class="num">Progress</th>
+                            <th class="num">DL Speed</th>
+                            <th class="num">UL Speed</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            peers.forEach(peer => {
+                const progress = peer.progress != null ? (peer.progress * 100).toFixed(1) + '%' : '\u2014';
+                const dlSpeed = peer.dl_speed ? formatBytes(peer.dl_speed) + '/s' : '\u2014';
+                const ulSpeed = peer.up_speed ? formatBytes(peer.up_speed) + '/s' : '\u2014';
+                const rowClass = peer.progress >= 1.0 ? 'seeder-row' : '';
+
+                html += `
+                    <tr class="${rowClass}">
+                        <td>${peer.ip || '\u2014'}</td>
+                        <td class="num">${peer.port || '\u2014'}</td>
+                        <td>${peer.client || '\u2014'}</td>
+                        <td>${peer.country || '\u2014'}</td>
+                        <td class="num">${progress}</td>
+                        <td class="num">${dlSpeed}</td>
+                        <td class="num">${ulSpeed}</td>
+                    </tr>
+                `;
+            });
+
+            html += '</tbody></table>';
+            container.innerHTML = html;
+        }
+
+        // --- Stats ---
+
         function displayRaceStats(data) {
             const { race, timeline, peer_count } = data;
             const statsContainer = document.getElementById('race-stats');
@@ -669,10 +604,16 @@
                 if (last) duration = formatDuration(last.elapsed_sec);
             }
 
+            const infoHash = race.info_hash || '';
+
             statsContainer.innerHTML = `
                 <div class="stat-card">
                     <div class="stat-label">Race Name</div>
                     <div class="stat-value multiline">${race.name || 'Unknown'}</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Info Hash</div>
+                    <div class="stat-value mono">${infoHash}</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Total Size</div>
@@ -701,7 +642,8 @@
             `;
         }
 
-        // Utility: Format bytes
+        // --- Utilities ---
+
         function formatBytes(bytes) {
             if (!bytes || bytes === 0) return '0 B';
             const k = 1024;
@@ -710,58 +652,46 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
-        // Utility: Format duration
         function formatDuration(seconds) {
             if (!seconds || seconds < 0) return 'Unknown';
             const h = Math.floor(seconds / 3600);
             const m = Math.floor((seconds % 3600) / 60);
             const s = Math.floor(seconds % 60);
-
             if (h > 0) return `${h}h ${m}m ${s}s`;
             if (m > 0) return `${m}m ${s}s`;
             return `${s}s`;
         }
 
-        // Utility: Number with commas
         function numberWithCommas(x) {
             if (x == null) return '0';
             return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
         }
 
-        // Utility: Format eBPF conn_ptr as short hex identifier
         function shortHex(connPtr) {
             if (!connPtr) return '';
             const s = connPtr.replace(/^0x/, '');
             return s.length > 8 ? '\u2026' + s.slice(-8) : s;
         }
 
-        // Server-Sent Events for real-time updates
+        // --- SSE ---
+
         function connectSSE() {
             const eventSource = new EventSource('/api/events');
-
             eventSource.onmessage = function(event) {
                 try {
                     const data = JSON.parse(event.data);
-
-                    if (data.type === 'race_added') {
-                        console.log('New race added, refreshing list...');
-                        if (!selectedRaceId) {
-                            loadRaces();
-                        }
+                    if (data.type === 'race_added' && !selectedRaceId) {
+                        loadRaces();
                     }
-                } catch (e) {
-                    // Ignore parsing errors (keepalive comments, etc.)
-                }
+                } catch (e) { /* keepalive comments */ }
             };
-
-            eventSource.onerror = function(error) {
+            eventSource.onerror = function() {
                 console.log('SSE connection error, will auto-reconnect...');
             };
-
             return eventSource;
         }
 
-        // Initialize
+        // --- Init ---
         loadRaces();
         const sse = connectSSE();
     </script>

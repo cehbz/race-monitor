@@ -47,6 +47,15 @@ struct {
 	__type(value, u8);
 } seen_peers SEC(".maps");
 
+// Per-CPU scratch space for calibration_event_t to avoid exceeding the
+// 512-byte BPF stack limit. Each CPU gets its own copy, so no locking needed.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct calibration_event_t);
+} cal_scratch SEC(".maps");
+
 // trace_we_have hooks libtorrent::torrent::we_have(piece_index_t).
 // Called once per completed+verified piece. Very low frequency (~1K/race).
 // x86_64 ABI: RDI = this (torrent*), RSI = piece_index (strong_typedef<int> passed as int).
@@ -78,18 +87,26 @@ int trace_incoming_have(struct pt_regs *ctx) {
 		u8 one = 1;
 		bpf_map_update_elem(&seen_peers, &ptr, &one, BPF_ANY);
 
-		struct calibration_event_t cal = {};
-		cal.event_type = EVT_CALIBRATION;
-		cal.timestamp = bpf_ktime_get_ns();
-		cal.obj_ptr = ptr;
+		// Use per-CPU scratch map instead of stack allocation to stay
+		// within the 512-byte BPF stack limit.
+		u32 key = 0;
+		struct calibration_event_t *cal = bpf_map_lookup_elem(&cal_scratch, &key);
+		if (!cal)
+			goto emit_have;
+
+		__builtin_memset(cal, 0, sizeof(*cal));
+		cal->event_type = EVT_CALIBRATION;
+		cal->timestamp = bpf_ktime_get_ns();
+		cal->obj_ptr = ptr;
 
 		// Read raw struct bytes from user-space peer_connection object.
 		// bpf_probe_read_user because uprobes execute in user-space context.
-		bpf_probe_read_user(cal.data, CALIBRATION_READ_SIZE, (void *)ptr);
+		bpf_probe_read_user(cal->data, CALIBRATION_READ_SIZE, (void *)ptr);
 
-		bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &cal, sizeof(cal));
+		bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, cal, sizeof(*cal));
 	}
 
+emit_have:;
 	// Always emit the normal incoming_have event
 	struct event_t event = {};
 	event.event_type = EVT_INCOMING_HAVE;

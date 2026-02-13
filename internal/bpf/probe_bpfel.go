@@ -8,9 +8,19 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"structs"
 
 	"github.com/cilium/ebpf"
 )
+
+type ProbeCalibrationEventT struct {
+	_         structs.HostLayout
+	EventType uint32
+	Pad       uint32
+	Timestamp uint64
+	ObjPtr    uint64
+	Data      [512]uint8
+}
 
 // LoadProbe returns the embedded CollectionSpec for Probe.
 func LoadProbe() (*ebpf.CollectionSpec, error) {
@@ -62,7 +72,9 @@ type ProbeProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ProbeMapSpecs struct {
-	Events *ebpf.MapSpec `ebpf:"events"`
+	CalScratch *ebpf.MapSpec `ebpf:"cal_scratch"`
+	Events     *ebpf.MapSpec `ebpf:"events"`
+	SeenPeers  *ebpf.MapSpec `ebpf:"seen_peers"`
 }
 
 // ProbeVariableSpecs contains global variables before they are loaded into the kernel.
@@ -91,12 +103,16 @@ func (o *ProbeObjects) Close() error {
 //
 // It can be passed to LoadProbeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ProbeMaps struct {
-	Events *ebpf.Map `ebpf:"events"`
+	CalScratch *ebpf.Map `ebpf:"cal_scratch"`
+	Events     *ebpf.Map `ebpf:"events"`
+	SeenPeers  *ebpf.Map `ebpf:"seen_peers"`
 }
 
 func (m *ProbeMaps) Close() error {
 	return _ProbeClose(
+		m.CalScratch,
 		m.Events,
+		m.SeenPeers,
 	)
 }
 

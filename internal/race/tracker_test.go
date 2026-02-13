@@ -18,6 +18,38 @@ func trackerTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// getRacePeers queries race_peers directly via Store.DB() so that the
+// GetRacePeers method can live in a storage _test.go file (test-only code)
+// without creating a cross-package test dependency.
+func getRacePeers(t *testing.T, store *storage.Store, ctx context.Context, raceID int64) []storage.RacePeer {
+	t.Helper()
+	rows, err := store.DB().QueryContext(ctx,
+		`SELECT id, race_id, ip, port, client, peer_id, country,
+		        progress, dl_speed, up_speed, first_seen, last_seen
+		FROM race_peers WHERE race_id = ?
+		ORDER BY ip, port`, raceID)
+	if err != nil {
+		t.Fatalf("failed to query race_peers: %v", err)
+	}
+	defer rows.Close()
+
+	var peers []storage.RacePeer
+	for rows.Next() {
+		var p storage.RacePeer
+		if err := rows.Scan(&p.ID, &p.RaceID, &p.IP, &p.Port,
+			&p.Client, &p.PeerID, &p.Country,
+			&p.Progress, &p.DLSpeed, &p.UPSpeed,
+			&p.FirstSeen, &p.LastSeen); err != nil {
+			t.Fatalf("failed to scan race_peer: %v", err)
+		}
+		peers = append(peers, p)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows iteration error: %v", err)
+	}
+	return peers
+}
+
 // setupTrackerTest creates a store, torrent, and race for tracker testing.
 // Returns the store, raceID, cleanup func, and a pre-computed bootTime-relative
 // nanosecond offset for synthesizing realistic eBPF timestamps.
@@ -305,10 +337,7 @@ func TestProcessEvents_PeerPolling(t *testing.T) {
 	<-errCh
 
 	// Verify peers were stored
-	peers, err := store.GetRacePeers(ctx, raceID)
-	if err != nil {
-		t.Fatalf("failed to get race peers: %v", err)
-	}
+	peers := getRacePeers(t, store, ctx, raceID)
 	if len(peers) != 2 {
 		t.Errorf("expected 2 race peers from poll, got %d", len(peers))
 	}

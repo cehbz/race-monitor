@@ -82,40 +82,6 @@ func TestCreateTorrent(t *testing.T) {
 	})
 }
 
-func TestGetTorrentByHash(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	store.CreateTorrent(ctx, "findme", "Find.Me", 999, 42)
-
-	t.Run("found", func(t *testing.T) {
-		tor, err := store.GetTorrentByHash(ctx, "findme")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if tor == nil {
-			t.Fatal("expected non-nil torrent")
-		}
-		if tor.InfoHash != "findme" {
-			t.Errorf("expected hash findme, got %q", tor.InfoHash)
-		}
-		if tor.PieceCount != 42 {
-			t.Errorf("expected 42 pieces, got %d", tor.PieceCount)
-		}
-	})
-
-	t.Run("not found returns nil", func(t *testing.T) {
-		tor, err := store.GetTorrentByHash(ctx, "nonexistent")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if tor != nil {
-			t.Errorf("expected nil for nonexistent hash, got %+v", tor)
-		}
-	})
-}
-
 func TestCreateRace(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
@@ -387,35 +353,3 @@ func TestInsertPacketEvents(t *testing.T) {
 	})
 }
 
-func TestDeleteRaceCascades(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	torID := createTestTorrent(t, store, "cascade", "Cascade", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID)
-	connID, _ := store.InsertConnection(ctx, "conn1", time.Now())
-
-	// Insert events and peers
-	store.InsertPacketEvents(ctx, []storage.Event{
-		{RaceID: raceID, ConnectionID: connID, Timestamp: time.Now(), EventType: storage.EventTypePieceReceived, PieceIndex: 0},
-	})
-	store.UpsertRacePeers(ctx, raceID, []storage.RacePeer{
-		{IP: "10.0.0.1", Port: 6881, Client: "test", FirstSeen: time.Now(), LastSeen: time.Now()},
-	})
-
-	// Delete race — should cascade to events and race_peers
-	if err := store.DeleteRace(ctx, raceID); err != nil {
-		t.Fatalf("failed to delete race: %v", err)
-	}
-
-	_, err := store.GetRace(ctx, raceID)
-	if err != storage.ErrRaceNotFound {
-		t.Errorf("expected ErrRaceNotFound after delete, got %v", err)
-	}
-
-	peers, _ := store.GetRacePeers(ctx, raceID)
-	if len(peers) != 0 {
-		t.Errorf("expected 0 peers after cascade delete, got %d", len(peers))
-	}
-}

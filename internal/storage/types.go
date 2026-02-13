@@ -68,13 +68,6 @@ type RacePeer struct {
 	LastSeen  time.Time
 }
 
-// RacePeerAddr is a lightweight (IP, port) pair from the race_peers table.
-// Used by the calibration engine to build the known peer address set.
-type RacePeerAddr struct {
-	IP   string
-	Port int
-}
-
 // Event represents a stored packet event in the database.
 type Event struct {
 	ID           int64

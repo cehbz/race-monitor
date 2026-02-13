@@ -18,6 +18,11 @@ type Store struct {
 	db *sql.DB
 }
 
+// DB returns the underlying *sql.DB for direct queries.
+func (s *Store) DB() *sql.DB {
+	return s.db
+}
+
 // formatTS formats a time.Time as RFC 3339 with millisecond precision.
 // Produces timestamps like "2026-02-09T05:18:37.753Z" directly parseable
 // by JavaScript's Date constructor and Python's datetime.
@@ -97,8 +102,6 @@ func (s *Store) dropAll() error {
 	tables := []string{
 		"packet_events", "race_peers", "connections",
 		"races", "torrents", "event_types",
-		// Legacy table names from v1
-		"peers",
 	}
 	for _, t := range tables {
 		if _, err := s.db.Exec("DROP TABLE IF EXISTS " + t); err != nil {
@@ -240,21 +243,6 @@ func (s *Store) CreateTorrent(ctx context.Context, infoHash, name string, size i
 	return id, nil
 }
 
-// GetTorrentByHash retrieves a torrent by its info_hash.
-func (s *Store) GetTorrentByHash(ctx context.Context, infoHash string) (*Torrent, error) {
-	var t Torrent
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, info_hash, name, size, piece_count FROM torrents WHERE info_hash = ?`,
-		infoHash).Scan(&t.ID, &t.InfoHash, &t.Name, &t.Size, &t.PieceCount)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &t, nil
-}
-
 // --- Race operations ---
 
 // CreateRace creates a new race record and returns its ID.
@@ -273,13 +261,6 @@ func (s *Store) CompleteRace(ctx context.Context, raceID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE races SET completed_at = ? WHERE id = ?`,
 		formatTS(time.Now()), raceID)
-	return err
-}
-
-// DeleteRace deletes a race and its associated events (cascades via FK).
-func (s *Store) DeleteRace(ctx context.Context, raceID int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`DELETE FROM races WHERE id = ?`, raceID)
 	return err
 }
 
@@ -399,32 +380,6 @@ func (s *Store) UpsertRacePeers(ctx context.Context, raceID int64, peers []RaceP
 	return tx.Commit()
 }
 
-// GetRacePeers returns all API-sourced peers for a race.
-func (s *Store) GetRacePeers(ctx context.Context, raceID int64) ([]RacePeer, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, race_id, ip, port, client, peer_id, country,
-		        progress, dl_speed, up_speed, first_seen, last_seen
-		FROM race_peers WHERE race_id = ?
-		ORDER BY ip, port`, raceID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var peers []RacePeer
-	for rows.Next() {
-		var p RacePeer
-		if err := rows.Scan(&p.ID, &p.RaceID, &p.IP, &p.Port,
-			&p.Client, &p.PeerID, &p.Country,
-			&p.Progress, &p.DLSpeed, &p.UPSpeed,
-			&p.FirstSeen, &p.LastSeen); err != nil {
-			return nil, err
-		}
-		peers = append(peers, p)
-	}
-	return peers, rows.Err()
-}
-
 // UpdateConnectionEndpoint sets the resolved IP:port on a connection record.
 // Called after auto-calibration maps a peer_connection* to a real endpoint.
 // Uses upsert because the calibration event may arrive before the tracker
@@ -471,44 +426,6 @@ func (s *Store) UpsertRacePeerFromCapture(ctx context.Context, raceID int64, ip 
 			last_seen = excluded.last_seen`,
 		raceID, ip, port, client, peerID, now, now)
 	return err
-}
-
-// GetRacePeerAddrs returns all unique (IP, port) pairs from race_peers for
-// the given race IDs. Used by the calibration state machine to build the
-// set of known peer endpoints for pattern matching.
-func (s *Store) GetRacePeerAddrs(ctx context.Context, raceIDs []int64) ([]RacePeerAddr, error) {
-	if len(raceIDs) == 0 {
-		return nil, nil
-	}
-
-	// Build placeholder list for IN clause
-	placeholders := ""
-	args := make([]interface{}, len(raceIDs))
-	for i, id := range raceIDs {
-		if i > 0 {
-			placeholders += ","
-		}
-		placeholders += "?"
-		args[i] = id
-	}
-
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT DISTINCT ip, port FROM race_peers WHERE race_id IN (`+placeholders+`)`,
-		args...)
-	if err != nil {
-		return nil, fmt.Errorf("querying race peer addrs: %w", err)
-	}
-	defer rows.Close()
-
-	var addrs []RacePeerAddr
-	for rows.Next() {
-		var a RacePeerAddr
-		if err := rows.Scan(&a.IP, &a.Port); err != nil {
-			return nil, err
-		}
-		addrs = append(addrs, a)
-	}
-	return addrs, rows.Err()
 }
 
 // --- Packet event operations ---
