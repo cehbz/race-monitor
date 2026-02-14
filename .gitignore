@@ -4,7 +4,6 @@ race-monitor-*
 !race-monitor/
 !race-monitor-*/
 *.exe
-*.o
 
 # Test artifacts
 coverage.out
@@ -37,4 +36,4 @@ test.out
 test-v2.sh
 TODO-peer-correlation.md
 DESIGN.md
-
+race-viz/app.log
