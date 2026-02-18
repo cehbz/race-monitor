@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // Store handles SQLite storage operations.
 type Store struct {
@@ -100,7 +100,7 @@ func (s *Store) migrate() error {
 // dropAll removes all known tables for clean recreation.
 func (s *Store) dropAll() error {
 	tables := []string{
-		"packet_events", "race_peers", "connections",
+		"packet_events", "connections",
 		"races", "torrents", "event_types",
 	}
 	for _, t := range tables {
@@ -129,15 +129,17 @@ func (s *Store) createSchema() error {
 	);
 
 	CREATE TABLE IF NOT EXISTS races (
-		id           INTEGER PRIMARY KEY AUTOINCREMENT,
-		torrent_id   INTEGER NOT NULL REFERENCES torrents(id),
-		started_at   TIMESTAMP NOT NULL,
-		completed_at TIMESTAMP,
+		id               INTEGER PRIMARY KEY AUTOINCREMENT,
+		torrent_id       INTEGER NOT NULL REFERENCES torrents(id),
+		started_at       TIMESTAMP NOT NULL,
+		completed_at     TIMESTAMP,
+		start_wallclock  TEXT,
 		UNIQUE(torrent_id, started_at)
 	);
 
 	CREATE TABLE IF NOT EXISTS connections (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		race_id    INTEGER REFERENCES races(id),
 		conn_ptr   TEXT UNIQUE NOT NULL,
 		first_seen TIMESTAMP NOT NULL,
 		ip         TEXT,
@@ -146,27 +148,11 @@ func (s *Store) createSchema() error {
 		client     TEXT
 	);
 
-	CREATE TABLE IF NOT EXISTS race_peers (
-		id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		race_id    INTEGER NOT NULL REFERENCES races(id) ON DELETE CASCADE,
-		ip         TEXT NOT NULL,
-		port       INTEGER NOT NULL,
-		client     TEXT,
-		peer_id    TEXT,
-		country    TEXT,
-		progress   REAL,
-		dl_speed   INTEGER,
-		up_speed   INTEGER,
-		first_seen TIMESTAMP NOT NULL,
-		last_seen  TIMESTAMP NOT NULL,
-		UNIQUE(race_id, ip, port)
-	);
-
 	CREATE TABLE IF NOT EXISTS packet_events (
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
 		race_id       INTEGER NOT NULL REFERENCES races(id) ON DELETE CASCADE,
 		connection_id INTEGER NOT NULL REFERENCES connections(id),
-		ts            TIMESTAMP NOT NULL,
+		ts            INTEGER NOT NULL,
 		event_type_id INTEGER NOT NULL REFERENCES event_types(id),
 		piece_index   INTEGER,
 		data          INTEGER
@@ -178,7 +164,7 @@ func (s *Store) createSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_events_race_ts ON packet_events(race_id, ts);
 	CREATE INDEX IF NOT EXISTS idx_events_conn ON packet_events(connection_id);
 	CREATE INDEX IF NOT EXISTS idx_events_type ON packet_events(event_type_id);
-	CREATE INDEX IF NOT EXISTS idx_race_peers_race ON race_peers(race_id);
+	CREATE INDEX IF NOT EXISTS idx_events_peer_piece ON packet_events(race_id, event_type_id, connection_id, piece_index, ts);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
@@ -216,29 +202,24 @@ func (s *Store) Close() error {
 
 // --- Torrent operations ---
 
-// CreateTorrent inserts torrent metadata and returns its database ID.
-// If the torrent already exists (by info_hash), returns the existing ID.
+// CreateTorrent inserts or updates torrent metadata and returns its database ID.
+// On conflict (existing info_hash), updates name/size/piece_count only when the
+// new value is "better" (non-empty name that isn't just the hash, non-zero size/piece_count).
 func (s *Store) CreateTorrent(ctx context.Context, infoHash, name string, size int64, pieceCount int) (int64, error) {
-	// Try insert first
-	result, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO torrents (info_hash, name, size, piece_count)
-		VALUES (?, ?, ?, ?)`,
-		infoHash, name, size, pieceCount)
-	if err != nil {
-		return 0, fmt.Errorf("inserting torrent: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
-		return result.LastInsertId()
-	}
-
-	// Already exists — fetch the ID
 	var id int64
-	err = s.db.QueryRowContext(ctx,
-		`SELECT id FROM torrents WHERE info_hash = ?`, infoHash).Scan(&id)
+	err := s.db.QueryRowContext(ctx,
+		`INSERT INTO torrents (info_hash, name, size, piece_count)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(info_hash) DO UPDATE SET
+			name = CASE WHEN excluded.name != excluded.info_hash AND excluded.name != ''
+			            THEN excluded.name ELSE torrents.name END,
+			size = CASE WHEN excluded.size > 0 THEN excluded.size ELSE torrents.size END,
+			piece_count = CASE WHEN excluded.piece_count > 0
+			                  THEN excluded.piece_count ELSE torrents.piece_count END
+		RETURNING id`,
+		infoHash, name, size, pieceCount).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("fetching torrent id: %w", err)
+		return 0, fmt.Errorf("upserting torrent: %w", err)
 	}
 	return id, nil
 }
@@ -261,6 +242,22 @@ func (s *Store) CompleteRace(ctx context.Context, raceID int64) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE races SET completed_at = ? WHERE id = ?`,
 		formatTS(time.Now()), raceID)
+	return err
+}
+
+// MarkAbandonedRaces marks all incomplete races as completed with the current timestamp.
+func (s *Store) MarkAbandonedRaces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE races SET completed_at = datetime('now') WHERE completed_at IS NULL`)
+	return err
+}
+
+// SetRaceStartWallclock sets the RFC 3339 wallclock timestamp for a race,
+// typically called from a hook to record when the race logically started.
+func (s *Store) SetRaceStartWallclock(ctx context.Context, raceID int64, wallclock string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE races SET start_wallclock = ? WHERE id = ?`,
+		wallclock, raceID)
 	return err
 }
 
@@ -314,70 +311,18 @@ func (s *Store) ListRecentRaces(ctx context.Context, days int) ([]Race, error) {
 // --- Connection operations ---
 
 // InsertConnection inserts or retrieves an eBPF connection and returns its DB ID.
-func (s *Store) InsertConnection(ctx context.Context, connPtr string, firstSeen time.Time) (int64, error) {
+func (s *Store) InsertConnection(ctx context.Context, raceID int64, connPtr string, firstSeen time.Time) (int64, error) {
 	var id int64
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO connections (conn_ptr, first_seen)
-		VALUES (?, ?)
+		`INSERT INTO connections (race_id, conn_ptr, first_seen)
+		VALUES (?, ?, ?)
 		ON CONFLICT(conn_ptr) DO UPDATE SET conn_ptr = conn_ptr
 		RETURNING id`,
-		connPtr, formatTS(firstSeen)).Scan(&id)
+		raceID, connPtr, formatTS(firstSeen)).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("inserting connection: %w", err)
 	}
 	return id, nil
-}
-
-// --- Race peer operations ---
-
-// UpsertRacePeers batch-upserts API-sourced peer data for a race.
-func (s *Store) UpsertRacePeers(ctx context.Context, raceID int64, peers []RacePeer) error {
-	if len(peers) == 0 {
-		return nil
-	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("beginning transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO race_peers (race_id, ip, port, client, peer_id, country,
-		                         progress, dl_speed, up_speed, first_seen, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(race_id, ip, port) DO UPDATE SET
-			client = excluded.client,
-			peer_id = excluded.peer_id,
-			country = excluded.country,
-			progress = excluded.progress,
-			dl_speed = excluded.dl_speed,
-			up_speed = excluded.up_speed,
-			last_seen = excluded.last_seen`)
-	if err != nil {
-		return fmt.Errorf("preparing statement: %w", err)
-	}
-	defer stmt.Close()
-
-	now := formatTS(time.Now())
-	for _, p := range peers {
-		firstSeen := now
-		if !p.FirstSeen.IsZero() {
-			firstSeen = formatTS(p.FirstSeen)
-		}
-		lastSeen := now
-		if !p.LastSeen.IsZero() {
-			lastSeen = formatTS(p.LastSeen)
-		}
-
-		if _, err := stmt.ExecContext(ctx,
-			raceID, p.IP, p.Port, p.Client, p.PeerID, p.Country,
-			p.Progress, p.DLSpeed, p.UPSpeed, firstSeen, lastSeen); err != nil {
-			return fmt.Errorf("upserting race peer: %w", err)
-		}
-	}
-
-	return tx.Commit()
 }
 
 // UpdateConnectionEndpoint sets the resolved IP:port on a connection record.
@@ -385,12 +330,12 @@ func (s *Store) UpsertRacePeers(ctx context.Context, raceID int64, peers []RaceP
 // Uses upsert because the calibration event may arrive before the tracker
 // goroutine creates the connection row (race condition between coordinator
 // and tracker goroutines).
-func (s *Store) UpdateConnectionEndpoint(ctx context.Context, connPtr string, ip string, port int) error {
+func (s *Store) UpdateConnectionEndpoint(ctx context.Context, raceID int64, connPtr string, ip string, port int) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO connections (conn_ptr, first_seen, ip, port)
-		VALUES (?, datetime('now'), ?, ?)
+		`INSERT INTO connections (race_id, conn_ptr, first_seen, ip, port)
+		VALUES (?, ?, datetime('now'), ?, ?)
 		ON CONFLICT(conn_ptr) DO UPDATE SET ip = excluded.ip, port = excluded.port`,
-		connPtr, ip, port)
+		raceID, connPtr, ip, port)
 	return err
 }
 
@@ -401,30 +346,14 @@ func (s *Store) UpdateConnectionEndpoint(ctx context.Context, connPtr string, ip
 // Uses upsert because the calibration event may arrive before the tracker
 // goroutine creates the connection row (race condition between coordinator
 // and tracker goroutines).
-func (s *Store) UpdateConnectionPeerInfo(ctx context.Context, connPtr string, ip string, port int, peerID string, client string) error {
+func (s *Store) UpdateConnectionPeerInfo(ctx context.Context, raceID int64, connPtr string, ip string, port int, peerID string, client string) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO connections (conn_ptr, first_seen, ip, port, peer_id, client)
-		VALUES (?, datetime('now'), ?, ?, ?, ?)
+		`INSERT INTO connections (race_id, conn_ptr, first_seen, ip, port, peer_id, client)
+		VALUES (?, ?, datetime('now'), ?, ?, ?, ?)
 		ON CONFLICT(conn_ptr) DO UPDATE SET
 			ip = excluded.ip, port = excluded.port,
 			peer_id = excluded.peer_id, client = excluded.client`,
-		connPtr, ip, port, peerID, client)
-	return err
-}
-
-// UpsertRacePeerFromCapture inserts or updates a race_peers record using data
-// extracted from eBPF calibration events (IP, port, client, peer_id). Used
-// after calibration to populate peer data without API polling.
-func (s *Store) UpsertRacePeerFromCapture(ctx context.Context, raceID int64, ip string, port int, client string, peerID string) error {
-	now := formatTS(time.Now())
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO race_peers (race_id, ip, port, client, peer_id, first_seen, last_seen)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(race_id, ip, port) DO UPDATE SET
-			client = excluded.client,
-			peer_id = excluded.peer_id,
-			last_seen = excluded.last_seen`,
-		raceID, ip, port, client, peerID, now, now)
+		raceID, connPtr, ip, port, peerID, client)
 	return err
 }
 
@@ -452,7 +381,7 @@ func (s *Store) InsertPacketEvents(ctx context.Context, events []Event) error {
 
 	for _, pe := range events {
 		if _, err := stmt.ExecContext(ctx,
-			pe.RaceID, pe.ConnectionID, formatTS(pe.Timestamp),
+			pe.RaceID, pe.ConnectionID, pe.Timestamp,
 			int(pe.EventType), pe.PieceIndex, pe.Data); err != nil {
 			return fmt.Errorf("inserting packet event: %w", err)
 		}

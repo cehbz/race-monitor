@@ -71,7 +71,9 @@ Create `~/.config/race-monitor/config.toml`:
 
 ```toml
 binary = "/usr/bin/qbittorrent-nox"          # Required: path to qBittorrent binary
-webui_url = "http://127.0.0.1:8080"          # Optional: qBittorrent Web UI URL
+webui_url = "http://127.0.0.1:8080"          # Optional: enables API-based info_hash calibration
+webui_user = ""                              # Optional: Web UI username (empty if no auth)
+webui_pass = ""                              # Optional: Web UI password
 race_db = "~/.local/share/race-monitor/races.db"  # Optional
 dashboard_url = "http://localhost:8888"       # Optional: enables real-time dashboard updates
 ```
@@ -80,7 +82,8 @@ dashboard_url = "http://localhost:8888"       # Optional: enables real-time dash
 - `binary`: Full path to the qBittorrent binary (must have symbol table)
 
 **Optional fields:**
-- `webui_url`: qBittorrent Web UI URL for fetching torrent metadata (default: `http://localhost:8080`)
+- `webui_url`: qBittorrent Web UI URL for API-based info_hash calibration via sync/maindata (recommended; falls back to struct correlation when unset)
+- `webui_user`, `webui_pass`: Web UI credentials (empty for no auth)
 - `race_db`: Database path (default: `~/.local/share/race-monitor/races.db`)
 - `dashboard_url`: Dashboard URL for race notifications (default: disabled)
 

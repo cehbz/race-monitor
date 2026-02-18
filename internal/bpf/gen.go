@@ -18,12 +18,15 @@ type CalibrationEvent struct {
 	Pad       uint32 // alignment padding
 	Timestamp uint64
 	ObjPtr    uint64
-	Data      [512]byte
+	Data      [4096]byte
 }
 
 // Event type constants matching the eBPF #defines.
 const (
-	EventWeHave       uint32 = 1
-	EventIncomingHave uint32 = 2
-	EventCalibration  uint32 = 3
+	EventWeHave             uint32 = 1
+	EventIncomingHave       uint32 = 2
+	EventCalibration        uint32 = 3 // peer_connection struct dump
+	EventTorrentCalibration uint32 = 4 // torrent struct dump (from we_have fallback)
+	EventTorrentStarted     uint32 = 5 // torrent started (torrent struct dump from torrent::start)
+	EventTorrentFinished    uint32 = 6 // torrent download completed (from torrent::finished)
 )

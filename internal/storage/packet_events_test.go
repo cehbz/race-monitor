@@ -20,28 +20,29 @@ func TestPacketEvents(t *testing.T) {
 	}
 
 	now := time.Now()
-	peerConnID, err := store.InsertConnection(ctx, "deadbeef", now)
+	peerConnID, err := store.InsertConnection(ctx, raceID, "deadbeef", now)
 	if err != nil {
 		t.Fatalf("failed to insert connection: %v", err)
 	}
 
-	selfConnID, err := store.InsertConnection(ctx, "self", now)
+	selfConnID, err := store.InsertConnection(ctx, raceID, "self", now)
 	if err != nil {
 		t.Fatalf("failed to insert self connection: %v", err)
 	}
 
+	nowNano := now.UnixNano()
 	events := []storage.Event{
 		{
 			RaceID:       raceID,
 			ConnectionID: peerConnID,
-			Timestamp:    now,
+			Timestamp:    nowNano,
 			EventType:    storage.EventTypeHave,
 			PieceIndex:   15,
 		},
 		{
 			RaceID:       raceID,
 			ConnectionID: selfConnID,
-			Timestamp:    now.Add(time.Second),
+			Timestamp:    nowNano + int64(time.Second),
 			EventType:    storage.EventTypePieceReceived,
 			PieceIndex:   5,
 		},
@@ -61,13 +62,14 @@ func TestPieceReceivedAndHaveEvents(t *testing.T) {
 
 	torID := createTestTorrent(t, store, "testhash2", "test torrent 2", 500000, 50)
 	raceID, _ := store.CreateRace(ctx, torID)
-	selfConnID, _ := store.InsertConnection(ctx, "self", now)
-	remoteConnID, _ := store.InsertConnection(ctx, "cafebabe", now)
+	selfConnID, _ := store.InsertConnection(ctx, raceID, "self", now)
+	remoteConnID, _ := store.InsertConnection(ctx, raceID, "cafebabe", now)
 
+	nowNano := now.UnixNano()
 	events := []storage.Event{
-		{RaceID: raceID, ConnectionID: selfConnID, Timestamp: now, EventType: storage.EventTypePieceReceived, PieceIndex: 0},
-		{RaceID: raceID, ConnectionID: remoteConnID, Timestamp: now.Add(time.Second), EventType: storage.EventTypeHave, PieceIndex: 1},
-		{RaceID: raceID, ConnectionID: selfConnID, Timestamp: now.Add(2 * time.Second), EventType: storage.EventTypePieceReceived, PieceIndex: 2},
+		{RaceID: raceID, ConnectionID: selfConnID, Timestamp: nowNano, EventType: storage.EventTypePieceReceived, PieceIndex: 0},
+		{RaceID: raceID, ConnectionID: remoteConnID, Timestamp: nowNano + int64(time.Second), EventType: storage.EventTypeHave, PieceIndex: 1},
+		{RaceID: raceID, ConnectionID: selfConnID, Timestamp: nowNano + 2*int64(time.Second), EventType: storage.EventTypePieceReceived, PieceIndex: 2},
 	}
 
 	if err := store.InsertPacketEvents(ctx, events); err != nil {

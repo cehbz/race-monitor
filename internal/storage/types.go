@@ -44,6 +44,7 @@ type Race struct {
 // real peer endpoint and client identity.
 type Connection struct {
 	ID        int64
+	RaceID    int64  // FK to races.id
 	ConnPtr   string // hex of peer_connection* from eBPF
 	FirstSeen time.Time
 	IP        *string // nullable: set after calibration resolves endpoint
@@ -52,28 +53,12 @@ type Connection struct {
 	Client    *string // nullable: decoded client name from peer_id (e.g. "qBittorrent 4530")
 }
 
-// RacePeer represents a peer observed via the qBittorrent API during a race.
-type RacePeer struct {
-	ID        int64
-	RaceID    int64
-	IP        string
-	Port      int
-	Client    string
-	PeerID    string // BT protocol peer_id string
-	Country   string
-	Progress  float64
-	DLSpeed   int64
-	UPSpeed   int64
-	FirstSeen time.Time
-	LastSeen  time.Time
-}
-
 // Event represents a stored packet event in the database.
 type Event struct {
 	ID           int64
 	RaceID       int64
-	ConnectionID int64 // FK to connections.id
-	Timestamp    time.Time
+	ConnectionID int64     // FK to connections.id
+	Timestamp    int64     // nanoseconds since boot (BPF ktime), stored as int64
 	EventType    EventType // integer matching event_types.id
 	PieceIndex   int
 	Data         int64

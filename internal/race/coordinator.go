@@ -2,71 +2,47 @@ package race
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"strings"
 	"time"
-
-	qbt "github.com/cehbz/qbittorrent"
 
 	"github.com/cehbz/race-monitor/internal/bpf"
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
-// QBittorrentClient defines the interface for interacting with qBittorrent.
-type QBittorrentClient interface {
-	TorrentsPropertiesCtx(ctx context.Context, hash string) (*qbt.TorrentsProperties, error)
-	TorrentsInfoCtx(ctx context.Context, params ...*qbt.TorrentsInfoParams) ([]qbt.TorrentInfo, error)
-	SyncTorrentPeersCtx(ctx context.Context, hash string, rid int) (*qbt.TorrentPeers, error)
-}
+// levelTrace is a verbose log level below Debug for per-event tracing.
+// Matches capture.LevelTrace; defined here to avoid a dependency on capture.
+const levelTrace = slog.LevelDebug - 4
 
-// raceState wraps an active race's event channel and metadata.
-type raceState struct {
-	eventChan  chan bpf.Event
-	hash       string
-	pieceCount int
-	raceID     int64
-}
-
-// peerInfo carries a peer's endpoint and BT peer_id from the API.
-type peerInfo struct {
-	Addr   netip.AddrPort
-	PeerID string // raw BT peer_id string from API (may be empty)
-}
-
-// peerAddrsUpdate carries known peer data from a tracker's peer poll
-// back to the coordinator for use in calibration pattern matching.
-type peerAddrsUpdate struct {
-	hash  string
-	peers []peerInfo
-}
-
-// raceComplete signals that a race tracker goroutine has finished.
+// raceComplete signals that a tracker goroutine has finished.
 type raceComplete struct {
 	hash string
 	err  error
 }
 
-// discoveryResult carries the result of an async API query for downloading torrents.
-type discoveryResult struct {
-	torrents []qbt.TorrentInfo
-	err      error
+// raceState wraps an active race's event channel and metadata.
+type raceState struct {
+	eventChan          chan bpf.Event
+	hash               string
+	pieceCount         int
+	raceID             int64
+	downloadCompleteCh chan struct{} // closed by coordinator when torrent::finished() fires
+	cancel             context.CancelFunc // for shutdown timeout
 }
 
 // StateSnapshot provides a point-in-time view of coordinator state.
 // Used by tests to safely inspect state without data races via QueryState().
 type StateSnapshot struct {
 	ActiveRaces        map[string]RaceSnap
-	TorrentPtrs        map[uint64]string
-	PendingCounts      map[uint64]int
-	Discovering        bool
 	Calibrated         bool
 	FullyCalibrated    bool // both sockaddr_in and peer_id offsets discovered
 	CalibrationOff     int  // sockaddr_in offset, -1 if uncalibrated
 	PeerIDCalibOff     int  // peer_id offset, -1 if uncalibrated
+	InfoHashCalibOff   int  // info_hash offset in torrent struct, -1 if uncalibrated
+	TorrentPtrCalibOff int  // torrent* offset in peer_connection struct, -1 if uncalibrated
 	ConnEndpoints      int  // count of resolved peer_connection* → IP:port mappings
-	KnownPeerAddrs     int  // count of known peer addresses for calibration
 }
 
 // RaceSnap captures a race's metadata at a point in time.
@@ -74,43 +50,41 @@ type RaceSnap struct {
 	Hash       string
 	PieceCount int
 	ChanLen    int
+	RaceID     int64 // DB race ID, for tests to query persisted events
 }
 
 type stateQuery struct {
 	reply chan StateSnapshot
 }
 
-// Coordinator manages race lifecycle using eBPF events and the qBittorrent API.
+// Coordinator manages race lifecycle using eBPF events from libtorrent uprobes.
 //
-// Design: we_have events carry obj_ptr = torrent* (unique per torrent). The
-// coordinator learns torrent_ptr → info_hash mappings via API queries and uses
-// them to route events to per-torrent race trackers.
+// Design: Races are created when torrent::start() fires (EVT_TORRENT_STARTED)
+// and completed when torrent::finished() fires (EVT_TORRENT_FINISHED).
+// If the lifecycle probes are unavailable, races fall back to first-we_have
+// creation and idle-timeout completion.
 //
-// incoming_have events carry obj_ptr = peer_connection* (no torrent affinity).
-// After calibration, these are routed exactly via peer_connection* → IP:port
-// → race mapping. Before calibration, best-effort routing by piece_index range.
+// we_have events carry obj_ptr = torrent* and are routed to per-torrent race
+// trackers. incoming_have events carry obj_ptr = peer_connection* and are
+// routed via calibration to specific races.
+//
+// After calibration, incoming_have events are routed exactly via peer_connection* →
+// IP:port → race mapping. Before calibration, best-effort routing by piece_index range.
 //
 // Single-writer pattern: only Run() modifies state maps.
 type Coordinator struct {
 	store        *storage.Store
-	qbtClient    QBittorrentClient
 	logger       *slog.Logger
 	dashboardURL string
 
-	// torrentPtrs maps torrent_ptr (from we_have obj_ptr) → info_hash.
-	// Learned via API discovery. Once set, stable for the torrent's lifetime.
+	// infoHashToRaceState maps info_hash → raceState for active races.
+	infoHashToRaceState map[string]*raceState
+
+	// torrentPtrs maps torrent_ptr (from we_have obj_ptr) → info_hash for routing.
 	torrentPtrs map[uint64]string
 
-	// activeRaces holds running race trackers, keyed by info_hash.
-	activeRaces map[string]*raceState
-
-	// pendingEvents buffers events for unknown torrent_ptrs during API discovery.
-	pendingEvents map[uint64][]bpf.Event
-
 	completeChan   chan raceComplete
-	discoveryChan  chan discoveryResult
 	stateQueryChan chan stateQuery
-	discovering    bool
 
 	// --- Calibration state ---
 
@@ -126,20 +100,36 @@ type Coordinator struct {
 	// Populated by looking up connEndpoints against knownPeerAddrs.
 	connToRace map[uint64]string
 
-	// knownPeerAddrs maps IP:port → set of info_hashes. Built from tracker
-	// peer poll results, used for both calibration matching and exact routing.
+	// knownPeerAddrs maps IP:port → set of info_hashes. Built from eBPF events
+	// and calibration, used for both calibration matching and exact routing.
 	knownPeerAddrs map[netip.AddrPort]map[string]bool
 
-	// knownPeerIDs maps IP:port → raw BT peer_id string from the API.
+	// knownPeerIDs maps IP:port → raw BT peer_id string from calibration.
 	// Used for peer_id offset calibration (phase 2).
 	knownPeerIDs map[netip.AddrPort]string
 
-	// peerAddrsChan receives peer address updates from tracker goroutines.
-	peerAddrsChan chan peerAddrsUpdate
+	// --- Torrent calibration state ---
 
-	// calibratedChan is closed when full calibration completes (both offsets
-	// discovered). Trackers monitor this to stop sync/peers polling.
-	calibratedChan chan struct{}
+	// torrentCalib tracks discovery of info_hash offset within torrent struct
+	// and torrent* offset within peer_connection struct.
+	torrentCalib *torrentCalibrationState
+
+	// knownTorrentPtrs is the set of torrent* pointers seen from we_have events.
+	// Used for torrent_ptr offset calibration in peer_connection dumps.
+	knownTorrentPtrs map[uint64]bool
+
+	// knownInfoHashes maps torrent_ptr → binary info_hash (20 bytes).
+	// Built from torrent::start() dumps once info_hash offset is calibrated.
+	knownInfoHashes map[uint64][]byte
+
+	// infoHashBytes maps hex-encoded info_hash → binary SHA-1 bytes (20 bytes).
+	// Populated by startRace when an info_hash is extracted from a torrent dump.
+	infoHashBytes map[string][]byte
+
+	// pendingStarts buffers EVT_TORRENT_STARTED events received before
+	// info_hash calibration completes. Once calibration locks in, these are
+	// reprocessed to extract hashes and create races retroactively.
+	pendingStarts []bpf.CalibrationEvent
 
 	// binaryHash is the SHA256 of the qBittorrent binary, used as the key
 	// for the persistent calibration cache.
@@ -147,6 +137,49 @@ type Coordinator struct {
 
 	// calibCachePath is the filesystem path to the calibration cache JSON file.
 	calibCachePath string
+
+	// torrentCalibAPI provides known info_hashes from qBittorrent's sync API.
+	// When set, used for API-based info_hash offset calibration instead of
+	// struct correlation. Nil when webui_url is not configured.
+	torrentCalibAPI TorrentCalibrationAPI
+
+	// knownHashesFromAPI accumulates hashes from Sync() calls for API-based
+	// calibration. Sync returns only changed torrents, so we merge across calls.
+	knownHashesFromAPI map[string]bool
+
+	// torrentMeta caches metadata (name, size) from the calibration API.
+	// Keyed by hex info_hash. Populated by Sync() calls, consumed by startRace.
+	torrentMeta map[string]TorrentMeta
+}
+
+// TorrentMeta holds metadata for a torrent returned by the calibration API.
+type TorrentMeta struct {
+	Name       string
+	Size       int64
+	PieceCount int
+}
+
+// PeerInfo holds a peer's network address and BT peer_id string.
+type PeerInfo struct {
+	Addr   netip.AddrPort
+	PeerID string
+}
+
+// TorrentCalibrationAPI provides known info_hashes and metadata from
+// qBittorrent's sync API for torrent struct offset calibration and
+// race enrichment (name, size, piece_count).
+type TorrentCalibrationAPI interface {
+	// Sync fetches maindata (uses stored rid). Returns metadata keyed by
+	// hex info_hash for changed torrents. Caller does not need to track rid.
+	Sync() (torrents map[string]TorrentMeta, err error)
+
+	// FetchTorrentMeta fetches per-torrent properties (piece_count, size).
+	// Name may be empty; caller should fall back to the Sync cache.
+	FetchTorrentMeta(hash string) (TorrentMeta, error)
+
+	// SyncPeers fetches the current peer list for a torrent.
+	// Used to populate knownPeerAddrs for sockaddr_in calibration.
+	SyncPeers(hash string) ([]PeerInfo, error)
 }
 
 // NewCoordinator creates a race coordinator.
@@ -154,49 +187,59 @@ type Coordinator struct {
 // binaryHash is the SHA256 of the qBittorrent binary (for calibration cache).
 // calibCachePath is the path to the calibration cache JSON file. Both may be
 // empty to disable persistent caching (e.g. in tests).
+// torrentCalibAPI is optional; when set, enables API-based info_hash calibration.
 func NewCoordinator(
 	store *storage.Store,
-	qbtClient QBittorrentClient,
 	logger *slog.Logger,
 	dashboardURL string,
 	binaryHash string,
 	calibCachePath string,
+	torrentCalibAPI TorrentCalibrationAPI,
 ) *Coordinator {
 	calibration := newCalibrationState()
-	calibratedChan := make(chan struct{})
+	torrentCalib := newTorrentCalibrationState()
 
 	// Try to load cached calibration offsets
 	if binaryHash != "" && calibCachePath != "" {
 		if cache := LoadCalibrationCache(calibCachePath); cache != nil && cache.BinaryHash == binaryHash {
 			calibration = newCalibratedState(cache.SockaddrOffset, cache.PeerIDOffset)
-			close(calibratedChan) // signal that calibration is already complete
+			if cache.InfoHashOffset != nil {
+				torrentCalib.infoHashOffset = *cache.InfoHashOffset
+			}
+			if cache.TorrentPtrOffset != nil {
+				torrentCalib.torrentPtrOffset = *cache.TorrentPtrOffset
+			}
 			logger.Info("loaded cached calibration",
 				"sockaddr_offset", cache.SockaddrOffset,
 				"peer_id_offset", cache.PeerIDOffset,
+				"info_hash_offset", torrentCalib.infoHashOffset,
+				"torrent_ptr_offset", torrentCalib.torrentPtrOffset,
 				"binary_hash", binaryHash)
 		}
 	}
 
 	return &Coordinator{
-		store:          store,
-		qbtClient:      qbtClient,
-		logger:         logger,
-		dashboardURL:   dashboardURL,
-		torrentPtrs:    make(map[uint64]string),
-		activeRaces:    make(map[string]*raceState),
-		pendingEvents:  make(map[uint64][]bpf.Event),
-		completeChan:   make(chan raceComplete, 10),
-		discoveryChan:  make(chan discoveryResult, 1),
-		stateQueryChan: make(chan stateQuery),
-		calibration:    calibration,
-		connEndpoints:  make(map[uint64]netip.AddrPort),
-		connToRace:     make(map[uint64]string),
-		knownPeerAddrs: make(map[netip.AddrPort]map[string]bool),
-		knownPeerIDs:   make(map[netip.AddrPort]string),
-		peerAddrsChan:  make(chan peerAddrsUpdate, 20),
-		calibratedChan: calibratedChan,
-		binaryHash:     binaryHash,
-		calibCachePath: calibCachePath,
+		store:                 store,
+		logger:                logger,
+		dashboardURL:          dashboardURL,
+		infoHashToRaceState:   make(map[string]*raceState),
+		torrentPtrs:           make(map[uint64]string),
+		completeChan:          make(chan raceComplete, 10),
+		stateQueryChan:        make(chan stateQuery),
+		calibration:           calibration,
+		connEndpoints:         make(map[uint64]netip.AddrPort),
+		connToRace:            make(map[uint64]string),
+		knownPeerAddrs:        make(map[netip.AddrPort]map[string]bool),
+		knownPeerIDs:          make(map[netip.AddrPort]string),
+		torrentCalib:          torrentCalib,
+		knownTorrentPtrs:      make(map[uint64]bool),
+		knownInfoHashes:       make(map[uint64][]byte),
+		infoHashBytes:         make(map[string][]byte),
+		binaryHash:            binaryHash,
+		calibCachePath:        calibCachePath,
+		torrentCalibAPI:       torrentCalibAPI,
+		knownHashesFromAPI:    make(map[string]bool),
+		torrentMeta:           make(map[string]TorrentMeta),
 	}
 }
 
@@ -210,61 +253,66 @@ func (c *Coordinator) QueryState() StateSnapshot {
 
 func (c *Coordinator) snapshotState() StateSnapshot {
 	snap := StateSnapshot{
-		TorrentPtrs:     make(map[uint64]string, len(c.torrentPtrs)),
-		ActiveRaces:     make(map[string]RaceSnap, len(c.activeRaces)),
-		PendingCounts:   make(map[uint64]int, len(c.pendingEvents)),
-		Discovering:     c.discovering,
-		Calibrated:      c.calibration.isCalibrated(),
-		FullyCalibrated: c.calibration.isFullyCalibrated(),
-		CalibrationOff:  c.calibration.offset,
-		PeerIDCalibOff:  c.calibration.peerIDOffset,
-		ConnEndpoints:   len(c.connEndpoints),
-		KnownPeerAddrs:  len(c.knownPeerAddrs),
+		ActiveRaces:        make(map[string]RaceSnap, len(c.infoHashToRaceState)),
+		Calibrated:         c.calibration.isCalibrated(),
+		FullyCalibrated:    c.calibration.isFullyCalibrated(),
+		CalibrationOff:     c.calibration.offset,
+		PeerIDCalibOff:     c.calibration.peerIDOffset,
+		InfoHashCalibOff:   c.torrentCalib.infoHashOffset,
+		TorrentPtrCalibOff: c.torrentCalib.torrentPtrOffset,
+		ConnEndpoints:      len(c.connEndpoints),
 	}
-	for k, v := range c.torrentPtrs {
-		snap.TorrentPtrs[k] = v
-	}
-	for h, s := range c.activeRaces {
+	for h, s := range c.infoHashToRaceState {
 		snap.ActiveRaces[h] = RaceSnap{
 			Hash:       s.hash,
 			PieceCount: s.pieceCount,
 			ChanLen:    len(s.eventChan),
+			RaceID:     s.raceID,
 		}
-	}
-	for k, v := range c.pendingEvents {
-		snap.PendingCounts[k] = len(v)
 	}
 	return snap
 }
 
-// Run is the main event loop. Reads raw eBPF events and calibration events,
-// and manages race lifecycle. The calibrations channel may be nil if
-// calibration is not available (e.g. in tests).
-func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, calibrations <-chan bpf.CalibrationEvent) error {
+// Run is the main event loop. Reads raw eBPF events, calibration events,
+// and PID death signals. Race lifecycle is driven entirely by libtorrent uprobes:
+// torrent::start() creates races, torrent::finished() signals completion.
+func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, calibrations <-chan bpf.CalibrationEvent, pidDeathCh <-chan error) error {
 	c.logger.Info("coordinator started, waiting for eBPF events")
+	if !c.torrentCalib.isInfoHashCalibrated() {
+		c.logger.Info("calibration requires 2+ torrents: nothing will be recorded until at least two downloads have been seen (primes the cache for future runs)")
+	}
 
-	pollTicker := time.NewTicker(5 * time.Second)
-	defer pollTicker.Stop()
+	// Prime metadata cache from API so torrent names are available when races start.
+	if c.torrentCalibAPI != nil {
+		if torrents, err := c.torrentCalibAPI.Sync(); err == nil {
+			for h, meta := range torrents {
+				c.knownHashesFromAPI[h] = true
+				c.torrentMeta[h] = meta
+			}
+			c.logger.Info("metadata cache primed from API", "torrents", len(torrents))
+		} else {
+			c.logger.Warn("failed to prime metadata cache", "error", err)
+		}
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
 			c.logger.Info("coordinator shutting down")
-			c.closeAllRaces()
+			if err := c.waitForTrackerCompletions(ctx); err != nil {
+				return err
+			}
 			return ctx.Err()
+
+		case pidErr := <-pidDeathCh:
+			c.logger.Info("PID died, finalizing all races", "error", pidErr)
+			if err := c.waitForTrackerCompletions(ctx); err != nil {
+				return err
+			}
+			return pidErr
 
 		case complete := <-c.completeChan:
 			c.handleComplete(complete)
-
-		case result := <-c.discoveryChan:
-			c.handleDiscoveryResult(ctx, result)
-
-		case <-pollTicker.C:
-			// Periodic poll: discover new downloads even if no we_have seen yet
-			// (handles case where events arrive slightly before we start listening)
-			if !c.discovering {
-				c.startDiscovery(ctx)
-			}
 
 		case q := <-c.stateQueryChan:
 			q.reply <- c.snapshotState()
@@ -274,18 +322,236 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, calibrat
 				c.handleCalibration(ctx, cal)
 			}
 
-		case update := <-c.peerAddrsChan:
-			c.handlePeerAddrsUpdate(update)
-
 		case event, ok := <-events:
 			if !ok {
 				c.logger.Info("event channel closed")
-				c.closeAllRaces()
-				return nil
+				return c.waitForTrackerCompletions(ctx)
 			}
 
 			c.handleEvent(ctx, event)
 		}
+	}
+}
+
+// handleTorrentStarted processes an EVT_TORRENT_STARTED calibration event.
+// If info_hash calibration is complete, extracts the hash and creates a race
+// immediately. Otherwise, buffers the event and attempts multi-dump correlation.
+func (c *Coordinator) handleTorrentStarted(ctx context.Context, cal bpf.CalibrationEvent) {
+	ptr := cal.ObjPtr
+
+	// Skip duplicate start events for the same torrent_ptr
+	if _, known := c.torrentPtrs[ptr]; known {
+		return
+	}
+
+	if c.torrentCalib.isInfoHashCalibrated() {
+		// Fast path: extract hash and create race immediately
+		hashBytes, ok := c.torrentCalib.extractInfoHash(cal.Data)
+		if !ok {
+			c.logger.Warn("torrent_started: failed to extract info_hash despite calibration",
+				"ptr", fmt.Sprintf("0x%x", ptr))
+			return
+		}
+		infoHash := hex.EncodeToString(hashBytes)
+		c.registerTorrentMapping(ptr, hashBytes)
+		c.startRace(ctx, infoHash, ptr)
+		return
+	}
+
+	// Slow path: buffer for correlation-based calibration
+	c.pendingStarts = append(c.pendingStarts, cal)
+	c.tryTorrentCorrelation(ctx, cal)
+}
+
+// tryTorrentCorrelation adds a torrent struct dump to the correlation buffer
+// and attempts to discover the info_hash offset. On success, reprocesses all
+// buffered starts and pending peer dumps.
+//
+// When torrentCalibAPI is set, uses API-based calibration (sync/maindata hashes).
+// Otherwise falls back to struct correlation (requires 2+ dumps, unique candidate).
+func (c *Coordinator) tryTorrentCorrelation(ctx context.Context, cal bpf.CalibrationEvent) {
+	c.torrentCalib.pendingTorrentDumps = append(c.torrentCalib.pendingTorrentDumps, cal)
+	n := len(c.torrentCalib.pendingTorrentDumps)
+	c.logger.Debug("torrent calibration: received dump",
+		"ptr", fmt.Sprintf("0x%x", cal.ObjPtr),
+		"pending_torrent_dumps", n)
+
+	// Try API-based calibration first when available
+	if c.torrentCalibAPI != nil {
+		torrents, err := c.torrentCalibAPI.Sync()
+		if err != nil {
+			c.logger.Debug("torrent calibration: sync API failed, falling back to correlation",
+				"error", err)
+		} else {
+			for h, meta := range torrents {
+				c.knownHashesFromAPI[h] = true
+				c.torrentMeta[h] = meta
+			}
+			c.logger.Debug("torrent calibration: sync/maindata",
+				"this_call", len(torrents),
+				"known_total", len(c.knownHashesFromAPI))
+			knownList := make([]string, 0, len(c.knownHashesFromAPI))
+			for h := range c.knownHashesFromAPI {
+				knownList = append(knownList, h)
+			}
+			off, apiCandidates, apiOk := c.torrentCalib.tryCalibrateInfoHashFromAPI(c.torrentCalib.pendingTorrentDumps, knownList)
+			if apiOk {
+				c.torrentCalib.infoHashOffset = off
+				c.logger.Info("torrent calibration: info_hash offset locked via API",
+					"offset", off)
+				c.finishTorrentCalibration(ctx)
+				return
+			}
+			c.logger.Debug("torrent calibration: API calibration did not lock in",
+				"dumps", len(c.torrentCalib.pendingTorrentDumps),
+				"unique_ptrs", n,
+				"known_hashes", len(c.knownHashesFromAPI),
+				"api_candidates", apiCandidates)
+		}
+	}
+
+	// Fallback: struct correlation (no API or API had no matches)
+	ok, numCandidates := c.torrentCalib.tryCalibrateInfoHashByCorrelation(c.torrentCalib.pendingTorrentDumps)
+	if !ok {
+		if numCandidates > 0 {
+			c.logger.Debug("torrent calibration: correlation inconclusive, waiting for more dumps",
+				"candidates", numCandidates)
+		}
+		return
+	}
+
+	c.logger.Info("torrent calibration: info_hash offset locked via correlation",
+		"offset", c.torrentCalib.infoHashOffset)
+	c.finishTorrentCalibration(ctx)
+}
+
+// finishTorrentCalibration runs after info_hash offset is locked: save cache,
+// extract hashes from dumps, create races, reprocess pending peer dumps.
+func (c *Coordinator) finishTorrentCalibration(ctx context.Context) {
+	c.saveTorrentCalibrationCache()
+
+	// Extract hashes from all buffered torrent dumps and register mappings
+	for _, d := range c.torrentCalib.pendingTorrentDumps {
+		if hashBytes, ok := c.torrentCalib.extractInfoHash(d.Data); ok {
+			c.registerTorrentMapping(d.ObjPtr, hashBytes)
+		}
+	}
+	c.torrentCalib.pendingTorrentDumps = nil
+
+	// Create races for all pending starts
+	for _, d := range c.pendingStarts {
+		if hashBytes, ok := c.torrentCalib.extractInfoHash(d.Data); ok {
+			infoHash := hex.EncodeToString(hashBytes)
+			c.startRace(ctx, infoHash, d.ObjPtr)
+		}
+	}
+	c.pendingStarts = nil
+
+	// Reprocess pending peer_connection dumps for torrent_ptr offset discovery
+	c.reprocessPendingTorrentPtrCalibrations()
+}
+
+// startRace creates a new race for the given info_hash and torrent_ptr.
+// Idempotent: does nothing if a race already exists for this hash.
+func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr uint64) {
+	if _, exists := c.infoHashToRaceState[infoHash]; exists {
+		return
+	}
+
+	c.logger.Info("race started", "hash", infoHash, "torrent_ptr", fmt.Sprintf("0x%x", torrentPtr))
+
+	// Store binary hash bytes for future calibration matching
+	if hashBytes, err := hex.DecodeString(infoHash); err == nil && len(hashBytes) == infoHashSize {
+		c.infoHashBytes[infoHash] = hashBytes
+	}
+
+	// Ensure torrent_ptr mapping exists
+	if _, ok := c.torrentPtrs[torrentPtr]; !ok {
+		c.mapTorrentPtr(torrentPtr, infoHash)
+	}
+
+	// Enrich metadata: fetch per-torrent properties for piece_count + size,
+	// then merge with Sync cache (which has the name).
+	torrentName := infoHash
+	var torrentSize int64
+	var pieceCount int
+	if meta, ok := c.torrentMeta[infoHash]; ok {
+		if meta.Name != "" {
+			torrentName = meta.Name
+		}
+		torrentSize = meta.Size
+		pieceCount = meta.PieceCount
+	}
+	if c.torrentCalibAPI != nil {
+		if propsMeta, err := c.torrentCalibAPI.FetchTorrentMeta(infoHash); err == nil {
+			if propsMeta.Size > 0 {
+				torrentSize = propsMeta.Size
+			}
+			if propsMeta.PieceCount > 0 {
+				pieceCount = propsMeta.PieceCount
+			}
+		} else {
+			c.logger.Debug("failed to fetch torrent properties", "hash", infoHash, "error", err)
+		}
+	}
+
+	torrentID, err := c.store.CreateTorrent(ctx, infoHash, torrentName, torrentSize, pieceCount)
+	if err != nil {
+		c.logger.Error("failed to create torrent record", "hash", infoHash, "error", err)
+		return
+	}
+
+	raceID, err := c.store.CreateRace(ctx, torrentID)
+	if err != nil {
+		c.logger.Error("failed to create race record", "hash", infoHash, "error", err)
+		return
+	}
+
+	downloadCompleteCh := make(chan struct{})
+	raceCtx, cancel := context.WithCancel(ctx)
+	state := &raceState{
+		eventChan:          make(chan bpf.Event, 10000),
+		hash:               infoHash,
+		pieceCount:         pieceCount,
+		raceID:             raceID,
+		downloadCompleteCh: downloadCompleteCh,
+		cancel:             cancel,
+	}
+	c.infoHashToRaceState[infoHash] = state
+
+	go func(hash string, raceID int64, eventChan <-chan bpf.Event, completeCh <-chan struct{}) {
+		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, eventChan, completeCh)
+		c.completeChan <- raceComplete{hash: hash, err: err}
+	}(infoHash, raceID, state.eventChan, downloadCompleteCh)
+
+	// Poll peers from API for sockaddr_in calibration bootstrap.
+	// This populates knownPeerAddrs which enables the sockaddr_in
+	// calibration path as an alternative to torrent_ptr routing.
+	c.pollPeersForCalibration(infoHash)
+}
+
+// handleTorrentFinished processes an EVT_TORRENT_FINISHED event.
+// Looks up torrent_ptr → info_hash → race and signals download completion.
+func (c *Coordinator) handleTorrentFinished(event bpf.Event) {
+	hash, ok := c.torrentPtrs[event.ObjPtr]
+	if !ok {
+		c.logger.Debug("torrent_finished for unmapped ptr",
+			"ptr", fmt.Sprintf("0x%x", event.ObjPtr))
+		return
+	}
+
+	state, ok := c.infoHashToRaceState[hash]
+	if !ok {
+		c.logger.Debug("torrent_finished for inactive race", "hash", hash)
+		return
+	}
+
+	c.logger.Info("torrent finished", "hash", hash)
+	select {
+	case <-state.downloadCompleteCh:
+		// Already closed
+	default:
+		close(state.downloadCompleteCh)
 	}
 }
 
@@ -296,246 +562,95 @@ func (c *Coordinator) handleEvent(ctx context.Context, event bpf.Event) {
 		c.handleWeHave(ctx, event)
 	case bpf.EventIncomingHave:
 		c.handleIncomingHave(event)
+	case bpf.EventTorrentFinished:
+		c.handleTorrentFinished(event)
 	}
 }
 
 // handleWeHave processes a we_have event. obj_ptr is the torrent* pointer.
+// Routes via exact torrent_ptr mapping only. The mapping is established by
+// startRace (from torrent::start() calibration), so we_have events for the
+// active race's torrent always have a known pointer. Unknown pointers belong
+// to other torrents and are dropped.
 func (c *Coordinator) handleWeHave(ctx context.Context, event bpf.Event) {
-	// Known torrent_ptr? Route directly.
 	if hash, ok := c.torrentPtrs[event.ObjPtr]; ok {
-		if state, ok := c.activeRaces[hash]; ok {
+		if state, ok := c.infoHashToRaceState[hash]; ok {
 			c.routeEvent(state, event)
 		}
 		return
 	}
 
-	// Unknown torrent_ptr — buffer and trigger discovery.
-	c.pendingEvents[event.ObjPtr] = append(c.pendingEvents[event.ObjPtr], event)
+	c.logger.Log(ctx, levelTrace, "we_have: dropped (unmapped torrent_ptr)",
+		"ptr", fmt.Sprintf("0x%x", event.ObjPtr),
+		"active_races", len(c.infoHashToRaceState))
+}
 
-	if !c.discovering {
-		c.startDiscovery(ctx)
+// mapTorrentPtr records a new torrent_ptr → info_hash mapping and updates
+// the calibration-related data structures for torrent struct calibration.
+func (c *Coordinator) mapTorrentPtr(ptr uint64, hash string) {
+	c.torrentPtrs[ptr] = hash
+	c.knownTorrentPtrs[ptr] = true
+
+	// Copy pre-decoded binary info_hash bytes for torrent calibration matching.
+	if hashBytes, ok := c.infoHashBytes[hash]; ok {
+		c.knownInfoHashes[ptr] = hashBytes
+	}
+
+	// If we just learned a new torrent_ptr and have pending peer_connection
+	// dumps, attempt torrent_ptr offset calibration.
+	if !c.torrentCalib.isTorrentPtrCalibrated() && len(c.torrentCalib.pendingPeerDumps) > 0 {
+		c.reprocessPendingTorrentPtrCalibrations()
 	}
 }
 
-// handleIncomingHave routes incoming_have events. If calibration has resolved
-// this peer_connection* to a specific race, route exactly to that race.
-// Otherwise, fall back to best-effort routing by piece_index range.
+// handleIncomingHave routes incoming_have events via exact routing only.
+// peer_connection* must be mapped to a race via connToRace (populated by
+// torrent_ptr calibration). Unmapped connections are dropped — qBittorrent
+// may have hundreds of active torrents whose peers would pollute race data.
 func (c *Coordinator) handleIncomingHave(event bpf.Event) {
-	// Exact routing: peer_connection* → race hash (post-calibration)
 	if hash, ok := c.connToRace[event.ObjPtr]; ok {
-		if state, ok := c.activeRaces[hash]; ok {
+		if state, ok := c.infoHashToRaceState[hash]; ok {
 			c.routeEvent(state, event)
 			return
 		}
 	}
 
-	// Best-effort fallback: route to all races with valid piece_index
-	for _, state := range c.activeRaces {
-		if state.pieceCount <= 0 || int(event.PieceIndex) < state.pieceCount {
-			c.routeEvent(state, event)
-		}
-	}
+	c.logger.Log(context.Background(), levelTrace, "incoming_have: dropped (unmapped peer_conn)",
+		"ptr", fmt.Sprintf("0x%x", event.ObjPtr),
+		"piece", event.PieceIndex)
 }
 
 // handleComplete processes a race tracker completion signal.
 func (c *Coordinator) handleComplete(complete raceComplete) {
-	if _, exists := c.activeRaces[complete.hash]; exists {
-		delete(c.activeRaces, complete.hash)
+	if state, exists := c.infoHashToRaceState[complete.hash]; exists {
+		state.cancel()
+		delete(c.infoHashToRaceState, complete.hash)
 		if complete.err != nil && complete.err != context.Canceled {
 			c.logger.Error("race tracking failed", "hash", complete.hash, "error", complete.err)
 		}
 		c.logger.Info("race tracking complete", "hash", complete.hash)
 	}
 
-	// Clean up torrentPtrs pointing to this hash so future races for the
-	// same torrent (re-download) will trigger fresh API discovery.
+	// Clean up torrentPtrs, knownTorrentPtrs, and knownInfoHashes
+	// for the completed race to avoid stale mappings.
 	for ptr, h := range c.torrentPtrs {
 		if h == complete.hash {
 			delete(c.torrentPtrs, ptr)
+			delete(c.knownTorrentPtrs, ptr)
+			delete(c.knownInfoHashes, ptr)
+		}
+	}
+	delete(c.infoHashBytes, complete.hash)
+
+	// Clean up connToRace entries for this race
+	for ptr, h := range c.connToRace {
+		if h == complete.hash {
+			delete(c.connToRace, ptr)
+			delete(c.connEndpoints, ptr)
 		}
 	}
 }
 
-// startDiscovery launches an async goroutine to query the qBittorrent API
-// for downloading torrents. Non-blocking: results arrive via discoveryChan.
-func (c *Coordinator) startDiscovery(ctx context.Context) {
-	c.discovering = true
-	go func() {
-		queryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-
-		torrents, err := c.qbtClient.TorrentsInfoCtx(queryCtx, &qbt.TorrentsInfoParams{
-			Filter: "downloading",
-		})
-		c.discoveryChan <- discoveryResult{torrents: torrents, err: err}
-	}()
-}
-
-// handleDiscoveryResult processes the result of an async API query.
-// Creates races for newly discovered torrents, assigns torrent_ptr → hash
-// mappings, and flushes buffered events.
-func (c *Coordinator) handleDiscoveryResult(ctx context.Context, result discoveryResult) {
-	c.discovering = false
-
-	if result.err != nil {
-		c.logger.Warn("discovery query failed", "error", result.err)
-		return
-	}
-
-	if len(result.torrents) == 0 {
-		c.logger.Debug("no downloading torrents found")
-		// Clear pending events — no download to attribute them to
-		c.pendingEvents = make(map[uint64][]bpf.Event)
-		return
-	}
-
-	// Identify new torrents not yet tracked
-	var newHashes []string
-	for _, t := range result.torrents {
-		hash := strings.ToLower(string(t.Hash))
-		if _, exists := c.activeRaces[hash]; !exists {
-			newHashes = append(newHashes, hash)
-			c.promoteToActive(ctx, hash)
-		}
-	}
-
-	if len(newHashes) == 0 && len(c.pendingEvents) > 0 {
-		// All downloading torrents already have active races.
-		// Try to assign unknown ptrs to existing races by piece_index.
-		c.assignPendingPtrs()
-		return
-	}
-
-	// Attempt to assign pending torrent_ptrs to newly created races.
-	c.assignPendingPtrs()
-}
-
-// assignPendingPtrs tries to assign buffered torrent_ptrs to active races.
-//
-// Strategy:
-//   - If exactly one pending ptr and one unassigned race, direct match.
-//   - Otherwise, use piece_index < piece_count to narrow candidates.
-//   - If still ambiguous, leave pending for future disambiguation.
-func (c *Coordinator) assignPendingPtrs() {
-	for ptr, events := range c.pendingEvents {
-		if _, alreadyAssigned := c.torrentPtrs[ptr]; alreadyAssigned {
-			c.flushPending(ptr)
-			continue
-		}
-
-		// Find candidate races: piece_index from buffered events must be valid
-		candidates := c.findCandidateRaces(events)
-
-		if len(candidates) == 1 {
-			hash := candidates[0]
-			c.torrentPtrs[ptr] = hash
-			c.logger.Info("mapped torrent_ptr to hash",
-				"ptr", fmt.Sprintf("0x%x", ptr), "hash", hash)
-			c.flushPending(ptr)
-		} else if len(candidates) == 0 {
-			// No valid race for these events — discard
-			c.logger.Debug("no candidate race for pending ptr, discarding",
-				"ptr", fmt.Sprintf("0x%x", ptr), "events", len(events))
-			delete(c.pendingEvents, ptr)
-		}
-		// len(candidates) > 1: ambiguous, leave pending for later
-	}
-}
-
-// findCandidateRaces returns hashes of active races that could own the given events,
-// based on piece_index range and whether the race already has a ptr assigned.
-func (c *Coordinator) findCandidateRaces(events []bpf.Event) []string {
-	// Collect all unassigned active race hashes
-	assignedHashes := make(map[string]bool)
-	for _, h := range c.torrentPtrs {
-		assignedHashes[h] = true
-	}
-
-	var candidates []string
-	for hash, state := range c.activeRaces {
-		if assignedHashes[hash] {
-			continue // already has a ptr assigned
-		}
-		// Check if all event piece indices are valid for this race
-		valid := true
-		for _, ev := range events {
-			if state.pieceCount > 0 && int(ev.PieceIndex) >= state.pieceCount {
-				valid = false
-				break
-			}
-		}
-		if valid {
-			candidates = append(candidates, hash)
-		}
-	}
-	return candidates
-}
-
-// flushPending sends all buffered events for a ptr to its assigned race.
-func (c *Coordinator) flushPending(ptr uint64) {
-	events, ok := c.pendingEvents[ptr]
-	if !ok {
-		return
-	}
-	delete(c.pendingEvents, ptr)
-
-	hash, ok := c.torrentPtrs[ptr]
-	if !ok {
-		return
-	}
-	state, ok := c.activeRaces[hash]
-	if !ok {
-		return
-	}
-
-	for _, event := range events {
-		c.routeEvent(state, event)
-	}
-	c.logger.Debug("flushed pending events", "ptr", fmt.Sprintf("0x%x", ptr), "count", len(events))
-}
-
-// promoteToActive creates a race record and starts a tracker goroutine.
-func (c *Coordinator) promoteToActive(ctx context.Context, hash string) {
-	propsCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	props, err := c.qbtClient.TorrentsPropertiesCtx(propsCtx, hash)
-	if err != nil {
-		c.logger.Error("failed to fetch torrent metadata", "hash", hash, "error", err)
-		return
-	}
-
-	c.logger.Info("starting race",
-		"hash", hash,
-		"name", props.Name,
-		"size", props.TotalSize,
-		"pieces", props.PiecesNum)
-
-	torrentID, err := c.store.CreateTorrent(ctx, hash, props.Name, props.TotalSize, int(props.PiecesNum))
-	if err != nil {
-		c.logger.Error("failed to create torrent record", "hash", hash, "error", err)
-		return
-	}
-
-	raceID, err := c.store.CreateRace(ctx, torrentID)
-	if err != nil {
-		c.logger.Error("failed to create race record", "hash", hash, "error", err)
-		return
-	}
-
-	state := &raceState{
-		eventChan:  make(chan bpf.Event, 10000),
-		hash:       hash,
-		pieceCount: int(props.PiecesNum),
-		raceID:     raceID,
-	}
-	c.activeRaces[hash] = state
-
-	go func(hash string, raceID int64, pieceCount int, eventChan <-chan bpf.Event, peerAddrsChan chan<- peerAddrsUpdate, calibratedChan <-chan struct{}) {
-		err := processEvents(ctx, c.store, c.qbtClient, c.logger, hash, raceID, pieceCount, eventChan, peerAddrsChan, calibratedChan)
-		c.completeChan <- raceComplete{hash: hash, err: err}
-	}(hash, raceID, int(props.PiecesNum), state.eventChan, c.peerAddrsChan, c.calibratedChan)
-}
 
 // routeEvent sends an event to an active race's channel.
 func (c *Coordinator) routeEvent(state *raceState, event bpf.Event) {
@@ -546,13 +661,134 @@ func (c *Coordinator) routeEvent(state *raceState, event bpf.Event) {
 	}
 }
 
-// handleCalibration processes a calibration event from eBPF. Handles three
-// calibration phases:
-//
-//  1. sockaddr_in offset discovery: scan dumps for known IP:port patterns
-//  2. peer_id offset discovery: correlate dumps with known peer_ids via IP:port
-//  3. Post-calibration extraction: extract IP:port and peer_id from every new connection
+// handleCalibration dispatches calibration events by type.
 func (c *Coordinator) handleCalibration(ctx context.Context, cal bpf.CalibrationEvent) {
+	switch cal.EventType {
+	case bpf.EventTorrentStarted:
+		c.handleTorrentStarted(ctx, cal)
+	case bpf.EventTorrentCalibration:
+		c.handleTorrentCalibration(ctx, cal)
+	case bpf.EventCalibration:
+		c.handlePeerCalibration(ctx, cal)
+	}
+}
+
+// handleTorrentCalibration processes a torrent struct dump from we_have
+// (fallback path when torrent::start() probe is unavailable). Uses the same
+// multi-dump correlation as handleTorrentStarted for info_hash offset discovery.
+func (c *Coordinator) handleTorrentCalibration(ctx context.Context, cal bpf.CalibrationEvent) {
+	if c.torrentCalib.isInfoHashCalibrated() {
+		// Already calibrated — extract info_hash from this torrent dump
+		hashBytes, ok := c.torrentCalib.extractInfoHash(cal.Data)
+		if ok {
+			c.registerTorrentMapping(cal.ObjPtr, hashBytes)
+		}
+		return
+	}
+
+	// Buffer for correlation and attempt calibration
+	c.tryTorrentCorrelation(ctx, cal)
+}
+
+// registerTorrentMapping maps a torrent_ptr to the given binary info_hash bytes,
+// updating all relevant data structures (torrentPtrs, knownTorrentPtrs, knownInfoHashes).
+func (c *Coordinator) registerTorrentMapping(ptr uint64, hashBytes []byte) {
+	infoHash := hex.EncodeToString(hashBytes)
+	c.knownInfoHashes[ptr] = hashBytes
+	if _, exists := c.torrentPtrs[ptr]; !exists {
+		c.mapTorrentPtr(ptr, infoHash)
+		c.logger.Debug("mapped torrent_ptr via calibrated info_hash",
+			"ptr", fmt.Sprintf("0x%x", ptr), "hash", infoHash)
+	}
+}
+
+// reprocessPendingTorrentPtrCalibrations attempts to discover the torrent*
+// offset in peer_connection dumps now that we have known torrent pointers.
+func (c *Coordinator) reprocessPendingTorrentPtrCalibrations() {
+	if c.torrentCalib.isTorrentPtrCalibrated() {
+		// Already calibrated — extract torrent_ptr from each pending dump
+		for _, pending := range c.torrentCalib.pendingPeerDumps {
+			c.resolvePeerConnTorrent(pending)
+		}
+		c.torrentCalib.pendingPeerDumps = nil
+		return
+	}
+
+	for _, pending := range c.torrentCalib.pendingPeerDumps {
+		if c.torrentCalib.tryCalibrateTorrentPtr(pending, c.knownTorrentPtrs) {
+			c.logger.Info("torrent calibration: torrent_ptr offset locked",
+				"offset", c.torrentCalib.torrentPtrOffset)
+			// Extract from all pending
+			for _, p := range c.torrentCalib.pendingPeerDumps {
+				c.resolvePeerConnTorrent(p)
+			}
+			c.torrentCalib.pendingPeerDumps = nil
+			return
+		}
+	}
+}
+
+// resolvePeerConnTorrent extracts the torrent* from a peer_connection dump
+// and maps peer_connection → torrent → info_hash → race.
+func (c *Coordinator) resolvePeerConnTorrent(cal bpf.CalibrationEvent) {
+	torrentPtr, ok := c.torrentCalib.extractTorrentPtr(cal.Data)
+	if !ok {
+		return
+	}
+
+	if hash, ok := c.torrentPtrs[torrentPtr]; ok {
+		c.connToRace[cal.ObjPtr] = hash
+		c.logger.Debug("mapped peer_conn → race via torrent_ptr",
+			"peer_conn", fmt.Sprintf("0x%x", cal.ObjPtr),
+			"torrent", fmt.Sprintf("0x%x", torrentPtr),
+			"hash", hash)
+	}
+}
+
+// attemptTorrentPtrCalibration tries to discover the torrent* offset in a
+// peer_connection dump, or buffers the dump for later if we don't have
+// enough known torrent pointers yet.
+func (c *Coordinator) attemptTorrentPtrCalibration(cal bpf.CalibrationEvent) {
+	if c.torrentCalib.isTorrentPtrCalibrated() {
+		// Already calibrated — extract and resolve directly.
+		c.resolvePeerConnTorrent(cal)
+		return
+	}
+
+	if len(c.knownTorrentPtrs) == 0 {
+		// No known torrent pointers yet — buffer for later.
+		c.torrentCalib.pendingPeerDumps = append(c.torrentCalib.pendingPeerDumps, cal)
+		return
+	}
+
+	if c.torrentCalib.tryCalibrateTorrentPtr(cal, c.knownTorrentPtrs) {
+		c.logger.Info("torrent calibration: torrent_ptr offset locked",
+			"offset", c.torrentCalib.torrentPtrOffset)
+		// Extract from this event
+		c.resolvePeerConnTorrent(cal)
+		// Reprocess all pending peer dumps
+		for _, p := range c.torrentCalib.pendingPeerDumps {
+			c.resolvePeerConnTorrent(p)
+		}
+		c.torrentCalib.pendingPeerDumps = nil
+		c.saveTorrentCalibrationCache()
+	} else {
+		c.torrentCalib.pendingPeerDumps = append(c.torrentCalib.pendingPeerDumps, cal)
+	}
+}
+
+// handlePeerCalibration processes a peer_connection calibration event.
+// Handles sockaddr_in and peer_id offset discovery, and also attempts
+// torrent_ptr offset discovery to enable exact incoming_have routing.
+//
+// Without API peer polling, sockaddr_in calibration works only if:
+// - Cached calibration exists (loaded on startup), OR
+// - Peers are discovered via torrent calibration → info_hash → known addrs.
+func (c *Coordinator) handlePeerCalibration(ctx context.Context, cal bpf.CalibrationEvent) {
+	// Always attempt torrent_ptr offset calibration on peer_connection dumps.
+	// This runs independently of sockaddr_in calibration.
+	c.attemptTorrentPtrCalibration(cal)
+
 	if c.calibration.isFullyCalibrated() {
 		// Fully calibrated — extract endpoint + peer_id, resolve to race
 		c.extractAndResolve(ctx, cal)
@@ -642,24 +878,23 @@ func (c *Coordinator) extractAndResolve(ctx context.Context, cal bpf.Calibration
 		client = decodePeerClient(peerID)
 	}
 
-	// Always update the connection record with at least the endpoint.
-	// When peer_id is available, include it; otherwise just set ip/port.
-	if hasPeerID {
-		if err := c.store.UpdateConnectionPeerInfo(ctx, connPtr, ip, port, peerID, client); err != nil {
-			c.logger.Debug("failed to update connection peer info", "error", err)
-		}
-	} else {
-		if err := c.store.UpdateConnectionEndpoint(ctx, connPtr, ip, port); err != nil {
-			c.logger.Debug("failed to update connection endpoint", "error", err)
+	// Get the raceID for this connection from connToRace
+	var raceID int64
+	if hash, ok := c.connToRace[cal.ObjPtr]; ok {
+		if state, ok := c.infoHashToRaceState[hash]; ok {
+			raceID = state.raceID
 		}
 	}
 
-	// Upsert into race_peers for the dashboard
-	if hash, ok := c.connToRace[cal.ObjPtr]; ok {
-		if state, ok := c.activeRaces[hash]; ok {
-			if err := c.store.UpsertRacePeerFromCapture(ctx, state.raceID, ip, port, client, peerID); err != nil {
-				c.logger.Debug("failed to upsert race peer from capture", "error", err)
-			}
+	// Always update the connection record with at least the endpoint.
+	// When peer_id is available, include it; otherwise just set ip/port.
+	if hasPeerID {
+		if err := c.store.UpdateConnectionPeerInfo(ctx, raceID, connPtr, ip, port, peerID, client); err != nil {
+			c.logger.Debug("failed to update connection peer info", "error", err)
+		}
+	} else {
+		if err := c.store.UpdateConnectionEndpoint(ctx, raceID, connPtr, ip, port); err != nil {
+			c.logger.Debug("failed to update connection endpoint", "error", err)
 		}
 	}
 
@@ -671,86 +906,131 @@ func (c *Coordinator) extractAndResolve(ctx context.Context, cal bpf.Calibration
 }
 
 // onFullCalibration is called when both sockaddr_in and peer_id offsets have
-// been discovered. Persists the calibration cache and signals trackers to
-// stop API polling.
+// been discovered. Persists the calibration cache.
 func (c *Coordinator) onFullCalibration(ctx context.Context) {
 	c.logger.Info("calibration: fully calibrated",
 		"sockaddr_offset", c.calibration.offset,
 		"peer_id_offset", c.calibration.peerIDOffset)
 
-	// Persist to cache
-	if c.binaryHash != "" && c.calibCachePath != "" {
-		if err := SaveCalibrationCache(c.calibCachePath, c.binaryHash, c.calibration.offset, c.calibration.peerIDOffset); err != nil {
-			c.logger.Warn("failed to save calibration cache", "error", err)
-		} else {
-			c.logger.Info("calibration: cache saved", "path", c.calibCachePath)
-		}
-	}
+	c.saveCalibrationCache()
+}
 
-	// Signal trackers to stop peer polling
-	select {
-	case <-c.calibratedChan:
-		// Already closed (e.g. loaded from cache)
-	default:
-		close(c.calibratedChan)
+// saveCalibrationCache persists all known calibration offsets to disk.
+func (c *Coordinator) saveCalibrationCache() {
+	if c.binaryHash == "" || c.calibCachePath == "" {
+		return
+	}
+	err := SaveCalibrationCache(
+		c.calibCachePath,
+		c.binaryHash,
+		c.calibration.offset,
+		c.calibration.peerIDOffset,
+		c.torrentCalib.infoHashOffset,
+		c.torrentCalib.torrentPtrOffset,
+	)
+	if err != nil {
+		c.logger.Warn("failed to save calibration cache", "error", err)
+	} else {
+		c.logger.Info("calibration: cache saved", "path", c.calibCachePath)
 	}
 }
 
-// handlePeerAddrsUpdate processes peer data from a tracker's peer poll.
-// Updates the known peer address and peer_id maps, then re-scans pending
-// calibration events for both sockaddr_in and peer_id offset discovery.
-func (c *Coordinator) handlePeerAddrsUpdate(update peerAddrsUpdate) {
-	for _, p := range update.peers {
-		if c.knownPeerAddrs[p.Addr] == nil {
-			c.knownPeerAddrs[p.Addr] = make(map[string]bool)
-		}
-		c.knownPeerAddrs[p.Addr][update.hash] = true
+// saveTorrentCalibrationCache is called when a torrent calibration offset
+// is locked. Re-saves the full cache including any previously locked peer
+// calibration offsets.
+func (c *Coordinator) saveTorrentCalibrationCache() {
+	c.saveCalibrationCache()
+}
 
-		// Track peer_id for peer_id offset calibration
-		if p.PeerID != "" {
-			c.knownPeerIDs[p.Addr] = p.PeerID
+
+// pollPeersForCalibration fetches the current peer list from the qBittorrent API
+// and populates knownPeerAddrs and knownPeerIDs. This bootstraps sockaddr_in
+// calibration by providing ground-truth IP:port → info_hash mappings.
+//
+// Called from startRace when a new race begins. The peer data enables two things:
+// 1. sockaddr_in offset discovery (matching dump bytes against known IP:port)
+// 2. peer_id offset discovery (matching dump bytes against known peer_id)
+//
+// After populating, reprocesses any buffered peer_connection calibration dumps.
+func (c *Coordinator) pollPeersForCalibration(infoHash string) {
+	if c.torrentCalibAPI == nil {
+		return
+	}
+
+	peers, err := c.torrentCalibAPI.SyncPeers(infoHash)
+	if err != nil {
+		c.logger.Debug("peer polling failed", "hash", infoHash, "error", err)
+		return
+	}
+
+	newAddrs := 0
+	for _, peer := range peers {
+		if _, exists := c.knownPeerAddrs[peer.Addr]; !exists {
+			c.knownPeerAddrs[peer.Addr] = make(map[string]bool)
+		}
+		if !c.knownPeerAddrs[peer.Addr][infoHash] {
+			c.knownPeerAddrs[peer.Addr][infoHash] = true
+			newAddrs++
+		}
+		if peer.PeerID != "" {
+			c.knownPeerIDs[peer.Addr] = peer.PeerID
 		}
 	}
 
-	// Phase 1: Try sockaddr_in calibration from pending events
-	if !c.calibration.isCalibrated() && len(c.calibration.pending) > 0 && len(c.knownPeerAddrs) > 0 {
-		knownPeers := make(map[netip.AddrPort]bool, len(c.knownPeerAddrs))
-		for addr := range c.knownPeerAddrs {
-			knownPeers[addr] = true
-		}
+	c.logger.Info("peer polling for calibration",
+		"hash", infoHash,
+		"peers", len(peers),
+		"new_addrs", newAddrs,
+		"total_known", len(c.knownPeerAddrs))
 
-		for _, cal := range c.calibration.pending {
-			if c.calibration.tryCalibrate(cal, knownPeers) {
-				c.logger.Info("calibration: sockaddr_in offset locked (from pending rescan)",
-					"offset", c.calibration.offset,
-					"votes", c.calibration.votes[c.calibration.offset])
-				c.reprocessPendingCalibrations(context.Background())
-				break
-			}
-		}
+	// Reprocess buffered calibration events now that we have known peers
+	if newAddrs > 0 && len(c.calibration.pending) > 0 {
+		c.reprocessPendingForSockaddr()
 	}
+}
 
-	// Phase 2: Try peer_id calibration from pending events (requires sockaddr_in first)
-	if c.calibration.isCalibrated() && !c.calibration.isFullyCalibrated() && len(c.calibration.pending) > 0 && len(c.knownPeerIDs) > 0 {
-		for _, cal := range c.calibration.pending {
-			if c.calibration.tryCalibratePeerID(cal, c.knownPeerIDs) {
-				c.logger.Info("calibration: peer_id offset locked (from pending rescan)",
-					"offset", c.calibration.peerIDOffset,
-					"votes", c.calibration.peerIDVotes[c.calibration.peerIDOffset])
-				c.onFullCalibration(context.Background())
-				c.reprocessPendingCalibrations(context.Background())
-				break
-			}
-		}
-	}
-
-	// Resolve any connEndpoints that weren't yet mapped to a race
+// reprocessPendingForSockaddr retries sockaddr_in calibration against
+// buffered peer_connection dumps now that knownPeerAddrs has been populated.
+func (c *Coordinator) reprocessPendingForSockaddr() {
 	if c.calibration.isCalibrated() {
-		for ptr, addr := range c.connEndpoints {
-			if _, resolved := c.connToRace[ptr]; !resolved {
-				c.resolveConnToRace(ptr, addr)
-			}
+		return // Already calibrated
+	}
+
+	knownPeers := make(map[netip.AddrPort]bool, len(c.knownPeerAddrs))
+	for addr := range c.knownPeerAddrs {
+		knownPeers[addr] = true
+	}
+	if len(knownPeers) == 0 {
+		return
+	}
+
+	c.logger.Debug("reprocessing pending calibrations with known peers",
+		"pending", len(c.calibration.pending),
+		"known_peers", len(knownPeers))
+
+	pending := c.calibration.pending
+	c.calibration.pending = nil
+
+	for _, cal := range pending {
+		if c.calibration.isCalibrated() {
+			// Sockaddr_in just locked — switch to full extraction path
+			c.calibration.pending = append(c.calibration.pending, cal)
+			continue
 		}
+		if c.calibration.tryCalibrate(cal, knownPeers) {
+			c.logger.Info("calibration: sockaddr_in offset locked (from peer poll)",
+				"offset", c.calibration.offset,
+				"votes", c.calibration.votes[c.calibration.offset])
+			// Buffer remaining for extractAndResolve
+			c.calibration.pending = append(c.calibration.pending, cal)
+		} else {
+			c.calibration.pending = append(c.calibration.pending, cal)
+		}
+	}
+
+	// If we just locked sockaddr_in, reprocess all pending for endpoint extraction
+	if c.calibration.isCalibrated() {
+		c.reprocessPendingCalibrations(context.Background())
 	}
 }
 
@@ -798,18 +1078,41 @@ func (c *Coordinator) resolveConnToRace(ptr uint64, addr netip.AddrPort) {
 	// If the peer belongs to exactly one active race, map directly.
 	// If multiple races share this peer, pick the first active one.
 	for hash := range races {
-		if _, active := c.activeRaces[hash]; active {
+		if _, active := c.infoHashToRaceState[hash]; active {
 			c.connToRace[ptr] = hash
 			return
 		}
 	}
 }
 
-// closeAllRaces closes all active race trackers during shutdown.
-func (c *Coordinator) closeAllRaces() {
-	for hash, state := range c.activeRaces {
+// waitForTrackerCompletions closes all race channels, waits for processEvents to
+// flush and exit (up to 500ms per race), then returns. On timeout, cancels
+// remaining trackers and returns nil.
+func (c *Coordinator) waitForTrackerCompletions(ctx context.Context) error {
+	n := len(c.infoHashToRaceState)
+	cancels := make([]context.CancelFunc, 0, n)
+	for _, state := range c.infoHashToRaceState {
+		cancels = append(cancels, state.cancel)
+	}
+	for hash, state := range c.infoHashToRaceState {
 		close(state.eventChan)
 		c.logger.Debug("closed race tracker", "hash", hash)
 	}
-	c.activeRaces = make(map[string]*raceState)
+	c.infoHashToRaceState = make(map[string]*raceState)
+
+	for range n {
+		select {
+		case <-c.completeChan:
+			continue
+		case <-time.After(500 * time.Millisecond):
+			for _, cancel := range cancels {
+				cancel()
+			}
+			c.logger.Warn("shutdown timeout waiting for trackers, forcing exit")
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }

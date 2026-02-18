@@ -9,11 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"text/tabwriter"
 
 	"github.com/BurntSushi/toml"
-	qbt "github.com/cehbz/qbittorrent"
 
 	"github.com/cehbz/race-monitor/internal/capture"
 	"github.com/cehbz/race-monitor/internal/race"
@@ -50,22 +50,20 @@ func printUsage() {
 	fmt.Println(`race-monitor - eBPF-based BitTorrent race monitor
 
 Commands:
-  daemon [options]          Monitor torrent races via eBPF uprobes
-                            Runs forever, tracking races as they appear
+  daemon <pid> [options]    Monitor torrent races via eBPF uprobes
+                            Requires the PID of the qBittorrent process to monitor
                             --detach: Run in background
                             --log-file: Write logs to file (recommended with --detach)
   list                      List recent races
 
 Example:
-  race-monitor daemon --detach --log-file ~/race-monitor.log
+  race-monitor daemon $(pgrep -f 'qbittorrent-nox$') --detach --log-file ~/race-monitor.log
 
 Configuration:
   Config file: ~/.config/race-monitor/config.toml
 
   Example config.toml:
     binary = "/usr/bin/qbittorrent-nox"       # Required: path to qBittorrent binary
-    pid = 0                                   # Optional: 0 = all processes
-    webui_url = "http://localhost:8080"        # Optional
     dashboard_url = "http://localhost:8888"    # Optional
     race_db = "/path/to/races.db"             # Optional
 
@@ -73,15 +71,18 @@ Configuration:
     binary: Path to the qBittorrent binary (must have symbol table)
 
   Defaults:
-    pid:       0 (monitor all processes using the binary)
-    webui_url: http://localhost:8080
     race_db:   ~/.local/share/race-monitor/races.db
 
 eBPF Probes:
   Requires root or file capabilities for eBPF uprobe attachment.
   Attaches uprobes to libtorrent functions inside the qBittorrent binary:
+    - torrent::start()                 — fires when a torrent begins (race creation)
+    - torrent::finished()              — fires when download completes (race completion)
     - torrent::we_have()               — fires when we complete a piece
     - peer_connection::incoming_have()  — fires when a peer announces a piece
+
+  The start() and finished() probes replace the previous qBittorrent hook system,
+  providing fully passive lifecycle detection without external scripts.
 
   Grant capabilities (Debian/Ubuntu with kernel < 6.7):
     sudo setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./race-monitor
@@ -91,34 +92,32 @@ eBPF Probes:
 
   Note: CAP_SYS_ADMIN is needed because the uprobe PMU's perf_event_open path
   on Debian 6.1 checks CAP_SYS_ADMIN rather than CAP_PERFMON. Newer kernels
-  (>= 6.7) may only need cap_bpf,cap_perfmon,cap_sys_resource.
-
-qBittorrent setup:
-  Start the daemon before or after launching qBittorrent:
-    race-monitor daemon --detach`)
+  (>= 6.7) may only need cap_bpf,cap_perfmon,cap_sys_resource.`)
 }
 
 // Config holds the configuration for race-monitor.
 type Config struct {
 	Binary       string `toml:"binary"`
-	PID          int    `toml:"pid"`
-	WebUIURL     string `toml:"webui_url"`
 	RaceDB       string `toml:"race_db"`
 	DashboardURL string `toml:"dashboard_url"`
+	WebUIURL     string `toml:"webui_url"`
+	WebUIUser    string `toml:"webui_user"`
+	WebUIPass    string `toml:"webui_pass"`
 }
 
 // getConfig reads configuration from $HOME/.config/race-monitor/config.toml.
-func getConfig() (binary, webUIURL, dbPath, dashboardURL string, pid int) {
+func getConfig() (binary, dbPath, dashboardURL, webuiURL, webuiUser, webuiPass string) {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
 	var cfg Config
 
 	// Defaults
 	cfg.Binary = ""
-	cfg.PID = 0
-	cfg.WebUIURL = "http://localhost:8080"
 	cfg.RaceDB = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
 	cfg.DashboardURL = ""
+	cfg.WebUIURL = ""
+	cfg.WebUIUser = ""
+	cfg.WebUIPass = ""
 
 	if _, err := os.Stat(configPath); err == nil {
 		if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
@@ -126,7 +125,7 @@ func getConfig() (binary, webUIURL, dbPath, dashboardURL string, pid int) {
 		}
 	}
 
-	return cfg.Binary, cfg.WebUIURL, cfg.RaceDB, cfg.DashboardURL, cfg.PID
+	return cfg.Binary, cfg.RaceDB, cfg.DashboardURL, cfg.WebUIURL, cfg.WebUIUser, cfg.WebUIPass
 }
 
 func ensureDBDir(dbPath string) error {
@@ -184,16 +183,32 @@ func daemonize(args []string) error {
 }
 
 func runDaemon(args []string) error {
-	configBinary, configWebUIURL, dbPath, dashboardURL, configPID := getConfig()
+	// PID is the first positional argument, flags follow
+	if len(args) == 0 {
+		return fmt.Errorf("missing required PID argument\nUsage: race-monitor daemon <pid> [flags]\n  pid: 0 = any process, or qBittorrent PID\nExample: race-monitor daemon $(pgrep -f 'qbittorrent-nox$')")
+	}
+
+	// Check if first arg looks like a flag (user forgot PID)
+	if args[0] == "" || args[0][0] == '-' {
+		return fmt.Errorf("first argument must be the qBittorrent PID, got %q\nUsage: race-monitor daemon <pid> [flags]", args[0])
+	}
+
+	pid, err := strconv.Atoi(args[0])
+	if err != nil || pid < 0 {
+		return fmt.Errorf("invalid PID: %q (use 0 for any process, positive integer for specific PID)", args[0])
+	}
+
+	// Remaining args are flags
+	flagArgs := args[1:]
+
+	configBinary, dbPath, dashboardURL, webuiURL, webuiUser, webuiPass := getConfig()
 
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	logLevel := fs.String("log-level", "info", "log level (trace, debug, info, warn, error)")
 	logFile := fs.String("log-file", "", "log file path (default: stderr)")
 	binary := fs.String("binary", configBinary, "path to qBittorrent binary")
-	pid := fs.Int("pid", configPID, "qBittorrent PID to monitor (0 = all processes)")
-	webUIURL := fs.String("webui-url", configWebUIURL, "qBittorrent Web UI URL")
 	detach := fs.Bool("detach", false, "run in background")
-	_ = fs.Parse(args)
+	_ = fs.Parse(flagArgs)
 
 	if *detach {
 		return daemonize(args)
@@ -239,8 +254,7 @@ func runDaemon(args []string) error {
 
 	logger.Info("starting race monitor daemon",
 		"binary", *binary,
-		"pid", *pid,
-		"webui_url", *webUIURL)
+		"pid", pid)
 
 	// Ensure DB directory exists
 	if err := ensureDBDir(dbPath); err != nil {
@@ -254,12 +268,6 @@ func runDaemon(args []string) error {
 	}
 	defer store.Close()
 
-	// Create qBittorrent client (no auth for localhost)
-	qbtClient, err := qbt.NewClient("", "", *webUIURL, nil)
-	if err != nil {
-		return fmt.Errorf("creating qBittorrent client: %w", err)
-	}
-
 	// Handle signals for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -272,6 +280,9 @@ func runDaemon(args []string) error {
 		cancel()
 	}()
 
+	// Watch for target process death via pidfd_open
+	pidDeathCh := race.WatchPID(pid)
+
 	// Compute binary hash for calibration cache
 	binaryHash, err := race.ComputeBinaryHash(*binary)
 	if err != nil {
@@ -282,16 +293,46 @@ func runDaemon(args []string) error {
 	home, _ := os.UserHomeDir()
 	calibCachePath := filepath.Join(home, ".config", "race-monitor", "calibration.json")
 
+	// Create qBittorrent sync client for API-based calibration when webui_url is set
+	var torrentCalibAPI race.TorrentCalibrationAPI
+	if webuiURL != "" {
+		api, err := newQBSyncClient(webuiURL, webuiUser, webuiPass, logger)
+		if err != nil {
+			logger.Warn("webui_url set but failed to create qBittorrent client (API calibration disabled)",
+				"error", err)
+		} else if api != nil {
+			torrentCalibAPI = api
+			logger.Info("API-based torrent calibration enabled", "webui_url", webuiURL)
+		}
+	}
+
+	// Determine calibration flags from cache to suppress unnecessary BPF dumps
+	calFlags := &capture.CalibrationFlags{
+		PeerCalibrationNeeded:    true,
+		TorrentCalibrationNeeded: true,
+	}
+	if binaryHash != "" {
+		if cache := race.LoadCalibrationCache(calibCachePath); cache != nil && cache.BinaryHash == binaryHash {
+			if cache.SockaddrOffset >= 0 && cache.PeerIDOffset >= 0 {
+				calFlags.PeerCalibrationNeeded = false
+			}
+			if cache.InfoHashOffset != nil && cache.TorrentPtrOffset != nil {
+				calFlags.TorrentCalibrationNeeded = false
+			}
+		}
+	}
+
 	// Start eBPF capture — attaches uprobes to libtorrent functions
-	events, calibrations, err := capture.Capture(ctx, logger, *binary, *pid)
+	events, calibrations, err := capture.Capture(ctx, logger, *binary, pid, calFlags)
 	if err != nil {
 		return fmt.Errorf("starting eBPF capture: %w", err)
 	}
 
 	// Create coordinator and run (routes eBPF events to per-race trackers,
-	// calibration events enable auto-discovery of peer_connection struct offsets)
-	coordinator := race.NewCoordinator(store, qbtClient, logger, dashboardURL, binaryHash, calibCachePath)
-	return coordinator.Run(ctx, events, calibrations)
+	// calibration events enable auto-discovery of struct offsets,
+	// lifecycle events from torrent::start()/finished() drive race creation/completion)
+	coordinator := race.NewCoordinator(store, logger, dashboardURL, binaryHash, calibCachePath, torrentCalibAPI)
+	return coordinator.Run(ctx, events, calibrations, pidDeathCh)
 }
 
 func runList(args []string) error {
@@ -299,7 +340,7 @@ func runList(args []string) error {
 	days := fs.Int("days", 7, "show races from last N days")
 	_ = fs.Parse(args)
 
-	_, _, dbPath, _, _ := getConfig()
+	_, dbPath, _, _, _, _ := getConfig()
 
 	store, err := storage.New(dbPath)
 	if err != nil {

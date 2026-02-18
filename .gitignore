@@ -37,3 +37,5 @@ test-v2.sh
 TODO-peer-correlation.md
 DESIGN.md
 race-viz/app.log
+internal/bpf/probe_bpfel.o
+internal/bpf/probe_bpfel.go

@@ -3,6 +3,7 @@ package race
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"net/netip"
 
 	"github.com/cehbz/race-monitor/internal/bpf"
@@ -10,15 +11,24 @@ import (
 
 const (
 	// calibrationMinVotes is the number of independent peer_connection*
-	// matches at the same offset required to lock in the calibration.
+	// matches at the same offset required to lock in sockaddr_in and
+	// peer_id calibration. Two votes prevents false positives from
+	// coincidental 8-byte sockaddr_in pattern matches.
 	calibrationMinVotes = 2
+
+	// torrentPtrMinVotes is the vote threshold for torrent_ptr offset
+	// calibration. Set to 1 because we're matching a specific 8-byte
+	// heap pointer (e.g. 0x7f27dc5ecad0) — the probability of a random
+	// 8-byte value matching is ~N_ptrs / 2^64 per offset, which is
+	// effectively zero. A single match is conclusive.
+	torrentPtrMinVotes = 1
 
 	// sockaddrINSize is the number of bytes in a sockaddr_in that we
 	// match: sin_family (2) + sin_port (2) + sin_addr (4).
 	sockaddrINSize = 8
 
 	// calibrationDataSize matches CALIBRATION_READ_SIZE in probe.c.
-	calibrationDataSize = 512
+	calibrationDataSize = 4096
 
 	// peerIDSize is the BT protocol peer_id length (always 20 bytes).
 	peerIDSize = 20
@@ -27,6 +37,9 @@ const (
 	// matching during calibration. The Azureus-style prefix is 8 bytes
 	// (e.g., "-qB4530-"); we require at least this many bytes.
 	peerIDMinMatchLen = 8
+
+	// infoHashSize is the SHA-1 info_hash length (always 20 bytes).
+	infoHashSize = 20
 )
 
 // calibrationState tracks the auto-calibration of both the m_remote sockaddr_in
@@ -34,7 +47,7 @@ const (
 //
 // The algorithm runs in two phases:
 //
-// Phase 1 (sockaddr_in): Scan 512-byte dumps for known peer IP:port patterns.
+// Phase 1 (sockaddr_in): Scan calibration dumps for known peer IP:port patterns.
 // Lock offset after ≥2 independent matches at the same byte position.
 //
 // Phase 2 (peer_id): After sockaddr_in is locked, correlate each dump to a
@@ -89,8 +102,8 @@ func (cs *calibrationState) isFullyCalibrated() bool {
 	return cs.offset >= 0 && cs.peerIDOffset >= 0
 }
 
-// tryCalibrate attempts to discover the sockaddr_in offset by scanning the
-// 512-byte calibration data for known peer IP:port patterns.
+// tryCalibrate attempts to discover the sockaddr_in offset by scanning
+// calibration data for known peer IP:port patterns.
 //
 // A sockaddr_in is identified by: AF_INET (0x0002 LE) at offset, followed by
 // port in network byte order (big-endian), followed by IPv4 address in network
@@ -291,4 +304,274 @@ func parseSockaddrIN(data []byte, offset int) (netip.AddrPort, bool) {
 	}
 
 	return netip.AddrPortFrom(addr, port), true
+}
+
+// --- Torrent calibration ---
+//
+// Discovers the info_hash offset within the torrent struct by scanning
+// torrent struct dumps for known info_hash patterns.
+// Also discovers the torrent* offset within peer_connection structs
+// by scanning peer_connection dumps for known torrent* pointer values.
+
+// torrentCalibrationState tracks discovery of:
+//   - info_hash offset within the torrent struct
+//   - torrent* (parent pointer) offset within the peer_connection struct
+type torrentCalibrationState struct {
+	// infoHashOffset is the byte offset of the 20-byte info_hash within
+	// the torrent struct. -1 if undiscovered.
+	infoHashOffset int
+	// torrentPtrOffset is the byte offset of the torrent* pointer within
+	// the peer_connection struct. -1 if undiscovered.
+	torrentPtrOffset int
+	torrentPtrVotes  map[int]int             // offset → match count
+	torrentPtrPtrs   map[int]map[uint64]bool // offset → set of peer_connection* ptrs that voted
+
+	// pendingTorrentDumps buffers torrent calibration events until we
+	// have a known info_hash to search for.
+	pendingTorrentDumps []bpf.CalibrationEvent
+
+	// pendingPeerDumps buffers peer_connection dumps until we have
+	// known torrent* pointers to search for.
+	pendingPeerDumps []bpf.CalibrationEvent
+}
+
+func newTorrentCalibrationState() *torrentCalibrationState {
+	return &torrentCalibrationState{
+		infoHashOffset:   -1,
+		torrentPtrOffset: -1,
+		torrentPtrVotes:  make(map[int]int),
+		torrentPtrPtrs:   make(map[int]map[uint64]bool),
+	}
+}
+
+func (ts *torrentCalibrationState) isInfoHashCalibrated() bool {
+	return ts.infoHashOffset >= 0
+}
+
+func (ts *torrentCalibrationState) isTorrentPtrCalibrated() bool {
+	return ts.torrentPtrOffset >= 0
+}
+
+// tryCalibrateInfoHashByCorrelation discovers the info_hash offset by
+// comparing torrent struct dumps from different torrent* pointers. Each
+// torrent has a unique 20-byte SHA-1 info_hash at the same offset. By
+// scanning for offsets where the 20-byte value is unique across all dumps,
+// we can identify the info_hash field without external ground truth.
+//
+// Requires at least 2 dumps from distinct torrent* pointers. With 2 dumps,
+// accepts only if exactly 1 candidate offset remains. With 3+ dumps the
+// false-positive rate drops dramatically.
+//
+// Returns true if the offset was locked in. On failure, numCandidates is the
+// count of candidate offsets (0 if not enough dumps).
+func (ts *torrentCalibrationState) tryCalibrateInfoHashByCorrelation(dumps []bpf.CalibrationEvent) (success bool, numCandidates int) {
+	if ts.isInfoHashCalibrated() {
+		return true, 0
+	}
+
+	// Collect one dump per unique torrent_ptr
+	byPtr := make(map[uint64]int) // ptr → index into dumps
+	for i, d := range dumps {
+		if _, exists := byPtr[d.ObjPtr]; !exists {
+			byPtr[d.ObjPtr] = i
+		}
+	}
+	if len(byPtr) < 2 {
+		return false, 0
+	}
+
+	// Gather the raw data slices
+	datas := make([][]byte, 0, len(byPtr))
+	for _, idx := range byPtr {
+		datas = append(datas, dumps[idx].Data[:])
+	}
+
+	// Scan 8-byte-aligned offsets for 20-byte windows where:
+	// 1. All values are non-zero (uninitialized fields are typically zero)
+	// 2. All values are unique across dumps (different torrents have different hashes)
+	// 3. No value looks like a user-space pointer pair (heuristic filter)
+	var candidates []int
+	for off := 0; off <= calibrationDataSize-infoHashSize; off += 8 {
+		seen := make(map[string]bool, len(datas))
+		valid := true
+
+		for _, data := range datas {
+			chunk := data[off : off+infoHashSize]
+
+			// Reject all-zero chunks
+			allZero := true
+			for _, b := range chunk {
+				if b != 0 {
+					allZero = false
+					break
+				}
+			}
+			if allZero {
+				valid = false
+				break
+			}
+
+			key := string(chunk)
+			if seen[key] {
+				// Same value in two different torrent dumps → not the info_hash
+				valid = false
+				break
+			}
+			seen[key] = true
+		}
+		if valid {
+			candidates = append(candidates, off)
+		}
+	}
+
+	// Accept only if we have a unique candidate. With 3+ diverse dumps
+	// this converges quickly. With 2 dumps, multiple candidates are common
+	// so we wait for more data.
+	if len(candidates) == 1 {
+		ts.infoHashOffset = candidates[0]
+		return true, 0
+	}
+
+	return false, len(candidates)
+}
+
+// tryCalibrateInfoHashFromAPI discovers the info_hash offset by searching
+// torrent dumps for known hashes from the qBittorrent sync API. Lock in when
+// 2+ dumps agree on the same offset (each containing a different known hash).
+//
+// hashes are hex-encoded info_hashes (40 chars each). Returns (offset, true)
+// when lock condition is met.
+func (ts *torrentCalibrationState) tryCalibrateInfoHashFromAPI(dumps []bpf.CalibrationEvent, hashes []string) (offset int, numCandidates int, ok bool) {
+	if ts.isInfoHashCalibrated() {
+		return ts.infoHashOffset, 0, true
+	}
+	if len(hashes) == 0 {
+		return -1, 0, false
+	}
+
+	// Build set of binary hashes (20 bytes each)
+	hashSet := make(map[string]bool)
+	for _, h := range hashes {
+		if len(h) != 40 {
+			continue
+		}
+		bin, err := hex.DecodeString(h)
+		if err != nil || len(bin) != infoHashSize {
+			continue
+		}
+		hashSet[string(bin)] = true
+	}
+	if len(hashSet) == 0 {
+		return -1, 0, false
+	}
+
+	// Collect one dump per unique torrent_ptr
+	byPtr := make(map[uint64]int)
+	for i, d := range dumps {
+		if _, exists := byPtr[d.ObjPtr]; !exists {
+			byPtr[d.ObjPtr] = i
+		}
+	}
+	if len(byPtr) == 0 {
+		return -1, 0, false
+	}
+
+	// Scan every byte offset — the info_hash (SHA-1, 20 bytes) may not be
+	// 8-byte aligned in the C++ struct. With API ground truth, false positives
+	// are impossible (probability ~N/2^160), so byte-level scanning is safe.
+	var candidates []int
+	for off := 0; off <= calibrationDataSize-infoHashSize; off++ {
+		seen := make(map[string]bool)
+		valid := true
+		for _, idx := range byPtr {
+			chunk := dumps[idx].Data[off : off+infoHashSize]
+			key := string(chunk)
+			if !hashSet[key] {
+				valid = false
+				break
+			}
+			if seen[key] {
+				valid = false
+				break
+			}
+			seen[key] = true
+		}
+		if valid {
+			candidates = append(candidates, off)
+		}
+	}
+
+	if len(candidates) == 1 {
+		return candidates[0], 1, true
+	}
+	return -1, len(candidates), false
+}
+
+// extractInfoHash reads the 20-byte info_hash from a torrent dump at the
+// locked offset. Returns the raw binary hash and true if successful.
+func (ts *torrentCalibrationState) extractInfoHash(data [calibrationDataSize]byte) ([]byte, bool) {
+	if !ts.isInfoHashCalibrated() {
+		return nil, false
+	}
+	if ts.infoHashOffset+infoHashSize > calibrationDataSize {
+		return nil, false
+	}
+	raw := make([]byte, infoHashSize)
+	copy(raw, data[ts.infoHashOffset:ts.infoHashOffset+infoHashSize])
+	return raw, true
+}
+
+// tryCalibrateTorrentPtr scans a peer_connection dump for a known torrent*
+// pointer value. knownTorrentPtrs is the set of torrent* pointers seen from
+// we_have events.
+// Returns true if the offset was locked in.
+func (ts *torrentCalibrationState) tryCalibrateTorrentPtr(cal bpf.CalibrationEvent, knownTorrentPtrs map[uint64]bool) bool {
+	if ts.isTorrentPtrCalibrated() {
+		return true
+	}
+
+	if len(knownTorrentPtrs) == 0 {
+		return false
+	}
+
+	// Scan the dump for 8-byte pointer values that match known torrent* ptrs.
+	// Pointer alignment: check at 8-byte boundaries only (x86_64).
+	for offset := 0; offset <= calibrationDataSize-8; offset += 8 {
+		ptr := binary.LittleEndian.Uint64(cal.Data[offset : offset+8])
+		if ptr == 0 {
+			continue
+		}
+		if !knownTorrentPtrs[ptr] {
+			continue
+		}
+
+		if ts.torrentPtrPtrs[offset] == nil {
+			ts.torrentPtrPtrs[offset] = make(map[uint64]bool)
+		}
+		if ts.torrentPtrPtrs[offset][cal.ObjPtr] {
+			continue
+		}
+		ts.torrentPtrPtrs[offset][cal.ObjPtr] = true
+
+		ts.torrentPtrVotes[offset]++
+		if ts.torrentPtrVotes[offset] >= torrentPtrMinVotes {
+			ts.torrentPtrOffset = offset
+			return true
+		}
+	}
+
+	return false
+}
+
+// extractTorrentPtr reads the torrent* pointer from a peer_connection dump
+// at the locked offset. Returns the pointer value and true if successful.
+func (ts *torrentCalibrationState) extractTorrentPtr(data [calibrationDataSize]byte) (uint64, bool) {
+	if !ts.isTorrentPtrCalibrated() {
+		return 0, false
+	}
+	if ts.torrentPtrOffset+8 > calibrationDataSize {
+		return 0, false
+	}
+	ptr := binary.LittleEndian.Uint64(data[ts.torrentPtrOffset : ts.torrentPtrOffset+8])
+	return ptr, ptr != 0
 }

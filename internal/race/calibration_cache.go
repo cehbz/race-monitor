@@ -13,10 +13,12 @@ import (
 // the SHA256 hash of the qBittorrent binary. This allows skipping the
 // calibration phase on daemon restart when the binary hasn't changed.
 type CalibrationCache struct {
-	BinaryHash     string `json:"binary_hash"`
-	SockaddrOffset int    `json:"sockaddr_offset"`
-	PeerIDOffset   int    `json:"peer_id_offset"`
-	CalibratedAt   string `json:"calibrated_at"`
+	BinaryHash       string `json:"binary_hash"`
+	SockaddrOffset   int    `json:"sockaddr_offset"`
+	PeerIDOffset     int    `json:"peer_id_offset"`
+	InfoHashOffset   *int   `json:"info_hash_offset,omitempty"`   // offset of info_hash in torrent struct
+	TorrentPtrOffset *int   `json:"torrent_ptr_offset,omitempty"` // offset of torrent* in peer_connection struct
+	CalibratedAt     string `json:"calibrated_at"`
 }
 
 // LoadCalibrationCache reads a calibration cache from a JSON file.
@@ -37,12 +39,18 @@ func LoadCalibrationCache(path string) *CalibrationCache {
 }
 
 // SaveCalibrationCache writes calibration offsets to a JSON file.
-func SaveCalibrationCache(path string, binaryHash string, sockaddrOffset, peerIDOffset int) error {
+func SaveCalibrationCache(path string, binaryHash string, sockaddrOffset, peerIDOffset int, infoHashOffset, torrentPtrOffset int) error {
 	cache := CalibrationCache{
 		BinaryHash:     binaryHash,
 		SockaddrOffset: sockaddrOffset,
 		PeerIDOffset:   peerIDOffset,
 		CalibratedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	if infoHashOffset >= 0 {
+		cache.InfoHashOffset = &infoHashOffset
+	}
+	if torrentPtrOffset >= 0 {
+		cache.TorrentPtrOffset = &torrentPtrOffset
 	}
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {

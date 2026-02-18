@@ -220,10 +220,12 @@ func TestInsertConnection(t *testing.T) {
 	defer cleanup()
 
 	ctx := context.Background()
+	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
+	raceID, _ := store.CreateRace(ctx, torID)
 	now := time.Now()
 
 	t.Run("inserts and returns ID", func(t *testing.T) {
-		id, err := store.InsertConnection(ctx, "deadbeef", now)
+		id, err := store.InsertConnection(ctx, raceID, "deadbeef", now)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -233,8 +235,8 @@ func TestInsertConnection(t *testing.T) {
 	})
 
 	t.Run("returns same ID for duplicate conn_ptr", func(t *testing.T) {
-		id1, _ := store.InsertConnection(ctx, "same_ptr", now)
-		id2, _ := store.InsertConnection(ctx, "same_ptr", now.Add(time.Second))
+		id1, _ := store.InsertConnection(ctx, raceID, "same_ptr", now)
+		id2, _ := store.InsertConnection(ctx, raceID, "same_ptr", now.Add(time.Second))
 
 		if id1 != id2 {
 			t.Errorf("expected same ID for duplicate conn_ptr, got %d != %d", id1, id2)
@@ -242,73 +244,11 @@ func TestInsertConnection(t *testing.T) {
 	})
 
 	t.Run("different ptrs get different IDs", func(t *testing.T) {
-		id1, _ := store.InsertConnection(ctx, "ptr_a", now)
-		id2, _ := store.InsertConnection(ctx, "ptr_b", now)
+		id1, _ := store.InsertConnection(ctx, raceID, "ptr_a", now)
+		id2, _ := store.InsertConnection(ctx, raceID, "ptr_b", now)
 
 		if id1 == id2 {
 			t.Error("expected different IDs for different conn_ptrs")
-		}
-	})
-}
-
-func TestUpsertRacePeers(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	torID := createTestTorrent(t, store, "peerhash", "PeerTorrent", 1000, 100)
-	raceID, _ := store.CreateRace(ctx, torID)
-	now := time.Now()
-
-	t.Run("inserts new peers", func(t *testing.T) {
-		peers := []storage.RacePeer{
-			{IP: "10.0.0.1", Port: 6881, Client: "qBittorrent/4.5.3", Progress: 0.5, FirstSeen: now, LastSeen: now},
-			{IP: "10.0.0.2", Port: 6881, Client: "Deluge/2.1.1", Progress: 1.0, FirstSeen: now, LastSeen: now},
-		}
-
-		if err := store.UpsertRacePeers(ctx, raceID, peers); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		got, err := store.GetRacePeers(ctx, raceID)
-		if err != nil {
-			t.Fatalf("failed to get peers: %v", err)
-		}
-		if len(got) != 2 {
-			t.Fatalf("expected 2 peers, got %d", len(got))
-		}
-	})
-
-	t.Run("upsert updates existing peer", func(t *testing.T) {
-		later := now.Add(5 * time.Second)
-		peers := []storage.RacePeer{
-			{IP: "10.0.0.1", Port: 6881, Client: "qBittorrent/4.6.0", Progress: 0.9, FirstSeen: later, LastSeen: later},
-		}
-
-		if err := store.UpsertRacePeers(ctx, raceID, peers); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		got, _ := store.GetRacePeers(ctx, raceID)
-		if len(got) != 2 {
-			t.Fatalf("expected 2 peers (no duplicate), got %d", len(got))
-		}
-		// Find the updated peer
-		for _, p := range got {
-			if p.IP == "10.0.0.1" && p.Port == 6881 {
-				if p.Client != "qBittorrent/4.6.0" {
-					t.Errorf("expected updated client, got %q", p.Client)
-				}
-				if p.Progress != 0.9 {
-					t.Errorf("expected updated progress 0.9, got %f", p.Progress)
-				}
-			}
-		}
-	})
-
-	t.Run("handles empty slice", func(t *testing.T) {
-		if err := store.UpsertRacePeers(ctx, raceID, nil); err != nil {
-			t.Fatalf("unexpected error for empty slice: %v", err)
 		}
 	})
 }
@@ -320,10 +260,10 @@ func TestInsertPacketEvents(t *testing.T) {
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
 	raceID, _ := store.CreateRace(ctx, torID)
-	connID, _ := store.InsertConnection(ctx, "self", time.Now())
+	connID, _ := store.InsertConnection(ctx, raceID, "self", time.Now())
 
 	t.Run("inserts multiple events", func(t *testing.T) {
-		now := time.Now()
+		now := time.Now().UnixNano()
 		events := []storage.Event{
 			{
 				RaceID:       raceID,
@@ -335,7 +275,7 @@ func TestInsertPacketEvents(t *testing.T) {
 			{
 				RaceID:       raceID,
 				ConnectionID: connID,
-				Timestamp:    now.Add(time.Second),
+				Timestamp:    now + int64(time.Second),
 				EventType:    storage.EventTypeHave,
 				PieceIndex:   5,
 			},

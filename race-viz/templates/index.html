@@ -308,19 +308,10 @@
                         <div id="faster-peers-section"><div class="loading">Analyzing peer performance...</div></div>
                     </div>
 
-                    ${raceData.race_peers && raceData.race_peers.length > 0 ? `
-                    <div class="chart-container">
-                        <div class="chart-title">Known Peers <span class="chart-info">(from qBittorrent API polling)</span></div>
-                        <div id="race-peers-section"></div>
-                    </div>
-                    ` : ''}
                 `;
 
                 displayRaceStats(raceData);
                 renderTimelineCharts(raceData);
-                if (raceData.race_peers && raceData.race_peers.length > 0) {
-                    renderRacePeers(raceData.race_peers);
-                }
 
                 const [progressResp, fasterResp] = await Promise.all([
                     fetch(`/api/race/${raceId}/peer_progress`),
@@ -516,71 +507,6 @@
                 html += '</tbody></table>';
             }
 
-            container.innerHTML = html;
-        }
-
-        function renderRacePeers(peers) {
-            const container = document.getElementById('race-peers-section');
-            if (!container) return;
-
-            if (!peers || peers.length === 0) {
-                container.innerHTML = '<div class="loading">No API-polled peers recorded.</div>';
-                return;
-            }
-
-            const seeders = peers.filter(p => p.progress >= 1.0).length;
-            const avgProgress = peers.reduce((s, p) => s + (p.progress || 0), 0) / peers.length;
-
-            let html = `
-                <div class="analysis-stats">
-                    <div class="stat-mini">
-                        <div class="stat-label">Known Peers</div>
-                        <div class="stat-value">${peers.length}</div>
-                    </div>
-                    <div class="stat-mini">
-                        <div class="stat-label">Seeders</div>
-                        <div class="stat-value" style="color: #3fb950">${seeders}</div>
-                    </div>
-                    <div class="stat-mini">
-                        <div class="stat-label">Avg Progress</div>
-                        <div class="stat-value">${(avgProgress * 100).toFixed(1)}%</div>
-                    </div>
-                </div>
-                <table class="peer-table">
-                    <thead>
-                        <tr>
-                            <th>IP</th>
-                            <th class="num">Port</th>
-                            <th>Client</th>
-                            <th>Country</th>
-                            <th class="num">Progress</th>
-                            <th class="num">DL Speed</th>
-                            <th class="num">UL Speed</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-            `;
-
-            peers.forEach(peer => {
-                const progress = peer.progress != null ? (peer.progress * 100).toFixed(1) + '%' : '\u2014';
-                const dlSpeed = peer.dl_speed ? formatBytes(peer.dl_speed) + '/s' : '\u2014';
-                const ulSpeed = peer.up_speed ? formatBytes(peer.up_speed) + '/s' : '\u2014';
-                const rowClass = peer.progress >= 1.0 ? 'seeder-row' : '';
-
-                html += `
-                    <tr class="${rowClass}">
-                        <td>${peer.ip || '\u2014'}</td>
-                        <td class="num">${peer.port || '\u2014'}</td>
-                        <td>${peer.client || '\u2014'}</td>
-                        <td>${peer.country || '\u2014'}</td>
-                        <td class="num">${progress}</td>
-                        <td class="num">${dlSpeed}</td>
-                        <td class="num">${ulSpeed}</td>
-                    </tr>
-                `;
-            });
-
-            html += '</tbody></table>';
             container.innerHTML = html;
         }
 

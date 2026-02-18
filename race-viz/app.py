@@ -9,7 +9,8 @@ eBPF architecture:
   - Two event types: have (peer announced piece) and piece_received (we completed)
   - Peers identified by opaque conn_ptr (hex address from eBPF uprobe)
   - Self peer (conn_ptr="self") represents our own piece completions
-  - Timestamps are RFC 3339 (e.g. "2026-02-09T05:18:37.753Z")
+  - Timestamps in packet_events are int64 nanoseconds since boot (BPF ktime)
+  - Race wallclock time recorded from hooks as start_wallclock
 """
 
 import os
@@ -36,6 +37,9 @@ CORS(app)
 
 # SSE client management
 sse_clients = []
+
+# Nanoseconds per second for BPF timestamp conversion.
+_NS_PER_SEC = 1_000_000_000
 
 
 def load_config():
@@ -113,14 +117,12 @@ def get_race_data(race_id):
 
     timeline = db.fetch_timeline(conn, race_id)
     peer_count = db.fetch_peer_count(conn, race_id)
-    race_peers = db.fetch_race_peers(conn, race_id)
     conn.close()
 
     return jsonify({
         'race': race,
         'timeline': timeline,
         'peer_count': peer_count,
-        'race_peers': race_peers,
     })
 
 
@@ -129,7 +131,7 @@ def get_peer_progress(race_id):
     """Per-peer cumulative completion % over time.
 
     Two-phase approach:
-    1. SQL: first timestamp each peer announced each piece
+    1. SQL: first timestamp each peer announced each piece (int64 ns since boot)
     2. Python: build cumulative timelines sampled at 1-second intervals
     """
     conn = db.get_db(DB_PATH)
@@ -144,28 +146,28 @@ def get_peer_progress(race_id):
     conn_meta = db.fetch_connection_meta(conn, race_id)
     conn.close()
 
-    # Find global epoch (earliest timestamp across all events)
+    # Find global epoch (earliest BPF timestamp across all events)
     all_ts = []
     for r in self_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            all_ts.append(dt)
+        ts = r['first_ts']
+        if ts is not None:
+            all_ts.append(ts)
     for r in peer_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            all_ts.append(dt)
+        ts = r['first_ts']
+        if ts is not None:
+            all_ts.append(ts)
 
     if not all_ts:
         return jsonify({'piece_count': piece_count, 'self': None, 'peers': []})
 
-    epoch = min(all_ts)
+    epoch_ns = min(all_ts)
 
-    # Build self timeline
+    # Build self timeline (elapsed seconds from epoch)
     self_times = []
     for r in self_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            self_times.append((dt - epoch).total_seconds())
+        ts = r['first_ts']
+        if ts is not None:
+            self_times.append((ts - epoch_ns) / _NS_PER_SEC)
 
     self_elapsed, self_pcts = build_cumulative_curve(self_times, piece_count)
     self_data = {
@@ -176,9 +178,9 @@ def get_peer_progress(race_id):
     # Group peer pieces by connection_id, build timelines
     peer_groups = defaultdict(list)
     for r in peer_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            peer_groups[r['connection_id']].append((dt - epoch).total_seconds())
+        ts = r['first_ts']
+        if ts is not None:
+            peer_groups[r['connection_id']].append((ts - epoch_ns) / _NS_PER_SEC)
 
     peers_data = []
     for conn_id, times in peer_groups.items():
@@ -251,14 +253,14 @@ def get_faster_peers(race_id):
             },
         })
 
-    # Parse our piece times and find race_start
-    our_times = []
+    # Parse our piece times as elapsed seconds from earliest event
+    our_ts = []
     for r in self_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            our_times.append(dt)
+        ts = r['first_ts']
+        if ts is not None:
+            our_ts.append(ts)
 
-    if not our_times:
+    if not our_ts:
         return jsonify({
             'faster_peers': [],
             'stats': {
@@ -270,14 +272,20 @@ def get_faster_peers(race_id):
             },
         })
 
-    race_start = min(our_times)
-    our_elapsed = sorted((dt - race_start).total_seconds() for dt in our_times)
+    race_start_ns = min(our_ts)
+    our_elapsed = sorted((ts - race_start_ns) / _NS_PER_SEC for ts in our_ts)
     race_duration = int(our_elapsed[-1]) + 1 if our_elapsed else 1
 
-    # Our authoritative finish time: completed_at if available, else last observed
+    # Our finish time: use completed_at if available, else last observed event
     completed_at = parse_rfc3339(race.get('completed_at'))
-    if completed_at:
-        our_finish_sec = (completed_at - race_start).total_seconds()
+    if completed_at and race.get('start_wallclock'):
+        # completed_at and start_wallclock are both wallclock RFC 3339;
+        # compute finish relative to race start
+        start_wc = parse_rfc3339(race['start_wallclock'])
+        if start_wc and completed_at:
+            our_finish_sec = (completed_at - start_wc).total_seconds()
+        else:
+            our_finish_sec = our_elapsed[-1]
     else:
         our_finish_sec = our_elapsed[-1]
 
@@ -286,9 +294,11 @@ def get_faster_peers(race_id):
     # Group peer pieces by connection_id
     peer_groups = defaultdict(list)
     for r in peer_pieces:
-        dt = parse_rfc3339(r['first_ts'])
-        if dt:
-            peer_groups[r['connection_id']].append((dt - race_start).total_seconds())
+        ts = r['first_ts']
+        if ts is not None:
+            peer_groups[r['connection_id']].append(
+                (ts - race_start_ns) / _NS_PER_SEC
+            )
 
     # Compare each peer
     faster_peers = []
@@ -408,9 +418,6 @@ if __name__ == '__main__':
         print(f"Error: Database not found at {DB_PATH}")
         print("Update 'race_db' in config.toml to specify database path")
         exit(1)
-
-    print("Ensuring performance indexes...")
-    db.ensure_indexes(DB_PATH)
 
     print(f"Starting Race Monitor Dashboard")
     print(f"Database: {DB_PATH}")

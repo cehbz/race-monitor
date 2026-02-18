@@ -3,10 +3,20 @@
 Encapsulates all SQLite queries behind named functions that return plain
 Python data structures. No Flask dependency — can be tested or reused
 independently.
+
+Schema v5 notes:
+  - packet_events.ts is int64 nanoseconds since boot (BPF ktime_get_ns)
+  - race_peers table has been removed (API dependency eliminated)
+  - Covering index is now created by the Go daemon at schema init time
+  - races.start_wallclock records the hook-observed wallclock time
 """
 
 import sqlite3
 from analysis import decode_peer_id
+
+
+# Nanoseconds per second — BPF timestamps are ktime_get_ns() int64 values.
+_NS_PER_SEC = 1_000_000_000
 
 
 def get_db(db_path):
@@ -15,22 +25,6 @@ def get_db(db_path):
     conn.text_factory = lambda b: b.decode('utf-8', errors='replace')
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def ensure_indexes(db_path):
-    """Create read-side performance indexes.
-
-    These are viz-app optimizations — they don't touch the Go daemon's schema
-    version. The covering index on (race_id, event_type_id, connection_id,
-    piece_index, ts) makes per-peer GROUP BY queries ~30x faster on 26M+ rows.
-    """
-    conn = sqlite3.connect(db_path)
-    conn.execute('''
-        CREATE INDEX IF NOT EXISTS idx_events_peer_piece
-        ON packet_events(race_id, event_type_id, connection_id, piece_index, ts)
-    ''')
-    conn.commit()
-    conn.close()
 
 
 def fetch_races(conn):
@@ -51,10 +45,10 @@ def fetch_races(conn):
 
 
 def fetch_race_counts(conn, race_ids):
-    """Peer/event counts for a batch of race IDs.
+    """Event and peer counts for a batch of race IDs.
 
-    peer_count: from race_peers (API-polled, most comprehensive).
-    event_count: from packet_events (eBPF captured).
+    peer_count: distinct eBPF connections with incoming_have events.
+    event_count: total packet_events.
     Returns {race_id: {'peer_count': N, 'event_count': N}}.
     """
     if not race_ids:
@@ -76,11 +70,11 @@ def fetch_race_counts(conn, race_ids):
             'event_count': row['event_count'],
         }
 
-    # Peer counts from race_peers (API-polled, richer than eBPF connections)
+    # Peer counts from eBPF connections (distinct connection_ids with have events)
     peer_cursor = conn.execute(f'''
-        SELECT race_id, COUNT(*) as peer_count
-        FROM race_peers
-        WHERE race_id IN ({placeholders})
+        SELECT race_id, COUNT(DISTINCT connection_id) as peer_count
+        FROM packet_events
+        WHERE race_id IN ({placeholders}) AND event_type_id = 1
         GROUP BY race_id
     ''', race_ids)
     for row in peer_cursor.fetchall():
@@ -96,7 +90,7 @@ def fetch_race_counts(conn, race_ids):
 def fetch_race_detail(conn, race_id):
     """Race metadata joined with torrent info. Returns dict or None."""
     cursor = conn.execute('''
-        SELECT r.id, r.started_at, r.completed_at,
+        SELECT r.id, r.started_at, r.completed_at, r.start_wallclock,
                t.info_hash, t.name, t.size, t.piece_count
         FROM races r
         JOIN torrents t ON r.torrent_id = t.id
@@ -109,27 +103,32 @@ def fetch_race_detail(conn, race_id):
 def fetch_timeline(conn, race_id):
     """1-second bucketed timeline of have/piece_received counts.
 
-    Uses idx_events_race_ts for efficient scanning. Returns ~600 rows for a
-    10-minute race instead of 26M raw events.
+    Timestamps are int64 nanoseconds since boot. We compute elapsed seconds
+    relative to the race's first event using integer arithmetic.
+
+    Returns ~600 rows for a 10-minute race instead of 26M raw events.
     """
     cursor = conn.execute('''
         WITH race_start AS (
             SELECT MIN(ts) as t0 FROM packet_events WHERE race_id = ?
         )
         SELECT
-            CAST((julianday(pe.ts) - julianday(rs.t0)) * 86400 AS INTEGER) as elapsed_sec,
+            CAST((pe.ts - rs.t0) / ? AS INTEGER) as elapsed_sec,
             SUM(CASE WHEN pe.event_type_id = 1 THEN 1 ELSE 0 END) as have_count,
             SUM(CASE WHEN pe.event_type_id = 2 THEN 1 ELSE 0 END) as piece_received
         FROM packet_events pe, race_start rs
         WHERE pe.race_id = ?
         GROUP BY elapsed_sec
         ORDER BY elapsed_sec
-    ''', (race_id, race_id))
+    ''', (race_id, _NS_PER_SEC, race_id))
     return [dict(row) for row in cursor.fetchall()]
 
 
 def fetch_self_pieces(conn, race_id):
-    """First timestamp per piece for our we_have events (event_type_id=2)."""
+    """First timestamp per piece for our we_have events (event_type_id=2).
+
+    Returns rows with piece_index and first_ts (int64 nanoseconds since boot).
+    """
     cursor = conn.execute('''
         SELECT piece_index, MIN(ts) as first_ts
         FROM packet_events
@@ -144,6 +143,8 @@ def fetch_peer_pieces(conn, race_id):
 
     Uses idx_events_peer_piece covering index. For 202 peers x 856 pieces
     this returns ~173K rows — manageable in Python.
+
+    Returns rows with connection_id, piece_index, first_ts (int64 ns since boot).
     """
     cursor = conn.execute('''
         SELECT pe.connection_id, pe.piece_index, MIN(pe.ts) as first_ts
@@ -155,21 +156,18 @@ def fetch_peer_pieces(conn, race_id):
 
 
 def fetch_connection_meta(conn, race_id):
-    """Connection metadata with LEFT JOIN to race_peers for richer client names.
+    """Connection metadata from eBPF calibration.
 
     Returns {connection_id: {conn_ptr, ip, port, client, peer_id, label}}.
     """
     cursor = conn.execute('''
-        SELECT c.id, c.conn_ptr, c.ip, c.port, c.peer_id,
-               COALESCE(rp.client, c.client) as client
+        SELECT c.id, c.conn_ptr, c.ip, c.port, c.peer_id, c.client
         FROM connections c
-        LEFT JOIN race_peers rp
-            ON rp.race_id = ? AND rp.ip = c.ip AND rp.port = c.port
         WHERE c.id IN (
             SELECT DISTINCT connection_id FROM packet_events
             WHERE race_id = ? AND event_type_id = 1
         )
-    ''', (race_id, race_id))
+    ''', (race_id,))
 
     meta = {}
     for r in cursor.fetchall():
@@ -189,15 +187,7 @@ def fetch_connection_meta(conn, race_id):
 
 
 def fetch_peer_count(conn, race_id):
-    """Peer count: prefers race_peers (API-polled) for accuracy, falls back
-    to eBPF connection count."""
-    cursor = conn.execute('''
-        SELECT COUNT(*) as cnt FROM race_peers WHERE race_id = ?
-    ''', (race_id,))
-    api_count = cursor.fetchone()['cnt']
-    if api_count > 0:
-        return api_count
-
+    """Peer count from distinct eBPF connections with incoming_have events."""
     cursor = conn.execute('''
         SELECT COUNT(DISTINCT connection_id) as peer_count
         FROM packet_events
@@ -206,17 +196,6 @@ def fetch_peer_count(conn, race_id):
     return cursor.fetchone()['peer_count']
 
 
-def fetch_race_peers(conn, race_id):
-    """All API-polled peers for a race (from race_peers table).
-
-    Returns list of dicts with: ip, port, client, peer_id, country,
-    progress, dl_speed, up_speed.
-    """
-    cursor = conn.execute('''
-        SELECT ip, port, client, peer_id, country,
-               progress, dl_speed, up_speed
-        FROM race_peers
-        WHERE race_id = ?
-        ORDER BY progress DESC, ip, port
-    ''', (race_id,))
-    return [dict(row) for row in cursor.fetchall()]
+def ktime_to_elapsed_sec(ts_ns, epoch_ns):
+    """Convert BPF ktime nanoseconds to elapsed seconds relative to epoch."""
+    return (ts_ns - epoch_ns) / _NS_PER_SEC
