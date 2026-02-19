@@ -39,7 +39,7 @@ func setupTrackerTest(t *testing.T, hash string) (*storage.Store, int64, func())
 		t.Fatalf("failed to create torrent: %v", err)
 	}
 
-	raceID, err := store.CreateRace(ctx, torID)
+	raceID, err := store.CreateRace(ctx, torID, 0)
 	if err != nil {
 		store.Close()
 		t.Fatalf("failed to create race: %v", err)
@@ -345,7 +345,7 @@ func TestFinalize(t *testing.T) {
 
 	ctx := context.Background()
 	torID, _ := store.CreateTorrent(ctx, "finalize_test", "Finalize.Test", 500, 50)
-	raceID, _ := store.CreateRace(ctx, torID)
+	raceID, _ := store.CreateRace(ctx, torID, 0)
 
 	logger := trackerTestLogger()
 

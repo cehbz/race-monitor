@@ -10,10 +10,10 @@ type Event struct {
 	ObjPtr     uint64
 }
 
-// CalibrationEvent mirrors the eBPF calibration_event_t struct layout.
-// Emitted once per new peer_connection* to enable auto-discovery of the
-// sockaddr_in offset within the peer_connection struct.
-type CalibrationEvent struct {
+// DumpEvent mirrors the eBPF struct_dump_t layout.
+// Carries a raw memory dump from a libtorrent object (peer_connection or torrent).
+// Emitted once per unique pointer for peer/torrent identification in userspace.
+type DumpEvent struct {
 	EventType uint32
 	Pad       uint32 // alignment padding
 	Timestamp uint64
@@ -23,10 +23,10 @@ type CalibrationEvent struct {
 
 // Event type constants matching the eBPF #defines.
 const (
-	EventWeHave             uint32 = 1
-	EventIncomingHave       uint32 = 2
-	EventCalibration        uint32 = 3 // peer_connection struct dump
-	EventTorrentCalibration uint32 = 4 // torrent struct dump (from we_have fallback)
-	EventTorrentStarted     uint32 = 5 // torrent started (torrent struct dump from torrent::start)
-	EventTorrentFinished    uint32 = 6 // torrent download completed (from torrent::finished)
+	EventWeHave         uint32 = 1
+	EventIncomingHave   uint32 = 2
+	EventPeerDump       uint32 = 3 // peer_connection struct dump
+	EventTorrentDump    uint32 = 4 // torrent struct dump (from we_have first encounter)
+	EventTorrentStarted uint32 = 5 // torrent started (torrent struct dump from torrent::start)
+	EventTorrentFinished uint32 = 6 // torrent download completed (from torrent::finished)
 )

@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 // Store handles SQLite storage operations.
 type Store struct {
@@ -134,6 +134,7 @@ func (s *Store) createSchema() error {
 		started_at       TIMESTAMP NOT NULL,
 		completed_at     TIMESTAMP,
 		start_wallclock  TEXT,
+		start_ktime      INTEGER,
 		UNIQUE(torrent_id, started_at)
 	);
 
@@ -227,10 +228,20 @@ func (s *Store) CreateTorrent(ctx context.Context, infoHash, name string, size i
 // --- Race operations ---
 
 // CreateRace creates a new race record and returns its ID.
-func (s *Store) CreateRace(ctx context.Context, torrentID int64) (int64, error) {
-	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO races (torrent_id, started_at) VALUES (?, ?)`,
-		torrentID, formatTS(time.Now()))
+// startKtime is the BPF ktime_get_ns timestamp from the torrent::start() event.
+// Pass 0 if no ktime is available (e.g. fallback race creation).
+func (s *Store) CreateRace(ctx context.Context, torrentID int64, startKtime int64) (int64, error) {
+	var result sql.Result
+	var err error
+	if startKtime > 0 {
+		result, err = s.db.ExecContext(ctx,
+			`INSERT INTO races (torrent_id, started_at, start_ktime) VALUES (?, ?, ?)`,
+			torrentID, formatTS(time.Now()), startKtime)
+	} else {
+		result, err = s.db.ExecContext(ctx,
+			`INSERT INTO races (torrent_id, started_at) VALUES (?, ?)`,
+			torrentID, formatTS(time.Now()))
+	}
 	if err != nil {
 		return 0, fmt.Errorf("inserting race: %w", err)
 	}
@@ -266,12 +277,12 @@ func (s *Store) GetRace(ctx context.Context, id int64) (*Race, error) {
 	var r Race
 	err := s.db.QueryRowContext(ctx,
 		`SELECT r.id, r.torrent_id, t.info_hash, t.name, t.size, t.piece_count,
-		        r.started_at, r.completed_at
+		        r.started_at, r.completed_at, r.start_ktime
 		FROM races r
 		JOIN torrents t ON r.torrent_id = t.id
 		WHERE r.id = ?`, id).Scan(
 		&r.ID, &r.TorrentID, &r.InfoHash, &r.Name, &r.Size, &r.PieceCount,
-		&r.StartedAt, &r.CompletedAt)
+		&r.StartedAt, &r.CompletedAt, &r.StartKtime)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRaceNotFound
 	}
@@ -286,7 +297,7 @@ func (s *Store) ListRecentRaces(ctx context.Context, days int) ([]Race, error) {
 	since := formatTS(time.Now().AddDate(0, 0, -days))
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT r.id, r.torrent_id, t.info_hash, t.name, t.size, t.piece_count,
-		        r.started_at, r.completed_at
+		        r.started_at, r.completed_at, r.start_ktime
 		FROM races r
 		JOIN torrents t ON r.torrent_id = t.id
 		WHERE r.started_at > ?
@@ -300,7 +311,7 @@ func (s *Store) ListRecentRaces(ctx context.Context, days int) ([]Race, error) {
 	for rows.Next() {
 		var r Race
 		if err := rows.Scan(&r.ID, &r.TorrentID, &r.InfoHash, &r.Name, &r.Size, &r.PieceCount,
-			&r.StartedAt, &r.CompletedAt); err != nil {
+			&r.StartedAt, &r.CompletedAt, &r.StartKtime); err != nil {
 			return nil, err
 		}
 		races = append(races, r)

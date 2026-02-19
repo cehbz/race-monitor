@@ -137,9 +137,12 @@
             font-size: 11px;
             font-weight: 600;
         }
+        .badge.self { background: rgba(88, 166, 255, 0.2); color: #58a6ff; }
         .badge.seeder { background: rgba(63, 185, 80, 0.2); color: #3fb950; }
+        .badge.leecher { background: rgba(121, 192, 255, 0.2); color: #79c0ff; }
         .badge.competitive { background: rgba(248, 81, 73, 0.2); color: #f85149; }
         .beat-us { color: #3fb950; font-weight: 600; font-size: 12px; }
+        .self-row td { background: rgba(88, 166, 255, 0.05); }
         .seeder-row td { opacity: 0.7; }
     </style>
 </head>
@@ -304,8 +307,11 @@
                     </div>
 
                     <div class="chart-container">
-                        <div class="chart-title">Faster Peers Analysis</div>
-                        <div id="faster-peers-section"><div class="loading">Analyzing peer performance...</div></div>
+                        <div class="chart-title">
+                            Race Participants
+                            <span class="chart-info">All peers ordered by finish time</span>
+                        </div>
+                        <div id="peers-table-section"><div class="loading">Loading peer data...</div></div>
                     </div>
 
                 `;
@@ -313,16 +319,16 @@
                 displayRaceStats(raceData);
                 renderTimelineCharts(raceData);
 
-                const [progressResp, fasterResp] = await Promise.all([
+                const [progressResp, peersResp] = await Promise.all([
                     fetch(`/api/race/${raceId}/peer_progress`),
-                    fetch(`/api/race/${raceId}/faster_peers`)
+                    fetch(`/api/race/${raceId}/peers`)
                 ]);
 
                 const progressData = await progressResp.json();
-                const fasterData = await fasterResp.json();
+                const peersData = await peersResp.json();
 
                 renderPeerProgressChart(progressData, raceData.race.piece_count);
-                renderFasterPeers(fasterData);
+                renderPeersTable(peersData);
 
             } catch (error) {
                 viz.innerHTML = `<div class="error">Error loading race data: ${error.message}</div>`;
@@ -384,6 +390,23 @@
                 return;
             }
 
+            // Check if any peers have actual per-piece tracking data
+            const peersWithData = data.peers.filter(p => p.elapsed_secs && p.elapsed_secs.length > 0);
+            const seedersOnly = peersWithData.length === 0 && data.peers.length > 0;
+
+            if (seedersOnly && data.self) {
+                // Pure download: only self curve, all peers are seeders
+                container.innerHTML = `
+                    <div style="color: #8b949e; font-size: 13px; margin-bottom: 12px;">
+                        All ${data.peers.length} peers are seeders (used BITFIELD/HAVE-ALL at connect time).
+                        Per-piece tracking requires leecher peers that send individual HAVE messages.
+                    </div>
+                    <div id="peer-progress-chart-plot"></div>
+                `;
+            }
+
+            const plotTarget = seedersOnly ? 'peer-progress-chart-plot' : 'peer-progress-chart';
+
             const traces = [];
             if (data.self) {
                 traces.push({
@@ -394,7 +417,8 @@
                 });
             }
 
-            data.peers.forEach((peer, idx) => {
+            // Only add peers that have actual data to the chart
+            peersWithData.forEach((peer, idx) => {
                 const color = peerColors[idx % peerColors.length];
                 traces.push({
                     x: peer.elapsed_secs, y: peer.completion_pcts,
@@ -405,8 +429,8 @@
                 });
             });
 
-            container.innerHTML = '';
-            Plotly.newPlot('peer-progress-chart', traces, {
+            if (!seedersOnly) container.innerHTML = '';
+            Plotly.newPlot(plotTarget, traces, {
                 ...commonLayout,
                 yaxis: { ...commonLayout.yaxis, title: 'Completion %', range: [0, 105] },
                 xaxis: { ...commonLayout.xaxis, title: 'Elapsed Time (seconds)' },
@@ -419,94 +443,103 @@
             }, plotlyConfig);
         }
 
-        // --- Faster peers ---
+        // --- Unified peers table ---
 
-        function renderFasterPeers(data) {
-            const container = document.getElementById('faster-peers-section');
+        function renderPeersTable(data) {
+            const container = document.getElementById('peers-table-section');
+            const participants = data.participants || [];
 
-            if (data.stats.note) {
-                container.innerHTML = `<div class="loading">${data.stats.note}</div>`;
+            if (participants.length === 0) {
+                container.innerHTML = '<div class="loading">No participants found for this race.</div>';
                 return;
             }
+
+            const seeders = participants.filter(p => p.type === 'seeder').length;
+            const leechers = participants.filter(p => p.type === 'leecher').length;
+            const beatUs = participants.filter(p => p.beat_us && p.type !== 'self').length;
 
             let html = `
                 <div class="analysis-stats">
                     <div class="stat-mini">
-                        <div class="stat-label">Total Peers</div>
-                        <div class="stat-value">${data.stats.total_peers}</div>
-                    </div>
-                    <div class="stat-mini">
-                        <div class="stat-label">Faster Than Us</div>
-                        <div class="stat-value">${data.stats.peers_faster_than_us}</div>
+                        <div class="stat-label">Participants</div>
+                        <div class="stat-value">${participants.length}</div>
                     </div>
                     <div class="stat-mini">
                         <div class="stat-label">Seeders</div>
-                        <div class="stat-value" style="color: #3fb950">${data.stats.seeders_detected}</div>
+                        <div class="stat-value" style="color: #3fb950">${seeders}</div>
                     </div>
                     <div class="stat-mini">
-                        <div class="stat-label">Competitive</div>
-                        <div class="stat-value" style="color: #f85149">${data.stats.competitive_peers}</div>
+                        <div class="stat-label">Leechers</div>
+                        <div class="stat-value" style="color: #79c0ff">${leechers}</div>
                     </div>
                     <div class="stat-mini">
-                        <div class="stat-label">Finished Before Us</div>
-                        <div class="stat-value" style="color: #d29922">${data.stats.finished_before_us_count}</div>
+                        <div class="stat-label">Beat Us</div>
+                        <div class="stat-value" style="color: #d29922">${beatUs}</div>
+                    </div>
+                    <div class="stat-mini">
+                        <div class="stat-label">Our Finish</div>
+                        <div class="stat-value">${data.our_finish_sec != null ? formatDuration(data.our_finish_sec) : '\u2014'}</div>
                     </div>
                 </div>
             `;
 
-            if (data.faster_peers.length === 0) {
-                html += '<div class="loading">No peers had a sustained completion lead over us.</div>';
-            } else {
-                html += `
-                    <table class="peer-table">
-                        <thead>
-                            <tr>
-                                <th>Peer</th>
-                                <th>Port</th>
-                                <th>Client</th>
-                                <th>Type</th>
-                                <th class="num">Ahead (s)</th>
-                                <th class="num">Avg Lead %</th>
-                                <th class="num">Peak Lead %</th>
-                                <th class="num">Pieces</th>
-                                <th class="num">Proj. Finish</th>
-                                <th>vs Us</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                `;
-
-                data.faster_peers.forEach(peer => {
-                    const rowClass = peer.category === 'seeder' ? 'seeder-row' : '';
-                    const peerLabel = peer.ip
-                        ? peer.ip
-                        : `<code title="${peer.conn_ptr}">${shortHex(peer.conn_ptr)}</code>`;
-                    const projFinish = peer.projected_finish_sec != null
-                        ? formatDuration(peer.projected_finish_sec)
-                        : '\u2014';
-                    const vsUs = peer.finished_before_us
-                        ? '<span class="beat-us">\u2713 beat us</span>'
-                        : '\u2014';
-
-                    html += `
-                        <tr class="${rowClass}">
-                            <td>${peerLabel}</td>
-                            <td class="num">${peer.port || '\u2014'}</td>
-                            <td>${peer.client || '\u2014'}</td>
-                            <td><span class="badge ${peer.category}">${peer.category === 'seeder' ? 'Seeder' : 'Competitive'}</span></td>
-                            <td class="num">${peer.ahead_secs}</td>
-                            <td class="num">${peer.avg_lead_pct.toFixed(1)}%</td>
-                            <td class="num">${peer.max_lead_pct.toFixed(1)}%</td>
-                            <td class="num">${peer.total_pieces}</td>
-                            <td class="num">${projFinish}</td>
-                            <td>${vsUs}</td>
+            html += `
+                <table class="peer-table">
+                    <thead>
+                        <tr>
+                            <th class="num">#</th>
+                            <th>IP</th>
+                            <th class="num">Port</th>
+                            <th>Client</th>
+                            <th>Type</th>
+                            <th class="num">Pieces</th>
+                            <th class="num">Finish Time</th>
+                            <th>vs Us</th>
                         </tr>
-                    `;
-                });
+                    </thead>
+                    <tbody>
+            `;
 
-                html += '</tbody></table>';
-            }
+            participants.forEach((p, idx) => {
+                const isSelf = p.type === 'self';
+                const isSeeder = p.type === 'seeder';
+                const rowClass = isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : '');
+                const ip = isSelf ? '(self)' : (p.ip || '\u2014');
+                const port = isSelf ? '\u2014' : (p.port || '\u2014');
+                const client = isSelf ? '\u2014' : (p.client || '\u2014');
 
+                let typeBadge;
+                if (isSelf) typeBadge = '<span class="badge self">Self</span>';
+                else if (isSeeder) typeBadge = '<span class="badge seeder">Seeder</span>';
+                else typeBadge = '<span class="badge leecher">Leecher</span>';
+
+                let finishStr;
+                if (p.finish_sec === 0 && isSeeder) finishStr = '\u2014';
+                else if (p.finish_sec != null) finishStr = formatDuration(p.finish_sec);
+                else finishStr = '\u2014';
+
+                let vsUs = '\u2014';
+                if (isSelf) vsUs = '';
+                else if (isSeeder) vsUs = '';
+                else if (p.beat_us) vsUs = '<span class="beat-us">\u2713 faster</span>';
+                else if (p.finish_sec != null && data.our_finish_sec != null)
+                    vsUs = '<span style="color: #8b949e">slower</span>';
+
+                html += `
+                    <tr class="${rowClass}">
+                        <td class="num">${idx + 1}</td>
+                        <td><code>${ip}</code></td>
+                        <td class="num">${port}</td>
+                        <td>${client}</td>
+                        <td>${typeBadge}</td>
+                        <td class="num">${p.pieces}</td>
+                        <td class="num">${finishStr}</td>
+                        <td>${vsUs}</td>
+                    </tr>
+                `;
+            });
+
+            html += '</tbody></table>';
             container.innerHTML = html;
         }
 

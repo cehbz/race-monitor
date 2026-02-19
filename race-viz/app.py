@@ -146,7 +146,9 @@ def get_peer_progress(race_id):
     conn_meta = db.fetch_connection_meta(conn, race_id)
     conn.close()
 
-    # Find global epoch (earliest BPF timestamp across all events)
+    # Use start_ktime (from torrent::start()) as epoch when available,
+    # falling back to earliest event timestamp. start_ktime captures the
+    # latency between torrent start and first piece verification.
     all_ts = []
     for r in self_pieces:
         ts = r['first_ts']
@@ -158,9 +160,27 @@ def get_peer_progress(race_id):
             all_ts.append(ts)
 
     if not all_ts:
-        return jsonify({'piece_count': piece_count, 'self': None, 'peers': []})
+        # No events at all, but still report discovered peers
+        peers_data = []
+        for conn_id, meta in conn_meta.items():
+            peers_data.append({
+                'id': conn_id,
+                'label': meta['label'],
+                'ip': meta['ip'],
+                'port': meta['port'],
+                'client': meta['client'],
+                'total_pieces': 0,
+                'elapsed_secs': [],
+                'completion_pcts': [],
+                'seeder': True,
+            })
+        return jsonify({
+            'piece_count': piece_count,
+            'self': None,
+            'peers': peers_data,
+        })
 
-    epoch_ns = min(all_ts)
+    epoch_ns = race.get('start_ktime') or min(all_ts)
 
     # Build self timeline (elapsed seconds from epoch)
     self_times = []
@@ -183,6 +203,7 @@ def get_peer_progress(race_id):
             peer_groups[r['connection_id']].append((ts - epoch_ns) / _NS_PER_SEC)
 
     peers_data = []
+    # Peers with per-piece HAVE data (leechers in a race)
     for conn_id, times in peer_groups.items():
         elapsed, pcts = build_cumulative_curve(times, piece_count)
         if not elapsed:
@@ -199,13 +220,31 @@ def get_peer_progress(race_id):
             'total_pieces': len(times),
             'elapsed_secs': elapsed,
             'completion_pcts': pcts,
+            'seeder': False,
         })
 
-    peers_data.sort(key=lambda p: p['total_pieces'], reverse=True)
+    # Peers discovered via calibration but without HAVE data (seeders)
+    tracked_ids = {p['id'] for p in peers_data}
+    for conn_id, meta in conn_meta.items():
+        if conn_id in tracked_ids:
+            continue
+        peers_data.append({
+            'id': conn_id,
+            'label': meta['label'],
+            'ip': meta['ip'],
+            'port': meta['port'],
+            'client': meta['client'],
+            'total_pieces': 0,
+            'elapsed_secs': [],
+            'completion_pcts': [],
+            'seeder': True,
+        })
+
+    peers_data.sort(key=lambda p: (-p['total_pieces'], p['label']))
 
     race_duration = max(
         self_elapsed[-1] if self_elapsed else 0,
-        max((p['elapsed_secs'][-1] for p in peers_data), default=0),
+        max((p['elapsed_secs'][-1] for p in peers_data if p['elapsed_secs']), default=0),
     )
 
     return jsonify({
@@ -216,16 +255,12 @@ def get_peer_progress(race_id):
     })
 
 
-@app.route('/api/race/<int:race_id>/faster_peers')
-def get_faster_peers(race_id):
-    """Identify peers whose cumulative completion curve is above ours.
+@app.route('/api/race/<int:race_id>/peers')
+def get_peers(race_id):
+    """Unified peer table: all race participants ordered by finish time.
 
-    Compares cumulative piece counts at each second. A peer is 'faster' only
-    if their curve leads ours for a sustained period — not merely because they
-    downloaded pieces in a different order.
-
-    Also projects each peer's finish time via linear extrapolation and reports
-    whether they finished before us.
+    Returns every peer (including self) with finish time or projection.
+    Seeders (no individual HAVE data) get finish_sec=0, sorted first.
     """
     conn = db.get_db(DB_PATH)
     race = db.fetch_race_detail(conn, race_id)
@@ -237,134 +272,122 @@ def get_faster_peers(race_id):
     self_pieces = db.fetch_self_pieces(conn, race_id)
     peer_pieces = db.fetch_peer_pieces(conn, race_id)
     conn_meta = db.fetch_connection_meta(conn, race_id)
-    total_peers = db.fetch_peer_count(conn, race_id)
     conn.close()
 
-    if not self_pieces:
-        return jsonify({
-            'faster_peers': [],
-            'stats': {
-                'total_peers': 0,
-                'peers_faster_than_us': 0,
-                'seeders_detected': 0,
-                'competitive_peers': 0,
-                'finished_before_us_count': 0,
-                'note': 'No we_have events found — download may not have started.',
-            },
-        })
-
-    # Parse our piece times as elapsed seconds from earliest event
-    our_ts = []
+    # Compute race epoch
+    all_ts = []
     for r in self_pieces:
-        ts = r['first_ts']
-        if ts is not None:
-            our_ts.append(ts)
+        if r['first_ts'] is not None:
+            all_ts.append(r['first_ts'])
+    for r in peer_pieces:
+        if r['first_ts'] is not None:
+            all_ts.append(r['first_ts'])
 
-    if not our_ts:
-        return jsonify({
-            'faster_peers': [],
-            'stats': {
-                'total_peers': total_peers,
-                'peers_faster_than_us': 0,
-                'seeders_detected': 0,
-                'competitive_peers': 0,
-                'finished_before_us_count': 0,
-            },
-        })
+    epoch_ns = race.get('start_ktime') or (min(all_ts) if all_ts else 0)
 
-    race_start_ns = min(our_ts)
-    our_elapsed = sorted((ts - race_start_ns) / _NS_PER_SEC for ts in our_ts)
-    race_duration = int(our_elapsed[-1]) + 1 if our_elapsed else 1
+    # --- Self entry ---
+    our_finish_sec = None
+    if all_ts and epoch_ns:
+        our_ts = [r['first_ts'] for r in self_pieces if r['first_ts'] is not None]
+        our_elapsed = sorted((ts - epoch_ns) / _NS_PER_SEC for ts in our_ts)
 
-    # Our finish time: use completed_at if available, else last observed event
-    completed_at = parse_rfc3339(race.get('completed_at'))
-    if completed_at and race.get('start_wallclock'):
-        # completed_at and start_wallclock are both wallclock RFC 3339;
-        # compute finish relative to race start
-        start_wc = parse_rfc3339(race['start_wallclock'])
-        if start_wc and completed_at:
-            our_finish_sec = (completed_at - start_wc).total_seconds()
-        else:
-            our_finish_sec = our_elapsed[-1]
-    else:
-        our_finish_sec = our_elapsed[-1]
+        # Prefer wallclock finish if available
+        completed_at = parse_rfc3339(race.get('completed_at'))
+        start_wc = parse_rfc3339(race.get('start_wallclock'))
+        if completed_at and start_wc:
+            our_finish_sec = round((completed_at - start_wc).total_seconds(), 1)
+        elif our_elapsed:
+            our_finish_sec = round(our_elapsed[-1], 1)
 
-    our_curve = build_piece_count_curve(our_elapsed, race_duration)
-
-    # Group peer pieces by connection_id
+    # --- Group peer pieces by connection_id ---
     peer_groups = defaultdict(list)
     for r in peer_pieces:
-        ts = r['first_ts']
-        if ts is not None:
+        if r['first_ts'] is not None:
             peer_groups[r['connection_id']].append(
-                (ts - race_start_ns) / _NS_PER_SEC
+                (r['first_ts'] - epoch_ns) / _NS_PER_SEC
             )
 
-    # Compare each peer
-    faster_peers = []
-    seeders = 0
-    competitive_count = 0
-    finished_before_us_count = 0
+    participants = []
 
+    # Self
+    self_pieces_count = len([r for r in self_pieces if r['first_ts'] is not None])
+    participants.append({
+        'ip': '',
+        'port': 0,
+        'client': '',
+        'peer_id': '',
+        'type': 'self',
+        'pieces': self_pieces_count,
+        'finish_sec': our_finish_sec,
+        'beat_us': False,
+    })
+
+    # Peers with HAVE data (leechers)
+    tracked_ids = set()
     for conn_id, times in peer_groups.items():
+        tracked_ids.add(conn_id)
         times.sort()
-        total = len(times)
         meta = conn_meta.get(conn_id, {
-            'conn_ptr': '', 'ip': '', 'port': 0, 'client': '', 'peer_id': '',
+            'ip': '', 'port': 0, 'client': '', 'peer_id': '',
         })
 
+        # Classify: if they had >= 80% pieces before our first we_have, seeder
         pre_race = sum(1 for t in times if t < 0)
-        peer_curve = build_piece_count_curve(times, race_duration)
+        is_seeder = pre_race >= piece_count * 0.8
 
-        result = classify_peer(peer_curve, our_curve, piece_count, race_duration, pre_race)
-        if result is None:
-            continue
-
-        # Build cumulative curve for extrapolation
-        peer_elapsed, peer_pcts = build_cumulative_curve(times, piece_count)
-        proj_finish = extrapolate_finish_time(peer_elapsed, peer_pcts, piece_count)
-        finished_before_us = proj_finish is not None and proj_finish < our_finish_sec
-
-        if finished_before_us:
-            finished_before_us_count += 1
-
-        if result['category'] == 'seeder':
-            seeders += 1
+        if is_seeder:
+            finish_sec = 0.0
         else:
-            competitive_count += 1
+            # Project finish via extrapolation
+            peer_elapsed, peer_pcts = build_cumulative_curve(times, piece_count)
+            finish_sec = extrapolate_finish_time(peer_elapsed, peer_pcts, piece_count)
 
-        faster_peers.append({
-            'connection_id': conn_id,
-            'conn_ptr': meta['conn_ptr'],
-            'ip': meta['ip'],
-            'port': meta['port'],
-            'client': meta['client'],
-            'peer_id': meta['peer_id'],
-            'total_pieces': total,
-            'ahead_secs': result['ahead_secs'],
-            'avg_lead_pct': result['avg_lead_pct'],
-            'max_lead_pct': result['max_lead_pct'],
-            'category': result['category'],
-            'projected_finish_sec': proj_finish,
-            'finished_before_us': finished_before_us,
+        beat_us = False
+        if finish_sec is not None and our_finish_sec is not None:
+            beat_us = finish_sec < our_finish_sec
+
+        participants.append({
+            'ip': meta.get('ip', ''),
+            'port': meta.get('port', 0),
+            'client': meta.get('client', ''),
+            'peer_id': meta.get('peer_id', ''),
+            'type': 'seeder' if is_seeder else 'leecher',
+            'pieces': len(times),
+            'finish_sec': round(finish_sec, 1) if finish_sec is not None else None,
+            'beat_us': beat_us,
         })
 
-    faster_peers.sort(key=lambda p: (
-        0 if p['category'] == 'competitive' else 1,
-        -p['avg_lead_pct'],
-    ))
+    # Peers without HAVE data (seeders discovered via struct dumps only)
+    for conn_id, meta in conn_meta.items():
+        if conn_id in tracked_ids:
+            continue
+        participants.append({
+            'ip': meta.get('ip', ''),
+            'port': meta.get('port', 0),
+            'client': meta.get('client', ''),
+            'peer_id': meta.get('peer_id', ''),
+            'type': 'seeder',
+            'pieces': 0,
+            'finish_sec': 0.0,
+            'beat_us': True,
+        })
+
+    # Sort: self first, then seeders (finish=0), then by finish_sec asc, unknown last
+    def sort_key(p):
+        if p['type'] == 'self':
+            return (0, 0)
+        if p['finish_sec'] is not None and p['finish_sec'] == 0:
+            return (1, -p['pieces'])  # seeders: more pieces first
+        if p['finish_sec'] is not None:
+            return (2, p['finish_sec'])
+        return (3, 0)  # unknown finish
+
+    participants.sort(key=sort_key)
 
     return jsonify({
-        'faster_peers': faster_peers,
-        'stats': {
-            'total_peers': total_peers,
-            'peers_faster_than_us': len(faster_peers),
-            'seeders_detected': seeders,
-            'competitive_peers': competitive_count,
-            'finished_before_us_count': finished_before_us_count,
-            'race_duration_secs': race_duration,
-            'our_finish_sec': round(our_finish_sec, 1),
-        },
+        'piece_count': piece_count,
+        'our_finish_sec': our_finish_sec,
+        'participants': participants,
     })
 
 

@@ -40,6 +40,17 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+// testOffsets returns CalibratedOffsets with the given info_hash offset and
+// dummy values for the other offsets (valid but unlikely to collide).
+func testOffsets(infoHashOffset int) CalibratedOffsets {
+	return CalibratedOffsets{
+		SockaddrOffset:   200,
+		PeerIDOffset:     300,
+		InfoHashOffset:   infoHashOffset,
+		TorrentPtrOffset: 400,
+	}
+}
+
 // waitForState polls QueryState until predicate is satisfied or timeout.
 func waitForState(t *testing.T, c *Coordinator, predicate func(StateSnapshot) bool, timeout time.Duration) StateSnapshot {
 	t.Helper()
@@ -56,17 +67,17 @@ func waitForState(t *testing.T, c *Coordinator, predicate func(StateSnapshot) bo
 	}
 }
 
-// makeTorrentStartEvent creates a CalibrationEvent for EVT_TORRENT_STARTED with
+// makeTorrentStartEvent creates a DumpEvent for EVT_TORRENT_STARTED with
 // the info_hash embedded at the given offset in the Data array.
-func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int) bpf.CalibrationEvent {
+func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int) bpf.DumpEvent {
 	if len(infoHashBytes) != 20 {
 		panic("infoHashBytes must be exactly 20 bytes")
 	}
-	if infoHashOffset+20 > calibrationDataSize {
-		panic("infoHashOffset too large for calibration data")
+	if infoHashOffset+20 > dumpDataSize {
+		panic("infoHashOffset too large for dump data")
 	}
 
-	event := bpf.CalibrationEvent{
+	event := bpf.DumpEvent{
 		EventType: bpf.EventTorrentStarted,
 		ObjPtr:    ptr,
 		Timestamp: uint64(time.Now().UnixNano()),
@@ -84,8 +95,9 @@ func TestNewCoordinator(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
+	offsets := testOffsets(64)
 
-	c := NewCoordinator(store, logger, "http://localhost:3000", "", "", nil)
+	c := NewCoordinator(store, logger, "http://localhost:3000", offsets, nil)
 
 	if c == nil {
 		t.Fatal("expected non-nil coordinator")
@@ -98,6 +110,9 @@ func TestNewCoordinator(t *testing.T) {
 	}
 	if c.dashboardURL != "http://localhost:3000" {
 		t.Error("dashboardURL not set correctly")
+	}
+	if c.offsets != offsets {
+		t.Error("offsets not set correctly")
 	}
 	if len(c.infoHashToRaceState) != 0 {
 		t.Error("infoHashToRaceState should be empty initially")
@@ -116,22 +131,19 @@ func TestTorrentStartCreatesRace(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a test info_hash
@@ -140,7 +152,7 @@ func TestTorrentStartCreatesRace(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
 	// Send EVT_TORRENT_STARTED
-	calibrationsChan <- makeTorrentStartEvent(0x1000, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x1000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -161,22 +173,19 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create test info_hash
@@ -186,7 +195,7 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	torrentPtr := uint64(0x2000)
 
 	// Send EVT_TORRENT_STARTED
-	calibrationsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -213,30 +222,26 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	<-errChan
 }
 
-// TestWeHaveRoutesKnownTorrentPtr tests that we_have events with the known
-// torrent_ptr (registered by startRace) are routed correctly, and events
-// with unknown pointers are dropped.
+// TestWeHaveRoutesAndDrops tests that we_have events with the known
+// torrent_ptr are routed correctly, and events with unknown pointers are dropped.
 func TestWeHaveRoutesAndDrops(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a single race via EVT_TORRENT_STARTED with torrent_ptr=0x3000
@@ -244,7 +249,7 @@ func TestWeHaveRoutesAndDrops(t *testing.T) {
 		0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0x3000, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x3000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -287,22 +292,19 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create two races via EVT_TORRENT_STARTED
@@ -314,8 +316,8 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 		0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94}
 	hash2Hex := hex.EncodeToString(hash2Bytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0x4000, hash1Bytes, infoHashOffset)
-	calibrationsChan <- makeTorrentStartEvent(0x4001, hash2Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x4000, hash1Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x4001, hash2Bytes, infoHashOffset)
 
 	preCloseSnap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
@@ -336,8 +338,6 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 		PieceIndex: 10,
 	}
 
-	// Close only eventsChan so coordinator processes the event before exiting.
-	// Closing calibrationsChan would make it always-ready and compete with events in select.
 	close(eventsChan)
 	<-errChan
 
@@ -355,22 +355,19 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create two races
@@ -380,15 +377,14 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 	hash2Bytes := []byte{0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8,
 		0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4}
 
-	calibrationsChan <- makeTorrentStartEvent(0x5000, hash1Bytes, infoHashOffset)
-	calibrationsChan <- makeTorrentStartEvent(0x5001, hash2Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x5000, hash1Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x5001, hash2Bytes, infoHashOffset)
 
 	preCloseSnap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
 	}, 2*time.Second)
 
-	// Send we_have with unknown ptr to multiple races
-	// This should be dropped (ambiguous)
+	// Send we_have with unknown ptr — should be dropped
 	eventsChan <- bpf.Event{
 		EventType:  bpf.EventWeHave,
 		ObjPtr:     0xcccc,
@@ -398,10 +394,10 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 	close(eventsChan)
 	<-errChan
 
-	// Neither race should have events (both have unknown ptr -> ambiguous)
+	// Neither race should have events
 	for _, race := range preCloseSnap.ActiveRaces {
 		if countPieceReceivedEvents(store, ctx, race.RaceID) > 0 {
-			t.Error("expected we_have to be dropped due to ambiguity")
+			t.Error("expected we_have to be dropped due to unknown ptr")
 		}
 	}
 }
@@ -412,22 +408,19 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create two races
@@ -439,8 +432,8 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 		0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25}
 	hash2Hex := hex.EncodeToString(hash2Bytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0x6000, hash1Bytes, infoHashOffset)
-	calibrationsChan <- makeTorrentStartEvent(0x6001, hash2Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x6000, hash1Bytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x6001, hash2Bytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
@@ -470,28 +463,25 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 }
 
 // TestIncomingHaveDropsUnmapped tests that incoming_have events for unmapped
-// peer_connection pointers are dropped, regardless of how many races are active.
+// peer_connection pointers are dropped.
 func TestIncomingHaveDropsUnmapped(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a single race
@@ -499,7 +489,7 @@ func TestIncomingHaveDropsUnmapped(t *testing.T) {
 		0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45}
 	hashHex := hex.EncodeToString(hashBytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0x7000, hashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0x7000, hashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 1
@@ -507,7 +497,6 @@ func TestIncomingHaveDropsUnmapped(t *testing.T) {
 	raceID := snap.ActiveRaces[hashHex].RaceID
 
 	// Send incoming_have with an unmapped peer_connection ptr — should be dropped
-	// even though only one race is active.
 	eventsChan <- bpf.Event{
 		EventType:  bpf.EventIncomingHave,
 		ObjPtr:     0x7777,
@@ -529,22 +518,19 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a race
@@ -553,7 +539,7 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 	torrentPtr := uint64(0x8000)
 
-	calibrationsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -586,18 +572,18 @@ func TestPidDeathExitsRun(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Send a pidDeath error
@@ -620,23 +606,22 @@ func TestContextCancelExitsRun(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Give Run a moment to start
 	time.Sleep(50 * time.Millisecond)
 
-	// Cancel context
 	cancel()
 
 	select {
@@ -655,7 +640,7 @@ func TestRouteEventChannelFull(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
 
 	state := &raceState{
 		eventChan:  make(chan bpf.Event, 1),
@@ -684,39 +669,39 @@ func TestMapTorrentPtr(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
 
 	c.mapTorrentPtr(0x1234, "testhash")
 
 	if hash, ok := c.torrentPtrs[0x1234]; !ok || hash != "testhash" {
 		t.Error("expected torrent_ptr mapping to be recorded")
 	}
+	if !c.knownTorrentPtrs[0x1234] {
+		t.Error("expected knownTorrentPtrs to be set")
+	}
 }
 
-// --- Integration tests (Run in goroutine, calibration events) ---
+// --- Integration tests (Run in goroutine) ---
 
-// TestLifecycleStartAndComplete tests complete lifecycle with EVT_TORRENT_STARTED and EVT_TORRENT_FINISHED
+// TestLifecycleStartAndComplete tests complete lifecycle with start and finish
 func TestLifecycleStartAndComplete(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Start a race
@@ -725,7 +710,7 @@ func TestLifecycleStartAndComplete(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 	torrentPtr := uint64(0x9000)
 
-	calibrationsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -757,29 +742,25 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Start multiple races
 	hashes := make([]string, 3)
 	ptrs := []uint64{0xa000, 0xa001, 0xa002}
 	for i := 0; i < 3; i++ {
-		// Create unique info_hash for each
 		infoHashBytes := []byte{
 			byte(0xb0 + i), byte(0xb1 + i), byte(0xb2 + i), byte(0xb3 + i), byte(0xb4 + i),
 			byte(0xb5 + i), byte(0xb6 + i), byte(0xb7 + i), byte(0xb8 + i), byte(0xb9 + i),
@@ -787,7 +768,7 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 			byte(0xbf + i), byte(0xc0 + i), byte(0xc1 + i), byte(0xc2 + i), byte(0xc3 + i),
 		}
 		hashes[i] = hex.EncodeToString(infoHashBytes)
-		calibrationsChan <- makeTorrentStartEvent(ptrs[i], infoHashBytes, infoHashOffset)
+		dumpsChan <- makeTorrentStartEvent(ptrs[i], infoHashBytes, infoHashOffset)
 	}
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
@@ -812,7 +793,6 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 		t.Errorf("expected 2 races after completion, got %d", len(snap.ActiveRaces))
 	}
 
-	// Verify hash0 is gone and hash1, hash2 remain
 	if _, exists := snap.ActiveRaces[hashes[0]]; exists {
 		t.Error("expected hashes[0] to be removed")
 	}
@@ -833,21 +813,18 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create multiple races
@@ -858,14 +835,13 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 			byte(0xda + i), byte(0xdb + i), byte(0xdc + i), byte(0xdd + i), byte(0xde + i),
 			byte(0xdf + i), byte(0xe0 + i), byte(0xe1 + i), byte(0xe2 + i), byte(0xe3 + i),
 		}
-		calibrationsChan <- makeTorrentStartEvent(uint64(0xb000+i), infoHashBytes, infoHashOffset)
+		dumpsChan <- makeTorrentStartEvent(uint64(0xb000+i), infoHashBytes, infoHashOffset)
 	}
 
 	waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 3
 	}, 2*time.Second)
 
-	// Cancel context
 	cancel()
 
 	select {
@@ -877,7 +853,6 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 		t.Fatal("timeout waiting for Run to exit")
 	}
 
-	// After Run exits, QueryState would block (no receiver). Check internal state directly.
 	if len(c.infoHashToRaceState) != 0 {
 		t.Error("expected all races to be cleaned up on shutdown")
 	}
@@ -889,22 +864,19 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a race
@@ -912,7 +884,7 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 		0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, 0x00, 0x01, 0x02, 0x03}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0xc000, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0xc000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -931,12 +903,12 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 		t.Fatal("timeout waiting for Run to exit")
 	}
 
-	// Verify race was finalized (Run waits for processEvents to flush before returning)
-	race, err := store.GetRace(ctx, raceID)
+	// Verify race was finalized
+	raceRecord, err := store.GetRace(ctx, raceID)
 	if err != nil {
 		t.Fatalf("get race: %v", err)
 	}
-	if !race.CompletedAt.Valid {
+	if !raceRecord.CompletedAt.Valid {
 		t.Error("expected race to be completed after channel close")
 	}
 }
@@ -947,22 +919,19 @@ func TestQueryStateSnapshotConsistency(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Pre-calibrate the info_hash offset
 	const infoHashOffset = 64
-	c.torrentCalib.infoHashOffset = infoHashOffset
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
+	dumpsChan := make(chan bpf.DumpEvent, 10)
 	pidDeathCh := make(chan error, 1)
 
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
 	}()
 
 	// Create a race
@@ -970,79 +939,15 @@ func TestQueryStateSnapshotConsistency(t *testing.T) {
 		0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	calibrationsChan <- makeTorrentStartEvent(0xd000, infoHashBytes, infoHashOffset)
+	dumpsChan <- makeTorrentStartEvent(0xd000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
 		return exists
 	}, 2*time.Second)
 
-	// Verify snapshot fields are initialized
 	if snap.ActiveRaces == nil {
 		t.Error("expected ActiveRaces to be non-nil")
-	}
-
-	close(eventsChan)
-	<-errChan
-}
-
-// TestInfoHashCorrelationCalibration tests calibration via multi-dump correlation
-func TestInfoHashCorrelationCalibration(t *testing.T) {
-	store, _ := storage.New(":memory:")
-	defer store.Close()
-
-	logger := testLogger()
-	c := NewCoordinator(store, logger, "", "", "", nil)
-
-	// Do NOT pre-calibrate; test the calibration mechanism
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	eventsChan := make(chan bpf.Event, 10)
-	calibrationsChan := make(chan bpf.CalibrationEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, calibrationsChan, pidDeathCh)
-	}()
-
-	// Use offset 488 with hash1/hash2 sharing first 12 bytes so correlation
-	// finds exactly 1 candidate (overlapping windows at 480 rejected).
-	const infoHashOffset = 488
-
-	hash1Bytes := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-		0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18}
-	hash1Hex := hex.EncodeToString(hash1Bytes)
-
-	hash2Bytes := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-		0x07, 0x08, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28}
-	hash2Hex := hex.EncodeToString(hash2Bytes)
-
-	// Send first event
-	calibrationsChan <- makeTorrentStartEvent(0xe000, hash1Bytes, infoHashOffset)
-
-	// Give it time to buffer (calibration not complete yet)
-	time.Sleep(100 * time.Millisecond)
-
-	// Send second event from different ptr - should trigger calibration
-	calibrationsChan <- makeTorrentStartEvent(0xe001, hash2Bytes, infoHashOffset)
-
-	// Wait for both races to be created (calibration should lock in after 2nd event)
-	snap := waitForState(t, c, func(s StateSnapshot) bool {
-		_, h1 := s.ActiveRaces[hash1Hex]
-		_, h2 := s.ActiveRaces[hash2Hex]
-		return h1 && h2 && s.InfoHashCalibOff == infoHashOffset
-	}, 2*time.Second)
-
-	if _, exists := snap.ActiveRaces[hash1Hex]; !exists {
-		t.Error("expected race from hash1 to be created after calibration")
-	}
-	if _, exists := snap.ActiveRaces[hash2Hex]; !exists {
-		t.Error("expected race from hash2 to be created after calibration")
-	}
-	if snap.InfoHashCalibOff != infoHashOffset {
-		t.Errorf("expected info_hash offset to be calibrated to %d, got %d", infoHashOffset, snap.InfoHashCalibOff)
 	}
 
 	close(eventsChan)

@@ -10,7 +10,7 @@ import (
 
 // buildSockaddrIN writes a sockaddr_in at the given offset in a calibration buffer.
 // sin_family=AF_INET(2) LE, sin_port=port BE, sin_addr=ip BE.
-func buildSockaddrIN(buf *[calibrationDataSize]byte, offset int, ip netip.Addr, port uint16) {
+func buildSockaddrIN(buf *[dumpDataSize]byte, offset int, ip netip.Addr, port uint16) {
 	binary.LittleEndian.PutUint16(buf[offset:], 2) // AF_INET
 	binary.BigEndian.PutUint16(buf[offset+2:], port)
 	ip4 := ip.As4()
@@ -18,7 +18,7 @@ func buildSockaddrIN(buf *[calibrationDataSize]byte, offset int, ip netip.Addr, 
 }
 
 func TestParseSockaddrIN_Valid(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	ip := netip.MustParseAddr("192.168.1.10")
 	buildSockaddrIN(&buf, 100, ip, 6881)
 
@@ -35,7 +35,7 @@ func TestParseSockaddrIN_Valid(t *testing.T) {
 }
 
 func TestParseSockaddrIN_WrongFamily(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	// Write AF_INET6 (10) instead of AF_INET (2)
 	binary.LittleEndian.PutUint16(buf[100:], 10)
 
@@ -46,7 +46,7 @@ func TestParseSockaddrIN_WrongFamily(t *testing.T) {
 }
 
 func TestParseSockaddrIN_ZeroPort(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	binary.LittleEndian.PutUint16(buf[100:], 2) // AF_INET
 	// Port is 0 — should reject
 
@@ -57,7 +57,7 @@ func TestParseSockaddrIN_ZeroPort(t *testing.T) {
 }
 
 func TestParseSockaddrIN_LoopbackRejected(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	ip := netip.MustParseAddr("127.0.0.1")
 	buildSockaddrIN(&buf, 100, ip, 6881)
 
@@ -68,7 +68,7 @@ func TestParseSockaddrIN_LoopbackRejected(t *testing.T) {
 }
 
 func TestParseSockaddrIN_UnspecifiedRejected(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	ip := netip.MustParseAddr("0.0.0.0")
 	buildSockaddrIN(&buf, 100, ip, 6881)
 
@@ -79,7 +79,7 @@ func TestParseSockaddrIN_UnspecifiedRejected(t *testing.T) {
 }
 
 func TestParseSockaddrIN_OutOfBounds(t *testing.T) {
-	var buf [calibrationDataSize]byte
+	var buf [dumpDataSize]byte
 	// Offset too close to end — not enough room for 8 bytes
 	_, ok := parseSockaddrIN(buf[:], 510)
 	if ok {
@@ -98,9 +98,9 @@ func TestCalibrationState_TwoVotesLockIn(t *testing.T) {
 	}
 
 	// First calibration event: peer_connection* = 0x1000 with IP at offset 64
-	var data1 [calibrationDataSize]byte
+	var data1 [dumpDataSize]byte
 	buildSockaddrIN(&data1, 64, ip1, 6881)
-	cal1 := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: data1}
+	cal1 := bpf.DumpEvent{ObjPtr: 0x1000, Data: data1}
 
 	// First event — should not lock in (need ≥2 votes)
 	if cs.tryCalibrate(cal1, known) {
@@ -111,9 +111,9 @@ func TestCalibrationState_TwoVotesLockIn(t *testing.T) {
 	}
 
 	// Second calibration event: different ptr, same offset
-	var data2 [calibrationDataSize]byte
+	var data2 [dumpDataSize]byte
 	buildSockaddrIN(&data2, 64, ip2, 6881)
-	cal2 := bpf.CalibrationEvent{ObjPtr: 0x2000, Data: data2}
+	cal2 := bpf.DumpEvent{ObjPtr: 0x2000, Data: data2}
 
 	if !cs.tryCalibrate(cal2, known) {
 		t.Fatal("expected calibration to lock in after 2 votes")
@@ -134,9 +134,9 @@ func TestCalibrationState_NoDuplicateVotesFromSamePtr(t *testing.T) {
 		netip.AddrPortFrom(ip, 6881): true,
 	}
 
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	buildSockaddrIN(&data, 64, ip, 6881)
-	cal := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: data}
+	cal := bpf.DumpEvent{ObjPtr: 0x1000, Data: data}
 
 	// Same ptr twice — should not double-count
 	cs.tryCalibrate(cal, known)
@@ -154,9 +154,9 @@ func TestCalibrationState_NoMatchWithoutKnownPeers(t *testing.T) {
 	cs := newCalibrationState()
 	known := map[netip.AddrPort]bool{} // empty
 
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	buildSockaddrIN(&data, 64, netip.MustParseAddr("10.0.0.1"), 6881)
-	cal := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: data}
+	cal := bpf.DumpEvent{ObjPtr: 0x1000, Data: data}
 
 	if cs.tryCalibrate(cal, known) {
 		t.Error("should not calibrate with empty known peers")
@@ -170,9 +170,9 @@ func TestCalibrationState_NoMatchForUnknownIP(t *testing.T) {
 	}
 
 	// Data has a different IP than the known set
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	buildSockaddrIN(&data, 64, netip.MustParseAddr("10.0.0.99"), 6881)
-	cal := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: data}
+	cal := bpf.DumpEvent{ObjPtr: 0x1000, Data: data}
 
 	if cs.tryCalibrate(cal, known) {
 		t.Error("should not calibrate when IP doesn't match known peers")
@@ -186,7 +186,7 @@ func TestCalibrationState_ExtractEndpoint(t *testing.T) {
 	cs := newCalibrationState()
 	cs.offset = 64 // Manually set calibrated offset
 
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	buildSockaddrIN(&data, 64, netip.MustParseAddr("172.16.0.5"), 51413)
 
 	addr, ok := cs.extractEndpoint(data)
@@ -204,7 +204,7 @@ func TestCalibrationState_ExtractEndpoint(t *testing.T) {
 func TestCalibrationState_ExtractFailsWhenUncalibrated(t *testing.T) {
 	cs := newCalibrationState()
 
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	buildSockaddrIN(&data, 64, netip.MustParseAddr("172.16.0.5"), 51413)
 
 	_, ok := cs.extractEndpoint(data)
@@ -226,13 +226,13 @@ func TestCalibrationState_MultipleOffsetsVoting(t *testing.T) {
 	}
 
 	// Two events with sockaddr at offset 64, one at offset 128
-	var d1, d2, d3 [calibrationDataSize]byte
+	var d1, d2, d3 [dumpDataSize]byte
 	buildSockaddrIN(&d1, 64, ip1, 6881)
 	buildSockaddrIN(&d2, 128, ip2, 6881) // red herring at different offset
 	buildSockaddrIN(&d3, 64, ip3, 6881)
 
-	cs.tryCalibrate(bpf.CalibrationEvent{ObjPtr: 0x1000, Data: d1}, known)
-	cs.tryCalibrate(bpf.CalibrationEvent{ObjPtr: 0x2000, Data: d2}, known)
+	cs.tryCalibrate(bpf.DumpEvent{ObjPtr: 0x1000, Data: d1}, known)
+	cs.tryCalibrate(bpf.DumpEvent{ObjPtr: 0x2000, Data: d2}, known)
 
 	// After 2 events, offset 64 has 1 vote, offset 128 has 1 vote — not calibrated
 	if cs.isCalibrated() {
@@ -240,7 +240,7 @@ func TestCalibrationState_MultipleOffsetsVoting(t *testing.T) {
 	}
 
 	// Third event at offset 64 gives it 2 votes → locks in
-	if !cs.tryCalibrate(bpf.CalibrationEvent{ObjPtr: 0x3000, Data: d3}, known) {
+	if !cs.tryCalibrate(bpf.DumpEvent{ObjPtr: 0x3000, Data: d3}, known) {
 		t.Fatal("expected offset 64 to lock in with 2 votes")
 	}
 	if cs.offset != 64 {
@@ -261,12 +261,12 @@ func TestCalibrationState_PendingReprocessing(t *testing.T) {
 	}
 
 	// Buffer 3 events (simulating they arrived before known peers)
-	var d1, d2, d3 [calibrationDataSize]byte
+	var d1, d2, d3 [dumpDataSize]byte
 	buildSockaddrIN(&d1, 200, ip1, 6881)
 	buildSockaddrIN(&d2, 200, ip2, 6881)
 	buildSockaddrIN(&d3, 200, ip3, 6881)
 
-	cs.pending = []bpf.CalibrationEvent{
+	cs.pending = []bpf.DumpEvent{
 		{ObjPtr: 0x1000, Data: d1},
 		{ObjPtr: 0x2000, Data: d2},
 		{ObjPtr: 0x3000, Data: d3},
@@ -299,7 +299,7 @@ func TestCalibrationState_PendingReprocessing(t *testing.T) {
 // --- Peer ID calibration tests ---
 
 // writePeerID writes a BT peer_id at the given offset in a calibration buffer.
-func writePeerID(buf *[calibrationDataSize]byte, offset int, peerID string) {
+func writePeerID(buf *[dumpDataSize]byte, offset int, peerID string) {
 	copy(buf[offset:], []byte(peerID))
 }
 
@@ -317,20 +317,20 @@ func TestCalibratePeerID_TwoVotesLockIn(t *testing.T) {
 	}
 
 	// First event: peer with IP 10.0.0.1, peer_id at offset 256
-	var d1 [calibrationDataSize]byte
+	var d1 [dumpDataSize]byte
 	buildSockaddrIN(&d1, 64, ip1, 6881)
 	writePeerID(&d1, 256, "-qB4530-aaaaaaaaaaaa")
-	cal1 := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: d1}
+	cal1 := bpf.DumpEvent{ObjPtr: 0x1000, Data: d1}
 
 	if cs.tryCalibratePeerID(cal1, knownPeerIDs) {
 		t.Fatal("should not lock in after 1 vote")
 	}
 
 	// Second event: different peer, peer_id at same offset 256
-	var d2 [calibrationDataSize]byte
+	var d2 [dumpDataSize]byte
 	buildSockaddrIN(&d2, 64, ip2, 6881)
 	writePeerID(&d2, 256, "-DE2110-bbbbbbbbbbbb")
-	cal2 := bpf.CalibrationEvent{ObjPtr: 0x2000, Data: d2}
+	cal2 := bpf.DumpEvent{ObjPtr: 0x2000, Data: d2}
 
 	if !cs.tryCalibratePeerID(cal2, knownPeerIDs) {
 		t.Fatal("expected peer_id calibration to lock in after 2 votes")
@@ -351,8 +351,8 @@ func TestCalibratePeerID_RequiresSockaddrFirst(t *testing.T) {
 		netip.MustParseAddrPort("10.0.0.1:6881"): "-qB4530-aaaaaaaaaaaa",
 	}
 
-	var d [calibrationDataSize]byte
-	cal := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: d}
+	var d [dumpDataSize]byte
+	cal := bpf.DumpEvent{ObjPtr: 0x1000, Data: d}
 
 	if cs.tryCalibratePeerID(cal, knownPeerIDs) {
 		t.Error("should not calibrate peer_id without sockaddr_in")
@@ -368,10 +368,10 @@ func TestCalibratePeerID_NoDuplicateVotes(t *testing.T) {
 		netip.AddrPortFrom(ip, 6881): "-qB4530-aaaaaaaaaaaa",
 	}
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	buildSockaddrIN(&d, 64, ip, 6881)
 	writePeerID(&d, 256, "-qB4530-aaaaaaaaaaaa")
-	cal := bpf.CalibrationEvent{ObjPtr: 0x1000, Data: d}
+	cal := bpf.DumpEvent{ObjPtr: 0x1000, Data: d}
 
 	cs.tryCalibratePeerID(cal, knownPeerIDs)
 	cs.tryCalibratePeerID(cal, knownPeerIDs) // same ptr
@@ -389,7 +389,7 @@ func TestExtractPeerID(t *testing.T) {
 	cs.offset = 64
 	cs.peerIDOffset = 256
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	writePeerID(&d, 256, "-qB4530-aaaaaaaaaaaa")
 
 	peerID, ok := cs.extractPeerID(d)
@@ -404,7 +404,7 @@ func TestExtractPeerID(t *testing.T) {
 func TestExtractPeerID_FailsWhenUncalibrated(t *testing.T) {
 	cs := newCalibrationState()
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	_, ok := cs.extractPeerID(d)
 	if ok {
 		t.Error("extraction should fail when peer_id not calibrated")
@@ -450,12 +450,12 @@ func TestNewCalibratedState(t *testing.T) {
 // --- Torrent calibration tests ---
 
 // writeInfoHash places a 20-byte info_hash at the given offset in a calibration buffer.
-func writeInfoHash(buf *[calibrationDataSize]byte, offset int, hash []byte) {
+func writeInfoHash(buf *[dumpDataSize]byte, offset int, hash []byte) {
 	copy(buf[offset:offset+20], hash)
 }
 
 // writeTorrentPtr places a 64-bit pointer at the given offset (8-byte aligned) in a buffer.
-func writeTorrentPtr(buf *[calibrationDataSize]byte, offset int, ptr uint64) {
+func writeTorrentPtr(buf *[dumpDataSize]byte, offset int, ptr uint64) {
 	binary.LittleEndian.PutUint64(buf[offset:], ptr)
 }
 
@@ -467,11 +467,11 @@ func TestTorrentCalibration_CorrelationTwoDumps(t *testing.T) {
 	hash2 := []byte{0xca, 0xfe, 0xba, 0xbe, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
 		0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20}
 
-	var d1, d2 [calibrationDataSize]byte
+	var d1, d2 [dumpDataSize]byte
 	writeInfoHash(&d1, 128, hash1)
 	writeInfoHash(&d2, 128, hash2)
 
-	dumps := []bpf.CalibrationEvent{
+	dumps := []bpf.DumpEvent{
 		{ObjPtr: 0x5000, Data: d1},
 		{ObjPtr: 0x6000, Data: d2},
 	}
@@ -491,9 +491,12 @@ func TestTorrentCalibration_CorrelationTwoDumps(t *testing.T) {
 func TestTorrentCalibration_CorrelationThreeDumps(t *testing.T) {
 	ts := newTorrentCalibrationState()
 
-	// Hash at offset 488 so overlapping windows at 480, 472, etc. are rejected.
-	// hash1 and hash2 share first 12 bytes so offset 480 (8 zeros + hash[0:12])
-	// has duplicate → rejected. Only offset 488 has all 3 unique.
+	// Place hashes at offset 4072 (last 8-byte-aligned position that fits a
+	// 20-byte hash in the 4096-byte buffer). This eliminates the right-side
+	// overlapping window (offset 4080 would exceed the buffer). The left-side
+	// window at 4064 (8 zeros + hash[0:12]) has duplicates for hash1/hash2
+	// because they share the first 12 bytes → rejected. Only offset 4072
+	// has all 3 unique.
 	hash1 := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
 		0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18}
 	hash2 := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
@@ -501,13 +504,13 @@ func TestTorrentCalibration_CorrelationThreeDumps(t *testing.T) {
 	hash3 := []byte{0x42, 0x43, 0x44, 0x45, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36,
 		0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40}
 
-	const infoHashOffset = 488
-	var d1, d2, d3 [calibrationDataSize]byte
+	const infoHashOffset = 4072
+	var d1, d2, d3 [dumpDataSize]byte
 	writeInfoHash(&d1, infoHashOffset, hash1)
 	writeInfoHash(&d2, infoHashOffset, hash2)
 	writeInfoHash(&d3, infoHashOffset, hash3)
 
-	dumps := []bpf.CalibrationEvent{
+	dumps := []bpf.DumpEvent{
 		{ObjPtr: 0x5000, Data: d1},
 		{ObjPtr: 0x6000, Data: d2},
 		{ObjPtr: 0x7000, Data: d3},
@@ -528,11 +531,11 @@ func TestTorrentCalibration_CorrelationNeedsTwoPtrs(t *testing.T) {
 	hash := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
 		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	writeInfoHash(&d, 128, hash)
 
 	// Single dump — should not calibrate
-	dumps := []bpf.CalibrationEvent{
+	dumps := []bpf.DumpEvent{
 		{ObjPtr: 0x5000, Data: d},
 	}
 
@@ -561,11 +564,11 @@ func TestTorrentCalibration_FromAPI(t *testing.T) {
 		0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40}
 
 	const infoHashOffset = 256
-	var d1, d2 [calibrationDataSize]byte
+	var d1, d2 [dumpDataSize]byte
 	writeInfoHash(&d1, infoHashOffset, hash1)
 	writeInfoHash(&d2, infoHashOffset, hash2)
 
-	dumps := []bpf.CalibrationEvent{
+	dumps := []bpf.DumpEvent{
 		{ObjPtr: 0x5000, Data: d1},
 		{ObjPtr: 0x6000, Data: d2},
 	}
@@ -589,10 +592,10 @@ func TestTorrentCalibration_FromAPISingleDump(t *testing.T) {
 
 	hash := []byte{0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
 		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	writeInfoHash(&d, 128, hash)
 
-	dumps := []bpf.CalibrationEvent{{ObjPtr: 0x5000, Data: d}}
+	dumps := []bpf.DumpEvent{{ObjPtr: 0x5000, Data: d}}
 	hashes := []string{"deadbeef0102030405060708090a0b0c0d0e0f10"}
 
 	off, _, ok := ts.tryCalibrateInfoHashFromAPI(dumps, hashes)
@@ -610,7 +613,7 @@ func TestTorrentCalibration_ExtractInfoHash(t *testing.T) {
 
 	hash := []byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33, 0x44,
 		0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xab, 0xcd, 0xef, 0x01}
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	writeInfoHash(&data, 128, hash)
 
 	extracted, ok := ts.extractInfoHash(data)
@@ -626,14 +629,14 @@ func TestTorrentCalibration_ExtractInfoHash(t *testing.T) {
 
 func TestTorrentCalibration_ExtractInfoHashFailsUncalibrated(t *testing.T) {
 	ts := newTorrentCalibrationState()
-	var data [calibrationDataSize]byte
+	var data [dumpDataSize]byte
 	_, ok := ts.extractInfoHash(data)
 	if ok {
 		t.Error("should fail when not calibrated")
 	}
 }
 
-func TestTorrentCalibration_TorrentPtrTwoVotesLockIn(t *testing.T) {
+func TestTorrentCalibration_TorrentPtrSingleVoteLockIn(t *testing.T) {
 	ts := newTorrentCalibrationState()
 
 	knownPtrs := map[uint64]bool{
@@ -641,22 +644,16 @@ func TestTorrentCalibration_TorrentPtrTwoVotesLockIn(t *testing.T) {
 		0xffff_0000_3333_4444: true,
 	}
 
-	// First peer_connection dump with known torrent ptr at offset 48
-	var d1 [calibrationDataSize]byte
+	// A single peer_connection dump with a known torrent ptr at offset 48
+	// should lock in immediately (torrentPtrMinVotes=1). The probability of
+	// a random 8-byte value matching a known heap pointer is ~N/2^64 ≈ 0,
+	// so one match is conclusive.
+	var d1 [dumpDataSize]byte
 	writeTorrentPtr(&d1, 48, 0xffff_0000_1111_2222)
-	cal1 := bpf.CalibrationEvent{ObjPtr: 0xa000, Data: d1}
+	cal1 := bpf.DumpEvent{ObjPtr: 0xa000, Data: d1}
 
-	if ts.tryCalibrateTorrentPtr(cal1, knownPtrs) {
-		t.Fatal("should not lock in after 1 vote")
-	}
-
-	// Second dump from different peer_connection, same offset
-	var d2 [calibrationDataSize]byte
-	writeTorrentPtr(&d2, 48, 0xffff_0000_3333_4444)
-	cal2 := bpf.CalibrationEvent{ObjPtr: 0xb000, Data: d2}
-
-	if !ts.tryCalibrateTorrentPtr(cal2, knownPtrs) {
-		t.Fatal("expected torrent_ptr calibration to lock in after 2 votes")
+	if !ts.tryCalibrateTorrentPtr(cal1, knownPtrs) {
+		t.Fatal("expected torrent_ptr calibration to lock in after 1 vote")
 	}
 	if ts.torrentPtrOffset != 48 {
 		t.Errorf("expected offset 48, got %d", ts.torrentPtrOffset)
@@ -666,28 +663,29 @@ func TestTorrentCalibration_TorrentPtrTwoVotesLockIn(t *testing.T) {
 func TestTorrentCalibration_TorrentPtrNoDuplicateVotes(t *testing.T) {
 	ts := newTorrentCalibrationState()
 
+	// Use two known pointers at the same offset but require 2 votes by
+	// verifying the vote count doesn't inflate when the same ObjPtr is
+	// submitted twice. First call locks in (torrentPtrMinVotes=1), but
+	// the vote count should remain 1 despite the duplicate submission.
 	knownPtrs := map[uint64]bool{0xffff_0000_1111_2222: true}
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	writeTorrentPtr(&d, 48, 0xffff_0000_1111_2222)
-	cal := bpf.CalibrationEvent{ObjPtr: 0xa000, Data: d}
+	cal := bpf.DumpEvent{ObjPtr: 0xa000, Data: d}
 
 	ts.tryCalibrateTorrentPtr(cal, knownPtrs)
-	ts.tryCalibrateTorrentPtr(cal, knownPtrs)
+	ts.tryCalibrateTorrentPtr(cal, knownPtrs) // duplicate — should not increment
 
-	if ts.isTorrentPtrCalibrated() {
-		t.Error("same ptr should not vote twice")
-	}
 	if ts.torrentPtrVotes[48] != 1 {
-		t.Errorf("expected 1 vote, got %d", ts.torrentPtrVotes[48])
+		t.Errorf("expected 1 vote (duplicate should be ignored), got %d", ts.torrentPtrVotes[48])
 	}
 }
 
 func TestTorrentCalibration_TorrentPtrNoKnownPtrs(t *testing.T) {
 	ts := newTorrentCalibrationState()
 
-	var d [calibrationDataSize]byte
-	cal := bpf.CalibrationEvent{ObjPtr: 0xa000, Data: d}
+	var d [dumpDataSize]byte
+	cal := bpf.DumpEvent{ObjPtr: 0xa000, Data: d}
 
 	if ts.tryCalibrateTorrentPtr(cal, nil) {
 		t.Error("should not calibrate with no known pointers")
@@ -698,7 +696,7 @@ func TestTorrentCalibration_ExtractTorrentPtr(t *testing.T) {
 	ts := newTorrentCalibrationState()
 	ts.torrentPtrOffset = 48
 
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	writeTorrentPtr(&d, 48, 0xdeadbeef_cafebabe)
 
 	ptr, ok := ts.extractTorrentPtr(d)
@@ -712,7 +710,7 @@ func TestTorrentCalibration_ExtractTorrentPtr(t *testing.T) {
 
 func TestTorrentCalibration_ExtractTorrentPtrFailsUncalibrated(t *testing.T) {
 	ts := newTorrentCalibrationState()
-	var d [calibrationDataSize]byte
+	var d [dumpDataSize]byte
 	_, ok := ts.extractTorrentPtr(d)
 	if ok {
 		t.Error("should fail when not calibrated")

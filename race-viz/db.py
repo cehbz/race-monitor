@@ -70,11 +70,12 @@ def fetch_race_counts(conn, race_ids):
             'event_count': row['event_count'],
         }
 
-    # Peer counts from eBPF connections (distinct connection_ids with have events)
+    # Peer counts from eBPF connections (all calibration-discovered connections,
+    # excluding the synthetic "self" connection used for our own piece completions)
     peer_cursor = conn.execute(f'''
-        SELECT race_id, COUNT(DISTINCT connection_id) as peer_count
-        FROM packet_events
-        WHERE race_id IN ({placeholders}) AND event_type_id = 1
+        SELECT race_id, COUNT(*) as peer_count
+        FROM connections
+        WHERE race_id IN ({placeholders}) AND conn_ptr != 'self'
         GROUP BY race_id
     ''', race_ids)
     for row in peer_cursor.fetchall():
@@ -91,7 +92,7 @@ def fetch_race_detail(conn, race_id):
     """Race metadata joined with torrent info. Returns dict or None."""
     cursor = conn.execute('''
         SELECT r.id, r.started_at, r.completed_at, r.start_wallclock,
-               t.info_hash, t.name, t.size, t.piece_count
+               r.start_ktime, t.info_hash, t.name, t.size, t.piece_count
         FROM races r
         JOIN torrents t ON r.torrent_id = t.id
         WHERE r.id = ?
@@ -104,13 +105,18 @@ def fetch_timeline(conn, race_id):
     """1-second bucketed timeline of have/piece_received counts.
 
     Timestamps are int64 nanoseconds since boot. We compute elapsed seconds
-    relative to the race's first event using integer arithmetic.
+    relative to the race's start_ktime (from torrent::start()) when available,
+    falling back to the first event timestamp. Using start_ktime captures
+    the latency between torrent start and first piece verification.
 
     Returns ~600 rows for a 10-minute race instead of 26M raw events.
     """
     cursor = conn.execute('''
         WITH race_start AS (
-            SELECT MIN(ts) as t0 FROM packet_events WHERE race_id = ?
+            SELECT COALESCE(
+                (SELECT r.start_ktime FROM races r WHERE r.id = ?),
+                (SELECT MIN(ts) FROM packet_events WHERE race_id = ?)
+            ) as t0
         )
         SELECT
             CAST((pe.ts - rs.t0) / ? AS INTEGER) as elapsed_sec,
@@ -120,7 +126,7 @@ def fetch_timeline(conn, race_id):
         WHERE pe.race_id = ?
         GROUP BY elapsed_sec
         ORDER BY elapsed_sec
-    ''', (race_id, _NS_PER_SEC, race_id))
+    ''', (race_id, race_id, _NS_PER_SEC, race_id))
     return [dict(row) for row in cursor.fetchall()]
 
 
@@ -159,14 +165,13 @@ def fetch_connection_meta(conn, race_id):
     """Connection metadata from eBPF calibration.
 
     Returns {connection_id: {conn_ptr, ip, port, client, peer_id, label}}.
+    Includes all calibration-discovered connections, not just those with
+    incoming_have events (seeders never send HAVE but are still peers).
     """
     cursor = conn.execute('''
         SELECT c.id, c.conn_ptr, c.ip, c.port, c.peer_id, c.client
         FROM connections c
-        WHERE c.id IN (
-            SELECT DISTINCT connection_id FROM packet_events
-            WHERE race_id = ? AND event_type_id = 1
-        )
+        WHERE c.race_id = ? AND c.conn_ptr != 'self'
     ''', (race_id,))
 
     meta = {}
@@ -187,11 +192,11 @@ def fetch_connection_meta(conn, race_id):
 
 
 def fetch_peer_count(conn, race_id):
-    """Peer count from distinct eBPF connections with incoming_have events."""
+    """Peer count from calibration-discovered eBPF connections (excludes self)."""
     cursor = conn.execute('''
-        SELECT COUNT(DISTINCT connection_id) as peer_count
-        FROM packet_events
-        WHERE race_id = ? AND event_type_id = 1
+        SELECT COUNT(*) as peer_count
+        FROM connections
+        WHERE race_id = ? AND conn_ptr != 'self'
     ''', (race_id,))
     return cursor.fetchone()['peer_count']
 

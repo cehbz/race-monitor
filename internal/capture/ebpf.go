@@ -21,39 +21,12 @@ import (
 	"github.com/cehbz/race-monitor/internal/bpf"
 )
 
-// setCalibrationFlags writes the calibration gate flags into BPF array maps.
-// When a flag is 0, the BPF probe skips emitting calibration dumps.
-func setCalibrationFlags(objs *bpf.ProbeObjects, flags *CalibrationFlags, logger *slog.Logger) error {
-	// Defaults: all calibration enabled (flag=1).
-	var peerFlag, torrentFlag uint32 = 1, 1
-	if flags != nil {
-		if !flags.PeerCalibrationNeeded {
-			peerFlag = 0
-		}
-		if !flags.TorrentCalibrationNeeded {
-			torrentFlag = 0
-		}
-	}
-
-	key := uint32(0)
-	if err := objs.PeerCalNeeded.Put(key, peerFlag); err != nil {
-		return fmt.Errorf("setting peer_cal_needed: %w", err)
-	}
-	if err := objs.TorrentCalNeeded.Put(key, torrentFlag); err != nil {
-		return fmt.Errorf("setting torrent_cal_needed: %w", err)
-	}
-
-	logger.Info("BPF calibration flags set",
-		"peer_cal_needed", peerFlag,
-		"torrent_cal_needed", torrentFlag)
-	return nil
-}
-
 // symbolPrefixes maps eBPF program names to their C++ mangled symbol prefixes.
 // We search the binary's ELF symbol table for a match (ignoring .cold variants).
 var symbolPrefixes = map[string]string{
 	"we_have":          "_ZN10libtorrent7torrent7we_haveE",
 	"incoming_have":    "_ZN10libtorrent15peer_connection13incoming_haveE",
+	"incoming_piece":   "_ZN10libtorrent15peer_connection14incoming_pieceE",
 	"torrent_start":    "_ZN10libtorrent7torrent5startE",
 	"torrent_finished": "_ZN10libtorrent7torrent8finishedE",
 }
@@ -86,26 +59,21 @@ type readResult struct {
 	err error
 }
 
-// CalibrationFlags controls which calibration dumps the BPF probes emit.
-// When a flag is false, the corresponding calibration events are suppressed
-// in the kernel, reducing overhead when offsets are cached.
-type CalibrationFlags struct {
-	PeerCalibrationNeeded    bool // emit peer_connection struct dumps
-	TorrentCalibrationNeeded bool // emit torrent struct dumps
+// HasTorrentStartSymbol checks whether the qBittorrent binary contains the
+// torrent::start() symbol needed for race lifecycle management.
+func HasTorrentStartSymbol(binPath string) bool {
+	_, err := findSymbol(binPath, symbolPrefixes["torrent_start"])
+	return err == nil
 }
 
 // Capture attaches eBPF uprobes to the qBittorrent binary and returns
-// channels for raw eBPF events and calibration events. The caller is
-// responsible for enriching events with torrent metadata from the qBittorrent
-// API. Calibration events contain memory dumps from peer_connection and torrent
-// structs for auto-discovering field offsets.
-//
-// calFlags controls which calibration dumps are emitted. Pass nil for
-// defaults (all calibration enabled).
+// channels for slim events and struct dump events. Struct dumps carry 4KB
+// memory snapshots from peer_connection and torrent objects, used for
+// extracting peer identity (IP, port, peer_id) and torrent identity (info_hash).
 //
 // If pid > 0, probes fire only for that process. If pid == 0, probes fire
 // for all processes executing the binary.
-func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, calFlags *CalibrationFlags) (<-chan bpf.Event, <-chan bpf.CalibrationEvent, error) {
+func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) (<-chan bpf.Event, <-chan bpf.DumpEvent, error) {
 	// Log diagnostic info for permission debugging
 	if paranoid, err := os.ReadFile("/proc/sys/kernel/perf_event_paranoid"); err == nil {
 		logger.Debug("kernel security", "perf_event_paranoid", strings.TrimSpace(string(paranoid)), "uid", os.Getuid())
@@ -132,6 +100,13 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 		return nil, nil, fmt.Errorf("resolving incoming_have symbol: %w", err)
 	}
 
+	// Resolve peer discovery symbol (optional — improves peer discovery in seeder-heavy swarms)
+	incomingPieceSym, err := findSymbol(binPath, symbolPrefixes["incoming_piece"])
+	if err != nil {
+		logger.Warn("peer discovery probe: incoming_piece() not found, peer discovery relies on incoming_have only", "error", err)
+		incomingPieceSym = ""
+	}
+
 	// Resolve lifecycle symbols (optional — degrade gracefully if absent)
 	torrentStartSym, err := findSymbol(binPath, symbolPrefixes["torrent_start"])
 	if err != nil {
@@ -147,6 +122,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	logger.Info("resolved probe symbols",
 		"we_have", weHaveSym,
 		"incoming_have", incomingHaveSym,
+		"incoming_piece", incomingPieceSym,
 		"torrent_start", torrentStartSym,
 		"torrent_finished", torrentFinishedSym)
 
@@ -154,13 +130,6 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	objs := bpf.ProbeObjects{}
 	if err := bpf.LoadProbeObjects(&objs, nil); err != nil {
 		return nil, nil, fmt.Errorf("loading eBPF objects (if 'permission denied': check kernel.perf_event_paranoid <= 2 and CAP_BPF capability): %w", err)
-	}
-
-	// Set calibration gate flags in BPF maps. Default is calibration needed
-	// (flag=1); suppress when offsets are cached (flag=0).
-	if err := setCalibrationFlags(&objs, calFlags, logger); err != nil {
-		objs.Close()
-		return nil, nil, fmt.Errorf("setting calibration flags: %w", err)
 	}
 
 	// Open the target binary for uprobe attachment
@@ -199,6 +168,17 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}
 	closers = append(closers, func() { upIncomingHave.Close() })
 
+	// Attach optional peer discovery probe (incoming_piece fires during
+	// active download even when peers are seeders who never send HAVE messages)
+	if incomingPieceSym != "" {
+		upIncomingPiece, err := ex.Uprobe(incomingPieceSym, objs.TraceIncomingPiece, uprobeOpts)
+		if err != nil {
+			logger.Warn("failed to attach incoming_piece uprobe (non-fatal)", "error", err)
+		} else {
+			closers = append(closers, func() { upIncomingPiece.Close() })
+		}
+	}
+
 	// Attach optional lifecycle probes
 	if torrentStartSym != "" {
 		upTorrentStart, err := ex.Uprobe(torrentStartSym, objs.TraceTorrentStart, uprobeOpts)
@@ -224,8 +204,8 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}
 
 	// Create perf event reader (256 KB per-CPU buffer — sized for ~3K events/sec
-	// incoming_have bursts plus calibration events sharing the same perf buffer.
-	// Calibration events are ~4KB but infrequent (~50/race).)
+	// incoming_have bursts plus struct dump events sharing the same perf buffer.
+	// Dump events are ~4KB but infrequent (~50/race).)
 	rd, err := perf.NewReader(objs.Events, 256*1024)
 	if err != nil {
 		closeAll()
@@ -233,18 +213,18 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}
 
 	eventChan := make(chan bpf.Event, 10000)
-	calChan := make(chan bpf.CalibrationEvent, 100)
+	dumpChan := make(chan bpf.DumpEvent, 100)
 
 	go func() {
 		defer close(eventChan)
-		defer close(calChan)
+		defer close(dumpChan)
 		defer rd.Close()
 		defer closeAll()
 
 		logger.Info("perf reader started, waiting for events")
 
 		var totalLost uint64
-		var eventCount, calCount uint64
+		var eventCount, dumpCount uint64
 		var firstEventLogged bool
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -266,7 +246,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "cals", calCount, "lost", totalLost)
+				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "dumps", dumpCount, "lost", totalLost)
 			case r, ok := <-recCh:
 				if !ok {
 					logger.Debug("perf reader closed", "total_lost_samples", totalLost)
@@ -303,18 +283,18 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 				}
 
 				switch eventType {
-				case bpf.EventCalibration, bpf.EventTorrentCalibration, bpf.EventTorrentStarted:
-					calCount++
-					// Large calibration events routed to calibration channel.
+				case bpf.EventPeerDump, bpf.EventTorrentDump, bpf.EventTorrentStarted:
+					dumpCount++
+					// Large struct dump events routed to dump channel.
 					// TorrentStarted carries a full torrent struct dump like
-					// TorrentCalibration but also triggers race creation.
-					var cal bpf.CalibrationEvent
-					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &cal); err != nil {
-						logger.Warn("failed to decode calibration event", "error", err)
+					// TorrentDump but also triggers race creation.
+					var dump bpf.DumpEvent
+					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &dump); err != nil {
+						logger.Warn("failed to decode struct dump event", "error", err)
 						continue
 					}
 					select {
-					case calChan <- cal:
+					case dumpChan <- dump:
 					case <-ctx.Done():
 						return
 					}
@@ -343,5 +323,5 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 		rd.Close()
 	}()
 
-	return eventChan, calChan, nil
+	return eventChan, dumpChan, nil
 }

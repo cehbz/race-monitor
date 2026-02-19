@@ -36,6 +36,7 @@ type Race struct {
 	InfoHash    string // denormalized from torrents
 	StartedAt   time.Time
 	CompletedAt sql.NullTime
+	StartKtime  sql.NullInt64 // BPF ktime_get_ns from torrent::start(), nullable
 }
 
 // Connection represents an eBPF-observed connection (opaque pointer identifier).

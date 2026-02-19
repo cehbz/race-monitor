@@ -14,7 +14,7 @@ func TestPacketEvents(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "testhash", "test torrent", 1000000, 100)
-	raceID, err := store.CreateRace(ctx, torID)
+	raceID, err := store.CreateRace(ctx, torID, 0)
 	if err != nil {
 		t.Fatalf("failed to create race: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestPieceReceivedAndHaveEvents(t *testing.T) {
 	now := time.Now()
 
 	torID := createTestTorrent(t, store, "testhash2", "test torrent 2", 500000, 50)
-	raceID, _ := store.CreateRace(ctx, torID)
+	raceID, _ := store.CreateRace(ctx, torID, 0)
 	selfConnID, _ := store.InsertConnection(ctx, raceID, "self", now)
 	remoteConnID, _ := store.InsertConnection(ctx, raceID, "cafebabe", now)
 

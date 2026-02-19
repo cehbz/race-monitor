@@ -91,7 +91,7 @@ func TestCreateRace(t *testing.T) {
 	t.Run("creates race with valid torrent", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "abc123hash", "Test.Torrent.2024", 1024*1024*1024, 1024)
 
-		id, err := store.CreateRace(ctx, torID)
+		id, err := store.CreateRace(ctx, torID, 0)
 		if err != nil {
 			t.Fatalf("failed to create race: %v", err)
 		}
@@ -103,9 +103,9 @@ func TestCreateRace(t *testing.T) {
 	t.Run("creates multiple races for same torrent", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "multi", "Multi", 100, 10)
 
-		id1, _ := store.CreateRace(ctx, torID)
+		id1, _ := store.CreateRace(ctx, torID, 0)
 		time.Sleep(2 * time.Millisecond) // ensure different started_at for UNIQUE constraint
-		id2, _ := store.CreateRace(ctx, torID)
+		id2, _ := store.CreateRace(ctx, torID, 0)
 
 		if id1 >= id2 {
 			t.Errorf("expected id1 < id2, got %d >= %d", id1, id2)
@@ -121,7 +121,7 @@ func TestGetRace(t *testing.T) {
 
 	t.Run("retrieves race with denormalized torrent data", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "testhash", "Test.Torrent", 500, 50)
-		raceID, _ := store.CreateRace(ctx, torID)
+		raceID, _ := store.CreateRace(ctx, torID, 0)
 
 		race, err := store.GetRace(ctx, raceID)
 		if err != nil {
@@ -162,7 +162,7 @@ func TestCompleteRace(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID)
+	raceID, _ := store.CreateRace(ctx, torID, 0)
 
 	if err := store.CompleteRace(ctx, raceID); err != nil {
 		t.Fatalf("failed to complete race: %v", err)
@@ -193,7 +193,7 @@ func TestListRecentRaces(t *testing.T) {
 	t.Run("returns races within period", func(t *testing.T) {
 		for i, h := range []string{"h1", "h2", "h3"} {
 			torID := createTestTorrent(t, store, h, "Torrent"+h, int64((i+1)*100), (i+1)*10)
-			store.CreateRace(ctx, torID)
+			store.CreateRace(ctx, torID, 0)
 		}
 
 		races, err := store.ListRecentRaces(ctx, 7)
@@ -221,7 +221,7 @@ func TestInsertConnection(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID)
+	raceID, _ := store.CreateRace(ctx, torID, 0)
 	now := time.Now()
 
 	t.Run("inserts and returns ID", func(t *testing.T) {
@@ -259,7 +259,7 @@ func TestInsertPacketEvents(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID)
+	raceID, _ := store.CreateRace(ctx, torID, 0)
 	connID, _ := store.InsertConnection(ctx, raceID, "self", time.Now())
 
 	t.Run("inserts multiple events", func(t *testing.T) {
