@@ -1,14 +1,21 @@
-# Binaries
+# Binaries/Generated Files
 race-monitor
 race-monitor-*
 !race-monitor/
 !race-monitor-*/
-*.exe
+race-calibrate
+!race-calibrate/
+!race-calibrate-*/
+internal/bpf/probe_bpfel.*
+internal/bpf/headers/vmlinux.h
+race-test.log
+race-viz/app.log
 
 # Test artifacts
 coverage.out
 coverage.html
 *.test
+test.out
 
 # IDE
 .idea/
@@ -21,6 +28,7 @@ coverage.html
 # OS
 .DS_Store
 Thumbs.db
+._*
 
 # Database (local dev)
 *.db
@@ -28,15 +36,4 @@ Thumbs.db
 *.db-wal
 
 race-viz/config.toml
-internal/bpf/headers/vmlinux.h
 race-viz/__pycache__/
-race-test.log
-.gitignore
-test.out
-test-v2.sh
-TODO-peer-correlation.md
-DESIGN.md
-race-viz/app.log
-internal/bpf/probe_bpfel.o
-internal/bpf/probe_bpfel.go
-race-calibrate
