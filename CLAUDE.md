@@ -19,13 +19,13 @@ The system is split into two binaries with distinct responsibilities:
 
 ```bash
 make generate       # Compile eBPF C (probe.c) → bytecode; requires clang + linux-headers
-make build          # generate + go build
+make build          # generate + go build (both race-monitor and race-calibrate)
 make build-quick    # Go build only (skips eBPF compilation, uses pre-generated .o)
-make install        # build + install to ~/bin
+make install        # build + install to ~/bin + sudo setcap (sets BPF capabilities)
 make check          # fmt + vet + test
 ```
 
-eBPF bytecode is pre-compiled and committed (`internal/bpf/probe_bpfel.o`). Only run `make generate` when changing `internal/bpf/probe.c`.
+eBPF bytecode is generated but gitignored (`internal/bpf/probe_bpfel.o`, `probe_bpfel.go`). Run `make generate` after changing `internal/bpf/probe.c` or after a fresh clone.
 
 ## Test Commands
 
@@ -47,7 +47,8 @@ go test ./internal/race/ -run TestCoordinatorRouting -v
 ### Calibration (one-time per binary)
 
 ```bash
-# Requires CAP_BPF + CAP_PERFMON + CAP_SYS_RESOURCE (or root)
+# Requires CAP_BPF + CAP_PERFMON + CAP_SYS_RESOURCE + CAP_SYS_ADMIN (or root)
+# make install sets these capabilities automatically via setcap
 # Requires at least one active download for peer_connection discovery
 race-calibrate --pid $(pgrep -f 'qbittorrent-nox$')
 ```
@@ -88,8 +89,8 @@ Data flows strictly downward through five layers:
 ```
 eBPF Probes (kernel C, internal/bpf/probe.c)
   ↓ perf buffer (256 KB/CPU)
-Capture Layer (internal/capture/ebpf.go) — ELF symbol resolution, uprobe attachment, event decoding
-  ↓ two channels: events (slim 24B) + calibrations (4KB struct dumps)
+Capture Layer (internal/capture/ebpf.go) — ELF symbol resolution, uprobe attachment, event decoding, BPF config
+  ↓ CaptureHandle: two channels (events + dumps) + BPF map handles
 Coordinator (internal/race/coordinator.go) — single-writer event router, all state mutations here
   ↓ per-race goroutines
 Trackers (internal/race/tracker.go) — per-race event processing, SQLite batch writes
@@ -120,11 +121,15 @@ Dashboard (race-viz/) — Python Flask + Plotly.js
 - `EventTorrentStarted` (5) — 4KB dump: torrent struct + triggers race creation
 - `EventTorrentFinished` (6) — slim 24B: download complete
 
-**Critical constraint:** eBPF code reads only CPU registers (RDI=`this`, RSI=`piece_index` on x86_64 System V ABI). It never dereferences struct fields at hardcoded offsets. This makes probes robust across libtorrent recompiles. Struct field extraction happens in userspace via the calibration system.
+**Critical constraint:** eBPF code reads only CPU registers (RDI=`this`, RSI=`piece_index` on x86_64 System V ABI). In monitor mode, peer probes also read `torrent_ptr` and `sockaddr_in` at calibrated offsets for identity-based dedup (two `bpf_probe_read_user` calls per event). Struct field extraction for peer_id and info_hash happens in userspace via the calibration system.
 
-**BPF maps:** Two LRU hash maps (`seen_peers` max 4096, `seen_torrents` max 256) dedup struct dumps per pointer so each peer_connection/torrent emits at most one 4KB dump.
+**BPF maps:**
+- `probe_config` (array, 1 entry) — calibrated offsets (`torrent_ptr_offset`, `sockaddr_offset`) written by userspace at startup. Zero values = calibration mode (pointer-based dedup).
+- `seen_peers` (LRU hash, max 4096) — dedup key is `struct peer_key {torrent_ptr, ip, port}` in monitor mode (identity-based), or `{ptr, 0, 0}` in calibration mode (pointer-based). The `emit_peer_dump_if_new()` helper reads the config map to decide which mode to use.
+- `seen_torrents` (LRU hash, max 256) — dedup by torrent* pointer (unchanged).
+- `dump_scratch` (per-CPU array, 1 entry) — scratch space for 4KB struct dumps.
 
-**Peer discovery:** Three probes collaborate to discover all peer_connection* pointers: `incoming_have` (fires for individual HAVE messages from leechers), `incoming_piece` (fires when we receive piece data — catches peers in active transfer), and `incoming_bitfield` (fires when peers send BITFIELD at connect time — catches seeders who never send individual HAVE messages). All three share the `seen_peers` dedup map.
+**Peer discovery:** Three probes collaborate to discover all peer_connection* pointers: `incoming_have` (fires for individual HAVE messages from leechers), `incoming_piece` (fires when we receive piece data — catches peers in active transfer), and `incoming_bitfield` (fires when peers send BITFIELD at connect time — catches seeders who never send individual HAVE messages). All three call `emit_peer_dump_if_new()` which handles dedup and dump emission.
 
 ### Calibration System
 
@@ -153,7 +158,9 @@ Calibration offsets are cached at `~/.config/race-monitor/calibration.json` keye
 - `connEndpoints`: `peer_connection*` → resolved IP:port
 - `torrentMeta`: info_hash → {Name, Size, PieceCount} (cached from qBittorrent API)
 
-Event routing: `we_have` events route via `torrentPtrs` (obj_ptr is torrent*). `incoming_have` events route via `connToRace` (obj_ptr is peer_connection*). Calibration events extract struct fields and populate these routing maps.
+Event routing: `we_have` events route via `torrentPtrs` (obj_ptr is torrent*). `incoming_have` events route via `connToRace` (obj_ptr is peer_connection*). Dump events extract struct fields and populate these routing maps.
+
+**SeenCache cleanup:** On race completion, the coordinator calls `ForgetPeer()` and `ForgetTorrent()` on the `SeenCache` interface (implemented by `CaptureHandle`) to delete BPF dedup map entries for the completed race. This allows peers and torrents to be rediscovered if they appear in a future race, preventing stale pointer-based entries from blocking new dumps.
 
 ### EnrichmentAPI
 
@@ -181,11 +188,11 @@ Indexes: `idx_events_race_ts` for timeline queries, `idx_events_peer_piece` cove
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `internal/bpf/probe.c` | 310 | eBPF uprobe programs (C) — 6 probes, 6 event types |
-| `internal/bpf/probe_bpfel.go` | 167 | Auto-generated Go bindings (do not edit) |
+| `internal/bpf/probe.c` | 280 | eBPF uprobe programs (C) — 6 probes, 6 event types, identity-based dedup |
+| `internal/bpf/probe_bpfel.go` | 185 | Auto-generated Go bindings (do not edit; gitignored) |
 | `internal/bpf/gen.go` | 32 | Event type constants and `go:generate` directive |
-| `internal/capture/ebpf.go` | 374 | ELF symbol resolution, uprobe attachment, perf reader, CalibrationFlags |
-| `internal/race/coordinator.go` | 570 | Single-writer event router — all state mutations |
+| `internal/capture/ebpf.go` | 340 | ELF symbol resolution, uprobe attachment, perf reader, CaptureHandle, ProbeConfig |
+| `internal/race/coordinator.go` | 600 | Single-writer event router — all state mutations, SeenCache cleanup |
 | `internal/race/tracker.go` | 257 | Per-race event processing, batch SQLite writes, idle monitoring |
 | `internal/race/calibration.go` | 564 | Two-phase offset discovery (sockaddr, peer_id, info_hash, torrent_ptr) |
 | `internal/race/calibration_cache.go` | 81 | JSON persistence of calibrated offsets |
@@ -209,6 +216,7 @@ Indexes: `idx_events_race_ts` for timeline queries, `idx_events_peer_piece` cove
 - `golang.org/x/sys` — Linux syscalls (pidfd_open for process death detection)
 
 System requirements: Linux ≥ 5.8, `clang` (build only), qBittorrent binary with symbol table (not stripped).
+Capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`, `CAP_SYS_ADMIN` (set by `make install` via `setcap`).
 
 ## Design Decisions
 
@@ -217,3 +225,4 @@ System requirements: Linux ≥ 5.8, `clang` (build only), qBittorrent binary wit
 - **Single-writer coordinator**: One goroutine owns all state maps. No mutexes on the hot path. Tracker goroutines communicate via channels.
 - **Schema recreation over migration**: Schema v5 drops and recreates all tables on version mismatch. Race data is transient; migration complexity is not justified.
 - **Three peer discovery probes**: `incoming_have` (fires when peers send HAVE), `incoming_piece` (fires when we receive piece data), and `incoming_bitfield` (fires when peers send BITFIELD at connect time). Seeders never send individual HAVE messages — they use BITFIELD/HAVE-ALL — so `incoming_bitfield` is essential for discovering seeder connections. `incoming_piece` catches peers during active transfer. All three share the `seen_peers` dedup map.
+- **Identity-based peer dedup**: BPF `seen_peers` uses `(torrent_ptr, ip, port)` as the dedup key instead of raw `peer_connection*` pointers. This prevents cross-race event contamination when libtorrent frees a connection and reuses the address for a different torrent. A `probe_config` BPF map passes calibrated offsets from userspace so probes can read these fields. Falls back to pointer-based dedup when offsets are unknown (calibration mode).
