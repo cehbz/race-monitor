@@ -34,18 +34,45 @@ struct struct_dump_t {
 	u8  data[DUMP_READ_SIZE];
 };
 
+// probe_config carries calibrated offsets from userspace. Written once by the
+// monitor after loading BPF objects. When torrent_ptr_offset == 0, probes fall
+// back to pointer-based dedup (calibration mode).
+struct probe_config {
+	u32 torrent_ptr_offset;  // offset of torrent* within peer_connection struct
+	u32 sockaddr_offset;     // offset of sockaddr_in within peer_connection struct
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct probe_config);
+} probe_config SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u32));
 } events SEC(".maps");
 
-// seen_peers tracks peer_connection* pointers we've already emitted a
-// struct dump for. LRU eviction prevents leaks in long-running daemons.
+// peer_key identifies a peer connection by its actual identity rather than
+// its memory address. This prevents cross-race contamination when libtorrent
+// frees a peer_connection and reuses the address for a different torrent.
+struct peer_key {
+	u64 torrent_ptr;  // torrent* this peer belongs to
+	u32 ip;           // sin_addr.s_addr (raw network byte order)
+	u16 port;         // sin_port (raw network byte order)
+	u16 _pad;
+};
+
+// seen_peers tracks peer connections we've already emitted a struct dump for.
+// Key is identity-based (torrent, IP, port) when calibrated offsets are
+// available, or pointer-based when in calibration mode.
+// LRU eviction prevents leaks in long-running daemons.
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
-	__type(key, u64);
+	__type(key, struct peer_key);
 	__type(value, u8);
 } seen_peers SEC(".maps");
 
@@ -67,6 +94,53 @@ struct {
 	__type(key, u64);
 	__type(value, u8);
 } seen_torrents SEC(".maps");
+
+// emit_peer_dump_if_new checks the seen_peers dedup map and emits a
+// peer_connection struct dump if this peer hasn't been seen before.
+// Returns 1 if a dump was emitted, 0 otherwise.
+//
+// When calibrated offsets are available (monitor mode), the dedup key is
+// (torrent_ptr, IP, port) — the actual peer identity. When offsets are
+// unknown (calibration mode), falls back to the raw pointer value.
+static __always_inline int emit_peer_dump_if_new(struct pt_regs *ctx, u64 ptr) {
+	struct peer_key key = {};
+	u32 cfg_key = 0;
+	struct probe_config *cfg = bpf_map_lookup_elem(&probe_config, &cfg_key);
+
+	if (cfg && cfg->torrent_ptr_offset != 0) {
+		// Monitor mode: dedup by (torrent_ptr, ip, port)
+		bpf_probe_read_user(&key.torrent_ptr, sizeof(key.torrent_ptr),
+		                    (void *)(ptr + cfg->torrent_ptr_offset));
+		bpf_probe_read_user(&key.ip, sizeof(key.ip),
+		                    (void *)(ptr + cfg->sockaddr_offset + 4));
+		bpf_probe_read_user(&key.port, sizeof(key.port),
+		                    (void *)(ptr + cfg->sockaddr_offset + 2));
+	} else {
+		// Calibration mode: offsets unknown, fall back to pointer-based dedup
+		key.torrent_ptr = ptr;
+	}
+
+	u8 *seen = bpf_map_lookup_elem(&seen_peers, &key);
+	if (seen)
+		return 0;
+
+	u8 one = 1;
+	bpf_map_update_elem(&seen_peers, &key, &one, BPF_ANY);
+
+	u32 scratch_key = 0;
+	struct struct_dump_t *dump = bpf_map_lookup_elem(&dump_scratch, &scratch_key);
+	if (!dump)
+		return 0;
+
+	dump->event_type = EVT_PEER_DUMP;
+	dump->_pad = 0;
+	dump->timestamp = bpf_ktime_get_ns();
+	dump->obj_ptr = ptr;
+
+	bpf_probe_read_user(dump->data, DUMP_READ_SIZE, (void *)ptr);
+	bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, dump, sizeof(*dump));
+	return 1;
+}
 
 // trace_we_have hooks libtorrent::torrent::we_have(piece_index_t).
 // Called once per completed+verified piece. Very low frequency (~1K/race).
@@ -112,36 +186,15 @@ int trace_we_have(struct pt_regs *ctx) {
 // Called when a peer announces it has a piece. Moderate frequency (~3K/sec peak).
 // x86_64 ABI: RDI = this (peer_connection*), RSI = piece_index.
 //
-// On first encounter of each peer_connection*, emits a struct dump for
+// On first encounter of each peer connection identity, emits a struct dump for
 // userspace to extract sockaddr_in, peer_id, and torrent_ptr from.
 SEC("uprobe/incoming_have")
 int trace_incoming_have(struct pt_regs *ctx) {
 	u64 ptr = PT_REGS_PARM1(ctx);
 
-	// Emit struct dump on first encounter of this peer_connection*
-	u8 *seen = bpf_map_lookup_elem(&seen_peers, &ptr);
-	if (!seen) {
-		u8 one = 1;
-		bpf_map_update_elem(&seen_peers, &ptr, &one, BPF_ANY);
+	// Emit struct dump on first encounter of this peer identity
+	emit_peer_dump_if_new(ctx, ptr);
 
-		u32 key = 0;
-		struct struct_dump_t *dump = bpf_map_lookup_elem(&dump_scratch, &key);
-		if (!dump)
-			goto emit_have;
-
-		dump->event_type = EVT_PEER_DUMP;
-		dump->_pad = 0;
-		dump->timestamp = bpf_ktime_get_ns();
-		dump->obj_ptr = ptr;
-
-		// Read raw struct bytes from user-space peer_connection object.
-		// bpf_probe_read_user because uprobes execute in user-space context.
-		bpf_probe_read_user(dump->data, DUMP_READ_SIZE, (void *)ptr);
-
-		bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, dump, sizeof(*dump));
-	}
-
-emit_have:;
 	// Always emit the normal incoming_have event
 	struct event_t event = {};
 	event.event_type = EVT_INCOMING_HAVE;
@@ -165,28 +218,30 @@ SEC("uprobe/incoming_piece")
 int trace_incoming_piece(struct pt_regs *ctx) {
 	u64 ptr = PT_REGS_PARM1(ctx);
 
-	// Emit struct dump on first encounter of this peer_connection*
-	u8 *seen = bpf_map_lookup_elem(&seen_peers, &ptr);
-	if (!seen) {
-		u8 one = 1;
-		bpf_map_update_elem(&seen_peers, &ptr, &one, BPF_ANY);
-
-		u32 key = 0;
-		struct struct_dump_t *dump = bpf_map_lookup_elem(&dump_scratch, &key);
-		if (!dump)
-			return 0;
-
-		dump->event_type = EVT_PEER_DUMP;
-		dump->_pad = 0;
-		dump->timestamp = bpf_ktime_get_ns();
-		dump->obj_ptr = ptr;
-
-		bpf_probe_read_user(dump->data, DUMP_READ_SIZE, (void *)ptr);
-		bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, dump, sizeof(*dump));
-	}
+	// Emit struct dump on first encounter of this peer identity
+	emit_peer_dump_if_new(ctx, ptr);
 
 	// No slim event emitted — incoming_piece is only used for peer discovery.
 	// The piece data is tracked via we_have (after verification).
+	return 0;
+}
+
+// trace_incoming_bitfield hooks libtorrent::peer_connection::incoming_bitfield().
+// Called when a peer sends a BITFIELD message at connect time, announcing all
+// pieces they already have. Seeders use BITFIELD (or HAVE-ALL) instead of
+// individual HAVE messages, so incoming_have never fires for them. This probe
+// ensures we discover every peer_connection* including seeders.
+//
+// Uses the same seen_peers dedup map as incoming_have and incoming_piece.
+// x86_64 ABI: RDI = this (peer_connection*).
+SEC("uprobe/incoming_bitfield")
+int trace_incoming_bitfield(struct pt_regs *ctx) {
+	u64 ptr = PT_REGS_PARM1(ctx);
+
+	// Emit struct dump on first encounter of this peer identity
+	emit_peer_dump_if_new(ctx, ptr);
+
+	// No slim event — bitfield is only used for peer discovery.
 	return 0;
 }
 

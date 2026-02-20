@@ -35,10 +35,10 @@ type raceState struct {
 // StateSnapshot provides a point-in-time view of coordinator state.
 // Used by tests to safely inspect state without data races via QueryState().
 type StateSnapshot struct {
-	ActiveRaces    map[string]RaceSnap
-	ConnEndpoints  int // count of resolved peer_connection* → IP:port mappings
-	TorrentPtrs    int // count of known torrent_ptr mappings
-	ConnToRace     int // count of peer_connection → race mappings
+	ActiveRaces   map[string]RaceSnap
+	ConnEndpoints int // count of resolved peer_connection* → IP:port mappings
+	TorrentPtrs   int // count of known torrent_ptr mappings
+	ConnToRace    int // count of peer_connection → race mappings
 }
 
 // RaceSnap captures a race's metadata at a point in time.
@@ -69,6 +69,14 @@ type EnrichmentAPI interface {
 
 	// FetchTorrentMeta fetches per-torrent properties (piece_count, size).
 	FetchTorrentMeta(hash string) (TorrentMeta, error)
+}
+
+// SeenCache allows the coordinator to manage BPF dedup map entries.
+// When a race completes, stale entries are removed so peers and torrents
+// can be rediscovered if they appear in a future race.
+type SeenCache interface {
+	ForgetPeer(torrentPtr uint64, endpoint netip.AddrPort) error
+	ForgetTorrent(ptr uint64) error
 }
 
 // Coordinator manages race lifecycle using eBPF events from libtorrent uprobes.
@@ -112,15 +120,23 @@ type Coordinator struct {
 
 	// torrentMeta caches metadata (name, size, piece_count) from the API.
 	torrentMeta map[string]TorrentMeta
+
+	// seenCache manages BPF dedup map entries. Nil when not available
+	// (e.g., in tests). Used to clean up seen_peers and seen_torrents
+	// entries when races complete, enabling rediscovery.
+	seenCache SeenCache
 }
 
 // NewCoordinator creates a race coordinator with pre-calibrated offsets.
+// seenCache is optional (nil in tests); when provided, BPF dedup maps are
+// cleaned up on race completion to enable peer/torrent rediscovery.
 func NewCoordinator(
 	store *storage.Store,
 	logger *slog.Logger,
 	dashboardURL string,
 	offsets CalibratedOffsets,
 	enrichAPI EnrichmentAPI,
+	seenCache SeenCache,
 ) *Coordinator {
 	return &Coordinator{
 		store:               store,
@@ -136,6 +152,7 @@ func NewCoordinator(
 		stateQueryChan:      make(chan stateQuery),
 		torrentMeta:         make(map[string]TorrentMeta),
 		enrichAPI:           enrichAPI,
+		seenCache:           seenCache,
 	}
 }
 
@@ -513,12 +530,55 @@ func (c *Coordinator) handleComplete(complete raceComplete) {
 		c.logger.Info("race tracking complete", "hash", complete.hash)
 	}
 
-	// Clean up torrentPtrs and knownTorrentPtrs for the completed race
+	// Collect torrent pointers for this race (needed for BPF cleanup)
+	var raceTorrentPtrs []uint64
 	for ptr, h := range c.torrentPtrs {
 		if h == complete.hash {
-			delete(c.torrentPtrs, ptr)
-			delete(c.knownTorrentPtrs, ptr)
+			raceTorrentPtrs = append(raceTorrentPtrs, ptr)
 		}
+	}
+
+	// Clean up BPF seen_peers entries for connections in this race.
+	// Reconstruct the BPF key from (torrent_ptr, endpoint) so the peer
+	// can be rediscovered if it appears in a future race.
+	if c.seenCache != nil && len(raceTorrentPtrs) > 0 {
+		var forgetCount int
+		for ptr, h := range c.connToRace {
+			if h != complete.hash {
+				continue
+			}
+			endpoint, hasEndpoint := c.connEndpoints[ptr]
+			if !hasEndpoint {
+				continue
+			}
+			// Try each torrent pointer — normally there's only one per race
+			for _, tPtr := range raceTorrentPtrs {
+				if err := c.seenCache.ForgetPeer(tPtr, endpoint); err == nil {
+					forgetCount++
+				}
+			}
+		}
+
+		// Clean up BPF seen_torrents entries
+		for _, tPtr := range raceTorrentPtrs {
+			if err := c.seenCache.ForgetTorrent(tPtr); err != nil {
+				c.logger.Debug("failed to forget torrent in BPF map",
+					"ptr", fmt.Sprintf("0x%x", tPtr), "error", err)
+			}
+		}
+
+		if forgetCount > 0 {
+			c.logger.Debug("cleaned up BPF dedup entries",
+				"hash", complete.hash,
+				"peers_forgotten", forgetCount,
+				"torrents_forgotten", len(raceTorrentPtrs))
+		}
+	}
+
+	// Clean up torrentPtrs and knownTorrentPtrs for the completed race
+	for _, ptr := range raceTorrentPtrs {
+		delete(c.torrentPtrs, ptr)
+		delete(c.knownTorrentPtrs, ptr)
 	}
 
 	// Clean up connToRace and connEndpoints for this race

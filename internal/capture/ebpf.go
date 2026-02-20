@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
@@ -24,11 +26,12 @@ import (
 // symbolPrefixes maps eBPF program names to their C++ mangled symbol prefixes.
 // We search the binary's ELF symbol table for a match (ignoring .cold variants).
 var symbolPrefixes = map[string]string{
-	"we_have":          "_ZN10libtorrent7torrent7we_haveE",
-	"incoming_have":    "_ZN10libtorrent15peer_connection13incoming_haveE",
-	"incoming_piece":   "_ZN10libtorrent15peer_connection14incoming_pieceE",
-	"torrent_start":    "_ZN10libtorrent7torrent5startE",
-	"torrent_finished": "_ZN10libtorrent7torrent8finishedE",
+	"we_have":           "_ZN10libtorrent7torrent7we_haveE",
+	"incoming_have":     "_ZN10libtorrent15peer_connection13incoming_haveE",
+	"incoming_piece":    "_ZN10libtorrent15peer_connection14incoming_pieceE",
+	"incoming_bitfield": "_ZN10libtorrent15peer_connection17incoming_bitfieldE",
+	"torrent_start":     "_ZN10libtorrent7torrent5startE",
+	"torrent_finished":  "_ZN10libtorrent7torrent8finishedE",
 }
 
 // findSymbol searches an ELF binary's symbol table for a symbol with the given prefix,
@@ -66,14 +69,64 @@ func HasTorrentStartSymbol(binPath string) bool {
 	return err == nil
 }
 
-// Capture attaches eBPF uprobes to the qBittorrent binary and returns
-// channels for slim events and struct dump events. Struct dumps carry 4KB
-// memory snapshots from peer_connection and torrent objects, used for
-// extracting peer identity (IP, port, peer_id) and torrent identity (info_hash).
+// ProbeConfig holds calibrated offsets to pass to BPF programs for
+// identity-based peer deduplication. When nil, BPF falls back to
+// pointer-based dedup (calibration mode).
+type ProbeConfig struct {
+	TorrentPtrOffset uint32 // offset of torrent* within peer_connection struct
+	SockaddrOffset   uint32 // offset of sockaddr_in within peer_connection struct
+}
+
+// CaptureHandle wraps the event channels and BPF map handles returned by Capture.
+type CaptureHandle struct {
+	Events       <-chan bpf.Event
+	Dumps        <-chan bpf.DumpEvent
+	seenPeers    *ebpf.Map
+	seenTorrents *ebpf.Map
+}
+
+// ForgetPeer deletes a peer identity from the BPF seen_peers dedup map,
+// allowing the peer to be rediscovered if it appears in a future race.
+func (h *CaptureHandle) ForgetPeer(torrentPtr uint64, endpoint netip.AddrPort) error {
+	if h.seenPeers == nil {
+		return nil
+	}
+	// Build key matching BPF struct peer_key layout (16 bytes):
+	//   u64 torrent_ptr (native LE)
+	//   u32 ip          (raw sin_addr bytes, network byte order)
+	//   u16 port        (raw sin_port bytes, network byte order)
+	//   u16 _pad        (zero)
+	var key [16]byte
+	binary.LittleEndian.PutUint64(key[0:], torrentPtr)
+	ip4 := endpoint.Addr().As4()
+	copy(key[8:12], ip4[:])
+	binary.BigEndian.PutUint16(key[12:14], endpoint.Port())
+	// key[14:16] already zero (padding)
+	return h.seenPeers.Delete(key[:])
+}
+
+// ForgetTorrent deletes a torrent pointer from the BPF seen_torrents dedup map,
+// allowing the torrent to emit a new struct dump if it restarts.
+func (h *CaptureHandle) ForgetTorrent(ptr uint64) error {
+	if h.seenTorrents == nil {
+		return nil
+	}
+	return h.seenTorrents.Delete(ptr)
+}
+
+// Capture attaches eBPF uprobes to the qBittorrent binary and returns a
+// CaptureHandle with channels for slim events and struct dump events.
+// Struct dumps carry 4KB memory snapshots from peer_connection and torrent
+// objects, used for extracting peer identity (IP, port, peer_id) and torrent
+// identity (info_hash).
 //
 // If pid > 0, probes fire only for that process. If pid == 0, probes fire
 // for all processes executing the binary.
-func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) (<-chan bpf.Event, <-chan bpf.DumpEvent, error) {
+//
+// If cfg is non-nil, calibrated offsets are written to the BPF config map,
+// enabling identity-based peer deduplication. If nil, BPF uses pointer-based
+// dedup (calibration mode).
+func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, cfg *ProbeConfig) (*CaptureHandle, error) {
 	// Log diagnostic info for permission debugging
 	if paranoid, err := os.ReadFile("/proc/sys/kernel/perf_event_paranoid"); err == nil {
 		logger.Debug("kernel security", "perf_event_paranoid", strings.TrimSpace(string(paranoid)), "uid", os.Getuid())
@@ -87,24 +140,29 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) 
 	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
-		return nil, nil, fmt.Errorf("removing memlock rlimit (needs CAP_SYS_RESOURCE): %w", err)
+		return nil, fmt.Errorf("removing memlock rlimit (needs CAP_SYS_RESOURCE): %w", err)
 	}
 
 	// Resolve mangled C++ symbols (required)
 	weHaveSym, err := findSymbol(binPath, symbolPrefixes["we_have"])
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolving we_have symbol: %w", err)
+		return nil, fmt.Errorf("resolving we_have symbol: %w", err)
 	}
 	incomingHaveSym, err := findSymbol(binPath, symbolPrefixes["incoming_have"])
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolving incoming_have symbol: %w", err)
+		return nil, fmt.Errorf("resolving incoming_have symbol: %w", err)
 	}
 
-	// Resolve peer discovery symbol (optional — improves peer discovery in seeder-heavy swarms)
+	// Resolve peer discovery symbols (optional — improve peer discovery)
 	incomingPieceSym, err := findSymbol(binPath, symbolPrefixes["incoming_piece"])
 	if err != nil {
 		logger.Warn("peer discovery probe: incoming_piece() not found, peer discovery relies on incoming_have only", "error", err)
 		incomingPieceSym = ""
+	}
+	incomingBitfieldSym, err := findSymbol(binPath, symbolPrefixes["incoming_bitfield"])
+	if err != nil {
+		logger.Warn("peer discovery probe: incoming_bitfield() not found, seeders using BITFIELD may not be discovered", "error", err)
+		incomingBitfieldSym = ""
 	}
 
 	// Resolve lifecycle symbols (optional — degrade gracefully if absent)
@@ -123,20 +181,43 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) 
 		"we_have", weHaveSym,
 		"incoming_have", incomingHaveSym,
 		"incoming_piece", incomingPieceSym,
+		"incoming_bitfield", incomingBitfieldSym,
 		"torrent_start", torrentStartSym,
 		"torrent_finished", torrentFinishedSym)
 
 	// Load eBPF programs
 	objs := bpf.ProbeObjects{}
 	if err := bpf.LoadProbeObjects(&objs, nil); err != nil {
-		return nil, nil, fmt.Errorf("loading eBPF objects (if 'permission denied': check kernel.perf_event_paranoid <= 2 and CAP_BPF capability): %w", err)
+		return nil, fmt.Errorf("loading eBPF objects (if 'permission denied': check kernel.perf_event_paranoid <= 2 and CAP_BPF capability): %w", err)
+	}
+
+	// Write calibrated offsets to the BPF config map (monitor mode).
+	// Default zero values mean calibration mode (pointer-based dedup).
+	if cfg != nil {
+		// probeConfigValue matches BPF struct probe_config: two u32 fields.
+		type probeConfigValue struct {
+			TorrentPtrOffset uint32
+			SockaddrOffset   uint32
+		}
+		cfgVal := probeConfigValue{
+			TorrentPtrOffset: cfg.TorrentPtrOffset,
+			SockaddrOffset:   cfg.SockaddrOffset,
+		}
+		cfgKey := uint32(0)
+		if err := objs.ProbeConfig.Update(cfgKey, cfgVal, ebpf.UpdateAny); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("writing probe_config map: %w", err)
+		}
+		logger.Info("BPF probe_config written",
+			"torrent_ptr_offset", cfg.TorrentPtrOffset,
+			"sockaddr_offset", cfg.SockaddrOffset)
 	}
 
 	// Open the target binary for uprobe attachment
 	ex, err := link.OpenExecutable(binPath)
 	if err != nil {
 		objs.Close()
-		return nil, nil, fmt.Errorf("opening executable %s: %w", binPath, err)
+		return nil, fmt.Errorf("opening executable %s: %w", binPath, err)
 	}
 
 	// Attach uprobes (optionally filtered to a single PID)
@@ -157,25 +238,32 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) 
 	upWeHave, err := ex.Uprobe(weHaveSym, objs.TraceWeHave, uprobeOpts)
 	if err != nil {
 		closeAll()
-		return nil, nil, fmt.Errorf("attaching uprobe to %s: %w", weHaveSym, err)
+		return nil, fmt.Errorf("attaching uprobe to %s: %w", weHaveSym, err)
 	}
 	closers = append(closers, func() { upWeHave.Close() })
 
 	upIncomingHave, err := ex.Uprobe(incomingHaveSym, objs.TraceIncomingHave, uprobeOpts)
 	if err != nil {
 		closeAll()
-		return nil, nil, fmt.Errorf("attaching uprobe to %s: %w", incomingHaveSym, err)
+		return nil, fmt.Errorf("attaching uprobe to %s: %w", incomingHaveSym, err)
 	}
 	closers = append(closers, func() { upIncomingHave.Close() })
 
-	// Attach optional peer discovery probe (incoming_piece fires during
-	// active download even when peers are seeders who never send HAVE messages)
+	// Attach optional peer discovery probes
 	if incomingPieceSym != "" {
 		upIncomingPiece, err := ex.Uprobe(incomingPieceSym, objs.TraceIncomingPiece, uprobeOpts)
 		if err != nil {
 			logger.Warn("failed to attach incoming_piece uprobe (non-fatal)", "error", err)
 		} else {
 			closers = append(closers, func() { upIncomingPiece.Close() })
+		}
+	}
+	if incomingBitfieldSym != "" {
+		upIncomingBitfield, err := ex.Uprobe(incomingBitfieldSym, objs.TraceIncomingBitfield, uprobeOpts)
+		if err != nil {
+			logger.Warn("failed to attach incoming_bitfield uprobe (non-fatal)", "error", err)
+		} else {
+			closers = append(closers, func() { upIncomingBitfield.Close() })
 		}
 	}
 
@@ -209,7 +297,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) 
 	rd, err := perf.NewReader(objs.Events, 256*1024)
 	if err != nil {
 		closeAll()
-		return nil, nil, fmt.Errorf("creating perf reader: %w", err)
+		return nil, fmt.Errorf("creating perf reader: %w", err)
 	}
 
 	eventChan := make(chan bpf.Event, 10000)
@@ -323,5 +411,10 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int) 
 		rd.Close()
 	}()
 
-	return eventChan, dumpChan, nil
+	return &CaptureHandle{
+		Events:       eventChan,
+		Dumps:        dumpChan,
+		seenPeers:    objs.SeenPeers,
+		seenTorrents: objs.SeenTorrents,
+	}, nil
 }

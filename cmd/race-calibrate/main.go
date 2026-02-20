@@ -143,11 +143,14 @@ func run() error {
 		cancel()
 	}()
 
-	// Start eBPF capture
-	events, dumps, err := capture.Capture(ctx, logger, *binary, *pid)
+	// Start eBPF capture (nil config = calibration mode with pointer-based dedup)
+	handle, err := capture.Capture(ctx, logger, *binary, *pid, nil)
 	if err != nil {
 		return fmt.Errorf("starting eBPF capture: %w", err)
 	}
+
+	events := handle.Events
+	dumps := handle.Dumps
 
 	// Drain events channel (we don't process piece events during calibration)
 	go func() {
@@ -165,7 +168,7 @@ func run() error {
 
 	// Known torrent pointers (from torrent::start events)
 	torrentPtrs := make(map[uint64]string)      // ptr → info_hash
-	knownTorrentPtrSet := make(map[uint64]bool)  // set of known ptrs
+	knownTorrentPtrSet := make(map[uint64]bool) // set of known ptrs
 
 	// refreshHashes re-fetches the torrent list from the API.
 	refreshHashes := func() {
@@ -414,7 +417,7 @@ func findTorrentPtrOffset(data [4096]byte, knownPtrs map[uint64]bool) (int, bool
 // peerCache caches SyncTorrentPeers results to avoid repeated API calls.
 var (
 	peerCacheMu    sync.Mutex
-	peerCacheAddrs map[string]map[netip.AddrPort]bool // hash → set of addrs
+	peerCacheAddrs map[string]map[netip.AddrPort]bool   // hash → set of addrs
 	peerCacheIDs   map[string]map[netip.AddrPort]string // hash → addr → peer_id
 )
 

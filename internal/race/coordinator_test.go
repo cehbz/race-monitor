@@ -97,7 +97,7 @@ func TestNewCoordinator(t *testing.T) {
 	logger := testLogger()
 	offsets := testOffsets(64)
 
-	c := NewCoordinator(store, logger, "http://localhost:3000", offsets, nil)
+	c := NewCoordinator(store, logger, "http://localhost:3000", offsets, nil, nil)
 
 	if c == nil {
 		t.Fatal("expected non-nil coordinator")
@@ -132,7 +132,7 @@ func TestTorrentStartCreatesRace(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -174,7 +174,7 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -230,7 +230,7 @@ func TestWeHaveRoutesAndDrops(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -293,7 +293,7 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -356,7 +356,7 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -409,7 +409,7 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -470,7 +470,7 @@ func TestIncomingHaveDropsUnmapped(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -519,7 +519,7 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -572,7 +572,7 @@ func TestPidDeathExitsRun(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -606,7 +606,7 @@ func TestContextCancelExitsRun(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -640,7 +640,7 @@ func TestRouteEventChannelFull(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	state := &raceState{
 		eventChan:  make(chan bpf.Event, 1),
@@ -669,7 +669,7 @@ func TestMapTorrentPtr(t *testing.T) {
 	defer store.Close()
 
 	logger := testLogger()
-	c := NewCoordinator(store, logger, "", testOffsets(64), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	c.mapTorrentPtr(0x1234, "testhash")
 
@@ -690,7 +690,7 @@ func TestLifecycleStartAndComplete(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -743,7 +743,7 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -814,7 +814,7 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -865,7 +865,7 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -920,7 +920,7 @@ func TestQueryStateSnapshotConsistency(t *testing.T) {
 
 	logger := testLogger()
 	const infoHashOffset = 64
-	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil)
+	c := NewCoordinator(store, logger, "", testOffsets(infoHashOffset), nil, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

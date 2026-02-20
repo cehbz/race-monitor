@@ -1,6 +1,7 @@
 .PHONY: build install clean test test-verbose test-coverage lint deps generate
 
 BINARY := race-monitor
+CALIBRATE_BINARY := race-calibrate
 INSTALL_PATH := $(HOME)/bin
 COVERAGE_FILE := coverage.out
 
@@ -10,17 +11,25 @@ generate:
 
 build: generate
 	go build -o $(BINARY) ./cmd/race-monitor
+	go build -o $(CALIBRATE_BINARY) ./cmd/race-calibrate
 
 # Build without regenerating eBPF (use pre-generated files)
 build-quick:
 	go build -o $(BINARY) ./cmd/race-monitor
+	go build -o $(CALIBRATE_BINARY) ./cmd/race-calibrate
+
+BPF_CAPS := cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep
+SETCAP := $(shell command -v setcap 2>/dev/null || echo /sbin/setcap)
 
 install: build
 	install -d $(INSTALL_PATH)
 	install $(BINARY) $(INSTALL_PATH)/
+	install $(CALIBRATE_BINARY) $(INSTALL_PATH)/
+	sudo $(SETCAP) '$(BPF_CAPS)' $(INSTALL_PATH)/$(BINARY)
+	sudo $(SETCAP) '$(BPF_CAPS)' $(INSTALL_PATH)/$(CALIBRATE_BINARY)
 
 clean:
-	rm -f $(BINARY) $(COVERAGE_FILE)
+	rm -f $(BINARY) $(CALIBRATE_BINARY) $(COVERAGE_FILE)
 
 # Run all tests
 test:
@@ -71,3 +80,4 @@ check: fmt vet test
 # Build for Linux amd64 (eBPF is Linux-only)
 build-linux:
 	GOOS=linux GOARCH=amd64 go build -o $(BINARY)-linux-amd64 ./cmd/race-monitor
+	GOOS=linux GOARCH=amd64 go build -o $(CALIBRATE_BINARY)-linux-amd64 ./cmd/race-calibrate

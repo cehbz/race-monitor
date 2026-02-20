@@ -130,12 +130,17 @@ func loadCalibratedOffsets(calibCachePath, binaryHash string) (race.CalibratedOf
 
 	if cache.InfoHashOffset == nil {
 		return race.CalibratedOffsets{}, fmt.Errorf(
-			"calibration file missing info_hash offset\n"+
+			"calibration file missing info_hash offset\n" +
 				"Run race-calibrate again to discover all offsets.")
 	}
 	if cache.TorrentPtrOffset == nil {
 		return race.CalibratedOffsets{}, fmt.Errorf(
-			"calibration file missing torrent_ptr offset\n"+
+			"calibration file missing torrent_ptr offset\n" +
+				"Run race-calibrate again to discover all offsets.")
+	}
+	if cache.SockaddrOffset <= 0 {
+		return race.CalibratedOffsets{}, fmt.Errorf(
+			"calibration file missing sockaddr_in offset\n" +
 				"Run race-calibrate again to discover all offsets.")
 	}
 
@@ -300,12 +305,16 @@ Config: ~/.config/race-monitor/config.toml
 		}
 	}
 
-	// Start eBPF capture
-	events, dumps, err := capture.Capture(ctx, logger, *binary, pid)
+	// Start eBPF capture with calibrated offsets for identity-based peer dedup
+	probeCfg := &capture.ProbeConfig{
+		TorrentPtrOffset: uint32(offsets.TorrentPtrOffset),
+		SockaddrOffset:   uint32(offsets.SockaddrOffset),
+	}
+	handle, err := capture.Capture(ctx, logger, *binary, pid, probeCfg)
 	if err != nil {
 		return fmt.Errorf("starting eBPF capture: %w", err)
 	}
 
-	coordinator := race.NewCoordinator(store, logger, dashboardURL, offsets, enrichAPI)
-	return coordinator.Run(ctx, events, dumps, pidDeathCh)
+	coordinator := race.NewCoordinator(store, logger, dashboardURL, offsets, enrichAPI, handle)
+	return coordinator.Run(ctx, handle.Events, handle.Dumps, pidDeathCh)
 }
