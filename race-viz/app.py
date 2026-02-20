@@ -312,23 +312,21 @@ def get_peers(race_id):
     # Self
     self_pieces_count = len([r for r in self_pieces if r['first_ts'] is not None])
     participants.append({
-        'ip': '',
+        'ip': '(self)',
         'port': 0,
         'client': '',
-        'peer_id': '',
         'type': 'self',
         'pieces': self_pieces_count,
         'finish_sec': our_finish_sec,
-        'beat_us': False,
     })
 
-    # Peers with HAVE data (leechers)
+    # Peers with HAVE data
     tracked_ids = set()
     for conn_id, times in peer_groups.items():
         tracked_ids.add(conn_id)
         times.sort()
         meta = conn_meta.get(conn_id, {
-            'ip': '', 'port': 0, 'client': '', 'peer_id': '',
+            'ip': '', 'port': 0, 'client': '',
         })
 
         # Classify: if they had >= 80% pieces before our first we_have, seeder
@@ -342,19 +340,13 @@ def get_peers(race_id):
             peer_elapsed, peer_pcts = build_cumulative_curve(times, piece_count)
             finish_sec = extrapolate_finish_time(peer_elapsed, peer_pcts, piece_count)
 
-        beat_us = False
-        if finish_sec is not None and our_finish_sec is not None:
-            beat_us = finish_sec < our_finish_sec
-
         participants.append({
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
             'client': meta.get('client', ''),
-            'peer_id': meta.get('peer_id', ''),
             'type': 'seeder' if is_seeder else 'leecher',
             'pieces': len(times),
             'finish_sec': round(finish_sec, 1) if finish_sec is not None else None,
-            'beat_us': beat_us,
         })
 
     # Peers without HAVE data (seeders discovered via struct dumps only)
@@ -365,22 +357,19 @@ def get_peers(race_id):
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
             'client': meta.get('client', ''),
-            'peer_id': meta.get('peer_id', ''),
             'type': 'seeder',
             'pieces': 0,
             'finish_sec': 0.0,
-            'beat_us': True,
         })
 
-    # Sort: self first, then seeders (finish=0), then by finish_sec asc, unknown last
+    # Sort: seeders first (finish=0, by pieces desc), then all others
+    # (including self) by finish_sec ascending, unknown last
     def sort_key(p):
-        if p['type'] == 'self':
-            return (0, 0)
-        if p['finish_sec'] is not None and p['finish_sec'] == 0:
-            return (1, -p['pieces'])  # seeders: more pieces first
+        if p['type'] == 'seeder' and p['finish_sec'] == 0:
+            return (0, -p['pieces'])
         if p['finish_sec'] is not None:
-            return (2, p['finish_sec'])
-        return (3, 0)  # unknown finish
+            return (1, p['finish_sec'])
+        return (2, 0)
 
     participants.sort(key=sort_key)
 

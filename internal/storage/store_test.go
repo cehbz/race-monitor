@@ -292,4 +292,3 @@ func TestInsertPacketEvents(t *testing.T) {
 		}
 	})
 }
-

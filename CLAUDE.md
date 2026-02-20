@@ -101,42 +101,43 @@ Dashboard (race-viz/) — Python Flask + Plotly.js
 
 ### eBPF Probes and Event Types
 
-`probe.c` attaches **5 uprobes** to mangled C++ symbols in qBittorrent's libtorrent:
+`probe.c` attaches **6 uprobes** to mangled C++ symbols in qBittorrent's libtorrent:
 
 | Probe | Symbol | Fires when | Event type |
 |-------|--------|-----------|------------|
-| `trace_we_have` | `torrent::we_have()` | We complete+verify a piece | Slim `EventWeHave` (1) + calibration `EventTorrentCalibration` (4) on first encounter |
-| `trace_incoming_have` | `peer_connection::incoming_have()` | Peer announces a piece via HAVE message | Slim `EventIncomingHave` (2) + calibration `EventCalibration` (3) on first encounter |
-| `trace_incoming_piece` | `peer_connection::incoming_piece()` | We receive a piece fragment from a peer | Calibration `EventCalibration` (3) only — no slim event |
-| `trace_torrent_start` | `torrent::start()` | Torrent transitions to started state | Calibration `EventTorrentStarted` (5) with struct dump |
+| `trace_we_have` | `torrent::we_have()` | We complete+verify a piece | Slim `EventWeHave` (1) + `EventTorrentDump` (4) on first encounter |
+| `trace_incoming_have` | `peer_connection::incoming_have()` | Peer announces a piece via HAVE message | Slim `EventIncomingHave` (2) + `EventPeerDump` (3) on first encounter |
+| `trace_incoming_piece` | `peer_connection::incoming_piece()` | We receive a piece fragment from a peer | `EventPeerDump` (3) only — no slim event |
+| `trace_incoming_bitfield` | `peer_connection::incoming_bitfield()` | Peer sends BITFIELD at connect time | `EventPeerDump` (3) only — no slim event |
+| `trace_torrent_start` | `torrent::start()` | Torrent transitions to started state | `EventTorrentStarted` (5) with struct dump |
 | `trace_torrent_finished` | `torrent::finished()` | All pieces downloaded and verified | Slim `EventTorrentFinished` (6) |
 
 **6 event types** (defined in `probe.c` and `internal/bpf/gen.go`):
 - `EventWeHave` (1) — slim 24B: piece verified by us
 - `EventIncomingHave` (2) — slim 24B: peer announced piece
-- `EventCalibration` (3) — 4KB dump: peer_connection struct (from `incoming_have`/`incoming_piece`)
-- `EventTorrentCalibration` (4) — 4KB dump: torrent struct (from `we_have` first encounter)
+- `EventPeerDump` (3) — 4KB dump: peer_connection struct (from `incoming_have`/`incoming_piece`/`incoming_bitfield`)
+- `EventTorrentDump` (4) — 4KB dump: torrent struct (from `we_have` first encounter)
 - `EventTorrentStarted` (5) — 4KB dump: torrent struct + triggers race creation
 - `EventTorrentFinished` (6) — slim 24B: download complete
 
 **Critical constraint:** eBPF code reads only CPU registers (RDI=`this`, RSI=`piece_index` on x86_64 System V ABI). It never dereferences struct fields at hardcoded offsets. This makes probes robust across libtorrent recompiles. Struct field extraction happens in userspace via the calibration system.
 
-**BPF map gating:** Two array maps (`peer_cal_needed`, `torrent_cal_needed`) control whether calibration dumps are emitted. Set to 0 by `race-calibrate` after offsets are locked; set to 1 by `race-monitor` (always needs dumps for peer discovery). Two LRU hash maps (`seen_peers` max 4096, `seen_torrents` max 256) dedup calibration dumps per pointer.
+**BPF maps:** Two LRU hash maps (`seen_peers` max 4096, `seen_torrents` max 256) dedup struct dumps per pointer so each peer_connection/torrent emits at most one 4KB dump.
 
-**Known limitation:** `incoming_have` only fires when peers send individual HAVE messages. Seeders announce all pieces at once via BITFIELD/HAVE-ALL at connect time, so `incoming_have` never fires for seeder connections. Peer progress tracking only works for leecher peers. The `incoming_piece` probe was added specifically to ensure peer_connection discovery works in seeder-heavy swarms (it fires when we receive piece data from any peer).
+**Peer discovery:** Three probes collaborate to discover all peer_connection* pointers: `incoming_have` (fires for individual HAVE messages from leechers), `incoming_piece` (fires when we receive piece data — catches peers in active transfer), and `incoming_bitfield` (fires when peers send BITFIELD at connect time — catches seeders who never send individual HAVE messages). All three share the `seen_peers` dedup map.
 
 ### Calibration System
 
 Two separate calibration paths discover 4 offsets total:
 
 **Torrent struct calibration** (info_hash + torrent_ptr):
-- `EventTorrentStarted`/`EventTorrentCalibration` carry 4KB torrent struct dumps
+- `EventTorrentStarted`/`EventTorrentDump` carry 4KB torrent struct dumps
 - Userspace scans for 20-byte sequences matching known info_hashes from the API
 - Voting system: each matching offset gets a vote; locks after ≥2 matches with same offset
 - torrent_ptr offset discovered by scanning peer_connection dumps for known torrent* pointers
 
 **Peer connection struct calibration** (sockaddr_in + peer_id):
-- `EventCalibration` carries 4KB peer_connection struct dumps (from `incoming_have`/`incoming_piece`)
+- `EventPeerDump` carries 4KB peer_connection struct dumps (from `incoming_have`/`incoming_piece`/`incoming_bitfield`)
 - Phase 1: Scans dump for `sockaddr_in` patterns (AF_INET=2, non-zero port, valid IP) matching known peers from the qBittorrent API. Votes on offset; locks after ≥2 matches.
 - Phase 2: After Phase 1 locks, extracts IP:port at known offset, matches to API peer data, finds 20-byte Azureus-format peer_id in dump. Locks after ≥2 matches.
 
@@ -180,7 +181,7 @@ Indexes: `idx_events_race_ts` for timeline queries, `idx_events_peer_piece` cove
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `internal/bpf/probe.c` | 276 | eBPF uprobe programs (C) — 5 probes, 6 event types |
+| `internal/bpf/probe.c` | 310 | eBPF uprobe programs (C) — 6 probes, 6 event types |
 | `internal/bpf/probe_bpfel.go` | 167 | Auto-generated Go bindings (do not edit) |
 | `internal/bpf/gen.go` | 32 | Event type constants and `go:generate` directive |
 | `internal/capture/ebpf.go` | 374 | ELF symbol resolution, uprobe attachment, perf reader, CalibrationFlags |
@@ -215,4 +216,4 @@ System requirements: Linux ≥ 5.8, `clang` (build only), qBittorrent binary wit
 - **No struct offset hardcoding**: All struct field access goes through calibrated offsets. Binary recompilation only requires re-running `race-calibrate`, not code changes.
 - **Single-writer coordinator**: One goroutine owns all state maps. No mutexes on the hot path. Tracker goroutines communicate via channels.
 - **Schema recreation over migration**: Schema v5 drops and recreates all tables on version mismatch. Race data is transient; migration complexity is not justified.
-- **Two calibration dump sources for peer_connection**: `incoming_have` (fires when peers send HAVE) and `incoming_piece` (fires when we receive piece data). The latter was added because seeders never send HAVE messages, making `incoming_have` unreliable for peer discovery in seeder-heavy swarms.
+- **Three peer discovery probes**: `incoming_have` (fires when peers send HAVE), `incoming_piece` (fires when we receive piece data), and `incoming_bitfield` (fires when peers send BITFIELD at connect time). Seeders never send individual HAVE messages — they use BITFIELD/HAVE-ALL — so `incoming_bitfield` is essential for discovering seeder connections. `incoming_piece` catches peers during active transfer. All three share the `seen_peers` dedup map.

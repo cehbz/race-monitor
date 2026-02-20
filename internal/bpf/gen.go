@@ -23,10 +23,10 @@ type DumpEvent struct {
 
 // Event type constants matching the eBPF #defines.
 const (
-	EventWeHave         uint32 = 1
-	EventIncomingHave   uint32 = 2
-	EventPeerDump       uint32 = 3 // peer_connection struct dump
-	EventTorrentDump    uint32 = 4 // torrent struct dump (from we_have first encounter)
-	EventTorrentStarted uint32 = 5 // torrent started (torrent struct dump from torrent::start)
+	EventWeHave          uint32 = 1
+	EventIncomingHave    uint32 = 2
+	EventPeerDump        uint32 = 3 // peer_connection struct dump
+	EventTorrentDump     uint32 = 4 // torrent struct dump (from we_have first encounter)
+	EventTorrentStarted  uint32 = 5 // torrent started (torrent struct dump from torrent::start)
 	EventTorrentFinished uint32 = 6 // torrent download completed (from torrent::finished)
 )

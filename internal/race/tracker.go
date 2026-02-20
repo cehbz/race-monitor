@@ -38,9 +38,9 @@ func processEvents(
 	downloadCompleteCh <-chan struct{},
 ) error {
 	const (
-		batchSize       = 100
+		batchSize               = 100
 		postCompleteIdleTimeout = 10 * time.Second
-		maxDuration     = 30 * time.Minute
+		maxDuration             = 30 * time.Minute
 	)
 
 	var (
@@ -49,12 +49,12 @@ func processEvents(
 		// selfConnID is the connection record for our own piece completions
 		selfConnID int64
 
-		have                  = make(map[int]bool)
-		loggedComplete        bool
-		downloadCompleted     bool
-		downloadCompleteSel   = downloadCompleteCh // local copy we nil after receiving
-		maxTimer              = time.NewTimer(maxDuration)
-		eventBatch            = make([]storage.Event, 0, batchSize)
+		have                = make(map[int]bool)
+		loggedComplete      bool
+		downloadCompleted   bool
+		downloadCompleteSel = downloadCompleteCh // local copy we nil after receiving
+		maxTimer            = time.NewTimer(maxDuration)
+		eventBatch          = make([]storage.Event, 0, batchSize)
 
 		totalEvents   uint64
 		weHaveCount   uint64
@@ -65,8 +65,8 @@ func processEvents(
 
 		// Post-completion idle tracking: lastEventTime[connPtr] = timestamp
 		lastEventTime = make(map[uint64]int64)
-		idleTimer     *time.Timer                     // initialized after download completes
-		idleTimerCh   <-chan time.Time                 // nil until idleTimer is created (nil channels block forever in select)
+		idleTimer     *time.Timer      // initialized after download completes
+		idleTimerCh   <-chan time.Time // nil until idleTimer is created (nil channels block forever in select)
 	)
 
 	defer maxTimer.Stop()

@@ -456,7 +456,8 @@
 
             const seeders = participants.filter(p => p.type === 'seeder').length;
             const leechers = participants.filter(p => p.type === 'leecher').length;
-            const beatUs = participants.filter(p => p.beat_us && p.type !== 'self').length;
+            const selfIdx = participants.findIndex(p => p.type === 'self');
+            const ourPlace = selfIdx >= 0 ? selfIdx + 1 : null;
 
             let html = `
                 <div class="analysis-stats">
@@ -473,8 +474,8 @@
                         <div class="stat-value" style="color: #79c0ff">${leechers}</div>
                     </div>
                     <div class="stat-mini">
-                        <div class="stat-label">Beat Us</div>
-                        <div class="stat-value" style="color: #d29922">${beatUs}</div>
+                        <div class="stat-label">Our Place</div>
+                        <div class="stat-value">${ourPlace != null ? '#' + ourPlace : '\u2014'}</div>
                     </div>
                     <div class="stat-mini">
                         <div class="stat-label">Our Finish</div>
@@ -491,10 +492,8 @@
                             <th>IP</th>
                             <th class="num">Port</th>
                             <th>Client</th>
-                            <th>Type</th>
                             <th class="num">Pieces</th>
                             <th class="num">Finish Time</th>
-                            <th>vs Us</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -504,37 +503,21 @@
                 const isSelf = p.type === 'self';
                 const isSeeder = p.type === 'seeder';
                 const rowClass = isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : '');
-                const ip = isSelf ? '(self)' : (p.ip || '\u2014');
-                const port = isSelf ? '\u2014' : (p.port || '\u2014');
-                const client = isSelf ? '\u2014' : (p.client || '\u2014');
-
-                let typeBadge;
-                if (isSelf) typeBadge = '<span class="badge self">Self</span>';
-                else if (isSeeder) typeBadge = '<span class="badge seeder">Seeder</span>';
-                else typeBadge = '<span class="badge leecher">Leecher</span>';
 
                 let finishStr;
-                if (p.finish_sec === 0 && isSeeder) finishStr = '\u2014';
+                if (isSeeder && (p.finish_sec === 0 || p.finish_sec == null))
+                    finishStr = '<span style="color: #3fb950">seeder</span>';
                 else if (p.finish_sec != null) finishStr = formatDuration(p.finish_sec);
                 else finishStr = '\u2014';
-
-                let vsUs = '\u2014';
-                if (isSelf) vsUs = '';
-                else if (isSeeder) vsUs = '';
-                else if (p.beat_us) vsUs = '<span class="beat-us">\u2713 faster</span>';
-                else if (p.finish_sec != null && data.our_finish_sec != null)
-                    vsUs = '<span style="color: #8b949e">slower</span>';
 
                 html += `
                     <tr class="${rowClass}">
                         <td class="num">${idx + 1}</td>
-                        <td><code>${ip}</code></td>
-                        <td class="num">${port}</td>
-                        <td>${client}</td>
-                        <td>${typeBadge}</td>
+                        <td><code>${p.ip || '\u2014'}</code></td>
+                        <td class="num">${p.port || '\u2014'}</td>
+                        <td>${p.client || '\u2014'}</td>
                         <td class="num">${p.pieces}</td>
                         <td class="num">${finishStr}</td>
-                        <td>${vsUs}</td>
                     </tr>
                 `;
             });

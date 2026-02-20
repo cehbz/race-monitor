@@ -361,4 +361,3 @@ func TestFinalize(t *testing.T) {
 		t.Error("expected race to have CompletedAt set")
 	}
 }
-
