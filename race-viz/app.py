@@ -328,7 +328,7 @@ def get_peers(race_id):
         'client': '',
         'type': 'self',
         'pieces': self_pieces_count,
-        'ahead': 0,
+        'ahead': piece_count // 2,
         'finish_sec': our_finish_sec,
     })
 
