@@ -299,12 +299,23 @@ def get_peers(race_id):
         elif our_elapsed:
             our_finish_sec = round(our_elapsed[-1], 1)
 
+    # Build self piece timestamp map: piece_index → first_ts (raw ns)
+    self_piece_ts = {}
+    for r in self_pieces:
+        if r['first_ts'] is not None:
+            self_piece_ts[r['piece_index']] = r['first_ts']
+
     # --- Group peer pieces by connection_id ---
+    # Store both elapsed time and raw ts + piece_index for ahead calculation
     peer_groups = defaultdict(list)
+    peer_raw = defaultdict(list)  # conn_id → [(piece_index, raw_ts), ...]
     for r in peer_pieces:
         if r['first_ts'] is not None:
             peer_groups[r['connection_id']].append(
                 (r['first_ts'] - epoch_ns) / _NS_PER_SEC
+            )
+            peer_raw[r['connection_id']].append(
+                (r['piece_index'], r['first_ts'])
             )
 
     participants = []
@@ -317,6 +328,7 @@ def get_peers(race_id):
         'client': '',
         'type': 'self',
         'pieces': self_pieces_count,
+        'ahead': 0,
         'finish_sec': our_finish_sec,
     })
 
@@ -340,12 +352,20 @@ def get_peers(race_id):
             peer_elapsed, peer_pieces = build_cumulative_curve(times, piece_count)
             finish_sec = extrapolate_finish_time(peer_elapsed, peer_pieces, piece_count)
 
+        # Count pieces where this peer announced before we verified
+        ahead = 0
+        for pidx, pts in peer_raw[conn_id]:
+            our_ts = self_piece_ts.get(pidx)
+            if our_ts is not None and pts < our_ts:
+                ahead += 1
+
         participants.append({
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
             'client': meta.get('client', ''),
             'type': 'seeder' if is_seeder else 'leecher',
             'pieces': len(times),
+            'ahead': ahead,
             'finish_sec': round(finish_sec, 1) if finish_sec is not None else None,
         })
 
@@ -359,6 +379,7 @@ def get_peers(race_id):
             'client': meta.get('client', ''),
             'type': 'seeder',
             'pieces': 0,
+            'ahead': 0,
             'finish_sec': 0.0,
         })
 

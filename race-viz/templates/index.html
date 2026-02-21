@@ -125,7 +125,10 @@
             color: #8b949e;
             font-weight: 600;
             font-size: 12px;
+            user-select: none;
         }
+        .peer-table th.sortable { cursor: pointer; }
+        .peer-table th.sortable:hover { color: #e6edf3; }
         .peer-table td { padding: 8px; border-bottom: 1px solid #30363d; font-size: 13px; }
         .peer-table tr:last-child td { border-bottom: none; }
         .peer-table .num { text-align: right; font-variant-numeric: tabular-nums; }
@@ -462,46 +465,94 @@
                 </div>
             `;
 
-            html += `
+            let sortCol = null;
+            let sortAsc = true;
+
+            function renderTable(parts) {
+                let thtml = `
                 <table class="peer-table">
                     <thead>
                         <tr>
                             <th class="num">#</th>
-                            <th>IP</th>
-                            <th class="num">Port</th>
-                            <th>Client</th>
-                            <th class="num">Pieces</th>
-                            <th class="num">Finish Time</th>
+                            <th class="sortable" data-col="ip">IP</th>
+                            <th class="num sortable" data-col="port">Port</th>
+                            <th class="sortable" data-col="client">Client</th>
+                            <th class="num sortable" data-col="pieces">Pieces</th>
+                            <th class="num sortable" data-col="ahead">Ahead</th>
+                            <th class="num sortable" data-col="finish">Finish</th>
                         </tr>
                     </thead>
                     <tbody>
-            `;
-
-            participants.forEach((p, idx) => {
-                const isSelf = p.type === 'self';
-                const isSeeder = p.type === 'seeder';
-                const rowClass = isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : '');
-
-                let finishStr;
-                if (isSeeder && (p.finish_sec === 0 || p.finish_sec == null))
-                    finishStr = '<span style="color: #3fb950">seeder</span>';
-                else if (p.finish_sec != null) finishStr = formatDuration(p.finish_sec);
-                else finishStr = '\u2014';
-
-                html += `
-                    <tr class="${rowClass}">
-                        <td class="num">${idx + 1}</td>
-                        <td><code>${p.ip || '\u2014'}</code></td>
-                        <td class="num">${p.port || '\u2014'}</td>
-                        <td>${p.client || '\u2014'}</td>
-                        <td class="num">${p.pieces}</td>
-                        <td class="num">${finishStr}</td>
-                    </tr>
                 `;
-            });
 
-            html += '</tbody></table>';
-            container.innerHTML = html;
+                parts.forEach((p, idx) => {
+                    const isSelf = p.type === 'self';
+                    const isSeeder = p.type === 'seeder';
+                    const rowClass = isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : '');
+
+                    let finishStr;
+                    if (isSeeder && (p.finish_sec === 0 || p.finish_sec == null))
+                        finishStr = '<span style="color: #3fb950">seeder</span>';
+                    else if (p.finish_sec != null) finishStr = formatDuration(p.finish_sec);
+                    else finishStr = '\u2014';
+
+                    const aheadStr = (isSelf || isSeeder) ? '\u2014' : p.ahead;
+
+                    thtml += `
+                        <tr class="${rowClass}">
+                            <td class="num">${idx + 1}</td>
+                            <td><code>${p.ip || '\u2014'}</code></td>
+                            <td class="num">${p.port || '\u2014'}</td>
+                            <td>${p.client || '\u2014'}</td>
+                            <td class="num">${p.pieces}</td>
+                            <td class="num">${aheadStr}</td>
+                            <td class="num">${finishStr}</td>
+                        </tr>
+                    `;
+                });
+
+                thtml += '</tbody></table>';
+                return thtml;
+            }
+
+            function sortAndRender() {
+                let sorted = participants;
+                if (sortCol) {
+                    const dir = sortAsc ? 1 : -1;
+                    sorted = [...participants].sort((a, b) => {
+                        let va, vb;
+                        switch (sortCol) {
+                            case 'ip': va = a.ip || ''; vb = b.ip || ''; return dir * va.localeCompare(vb);
+                            case 'client': va = a.client || ''; vb = b.client || ''; return dir * va.localeCompare(vb);
+                            case 'port': return dir * ((a.port || 0) - (b.port || 0));
+                            case 'pieces': return dir * (a.pieces - b.pieces);
+                            case 'ahead': return dir * ((a.ahead || 0) - (b.ahead || 0));
+                            case 'finish':
+                                va = a.finish_sec != null ? a.finish_sec : Infinity;
+                                vb = b.finish_sec != null ? b.finish_sec : Infinity;
+                                return dir * (va - vb);
+                            default: return 0;
+                        }
+                    });
+                }
+                container.innerHTML = html + renderTable(sorted);
+            }
+
+            sortAndRender();
+
+            // Event delegation for column sorting
+            container.addEventListener('click', (e) => {
+                const th = e.target.closest('th.sortable');
+                if (!th) return;
+                const col = th.dataset.col;
+                if (sortCol === col) {
+                    sortAsc = !sortAsc;
+                } else {
+                    sortCol = col;
+                    sortAsc = col === 'ahead' || col === 'pieces' ? false : true;
+                }
+                sortAndRender();
+            });
         }
 
         // --- Stats ---
