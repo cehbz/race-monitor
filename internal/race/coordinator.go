@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/cehbz/race-monitor/internal/bpf"
@@ -431,6 +433,8 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		return
 	}
 
+	c.notifyDashboard(raceID)
+
 	downloadCompleteCh := make(chan struct{})
 	raceCtx, cancel := context.WithCancel(ctx)
 	state := &raceState{
@@ -447,6 +451,23 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, eventChan, completeCh)
 		c.completeChan <- raceComplete{hash: hash, err: err}
 	}(infoHash, raceID, state.eventChan, downloadCompleteCh)
+}
+
+// notifyDashboard sends a fire-and-forget POST to the dashboard SSE endpoint.
+func (c *Coordinator) notifyDashboard(raceID int64) {
+	if c.dashboardURL == "" {
+		return
+	}
+	go func() {
+		url := c.dashboardURL + "/api/notify"
+		body := fmt.Sprintf(`{"race_id": %d}`, raceID)
+		resp, err := http.Post(url, "application/json", strings.NewReader(body))
+		if err != nil {
+			c.logger.Debug("dashboard notify failed", "error", err)
+			return
+		}
+		resp.Body.Close()
+	}()
 }
 
 // handleEvent routes a single eBPF event.
