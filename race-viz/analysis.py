@@ -38,15 +38,15 @@ def decode_peer_id(raw):
 
 
 def build_cumulative_curve(piece_times, piece_count):
-    """Build (elapsed_secs, completion_pcts) from sorted elapsed-second floats.
+    """Build (elapsed_secs, piece_counts) from elapsed-second floats.
 
     Args:
         piece_times: List of elapsed seconds (floats) when each piece arrived.
                      Need not be sorted — will be sorted internally.
-        piece_count: Total pieces in the torrent (for percentage calculation).
+        piece_count: Total pieces in the torrent (used only for validation).
 
     Returns:
-        (elapsed_secs, completion_pcts) — parallel lists sampled at 1-second
+        (elapsed_secs, piece_counts) — parallel lists sampled at 1-second
         boundaries. Only emits a point when the cumulative count changes.
     """
     if not piece_times or piece_count <= 0:
@@ -54,7 +54,7 @@ def build_cumulative_curve(piece_times, piece_count):
 
     times = sorted(piece_times)
     elapsed_secs = []
-    completion_pcts = []
+    cumulative_pieces = []
     piece_idx = 0
     max_sec = int(times[-1]) + 1
 
@@ -62,15 +62,13 @@ def build_cumulative_curve(piece_times, piece_count):
         while piece_idx < len(times) and times[piece_idx] <= sec:
             piece_idx += 1
         if piece_idx > 0 and (
-            not elapsed_secs
-            or piece_idx != int(completion_pcts[-1] * piece_count / 100)
-            if completion_pcts
-            else True
+            not cumulative_pieces
+            or piece_idx != cumulative_pieces[-1]
         ):
             elapsed_secs.append(sec)
-            completion_pcts.append(round(100.0 * piece_idx / piece_count, 2))
+            cumulative_pieces.append(piece_idx)
 
-    return elapsed_secs, completion_pcts
+    return elapsed_secs, cumulative_pieces
 
 
 def build_piece_count_curve(sorted_times, duration):
@@ -147,30 +145,30 @@ def classify_peer(peer_curve, our_curve, piece_count, race_duration, pre_race_co
     }
 
 
-def extrapolate_finish_time(elapsed_secs, completion_pcts, piece_count):
-    """Project when a peer reaches 100% completion via linear extrapolation.
+def extrapolate_finish_time(elapsed_secs, piece_counts, piece_count):
+    """Project when a peer reaches piece_count via linear extrapolation.
 
     Uses the last N data points (up to 10) to fit a line and project forward.
 
     Args:
         elapsed_secs: List of elapsed second values (from build_cumulative_curve).
-        completion_pcts: Parallel list of completion percentages.
-        piece_count: Total pieces (unused directly but kept for interface symmetry).
+        piece_counts: Parallel list of cumulative piece counts.
+        piece_count: Total pieces in the torrent.
 
     Returns:
-        Projected elapsed seconds to reach 100%, or None if:
+        Projected elapsed seconds to reach piece_count, or None if:
         - Insufficient data (< 2 points)
         - Flat or decreasing curve (slope <= 0)
         - Already >= 95% complete (returns last elapsed_sec as actual finish)
     """
-    if not elapsed_secs or not completion_pcts:
+    if not elapsed_secs or not piece_counts:
         return None
 
-    last_pct = completion_pcts[-1]
+    last_pieces = piece_counts[-1]
     last_sec = elapsed_secs[-1]
 
     # Nearly done — use actual observed time
-    if last_pct >= 95.0:
+    if last_pieces >= piece_count * 0.95:
         return last_sec
 
     # Need at least 2 points for slope
@@ -179,7 +177,7 @@ def extrapolate_finish_time(elapsed_secs, completion_pcts, piece_count):
         return None
 
     xs = elapsed_secs[-n:]
-    ys = completion_pcts[-n:]
+    ys = piece_counts[-n:]
 
     # Simple linear regression
     x_mean = sum(xs) / n
@@ -190,6 +188,6 @@ def extrapolate_finish_time(elapsed_secs, completion_pcts, piece_count):
     if den == 0 or num <= 0:
         return None  # flat or decreasing
 
-    slope = num / den  # pct per second
-    remaining = 100.0 - last_pct
+    slope = num / den  # pieces per second
+    remaining = piece_count - last_pieces
     return round(last_sec + remaining / slope, 1)

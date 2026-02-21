@@ -78,35 +78,35 @@ class TestBuildCumulativeCurve:
     def test_basic(self):
         # 3 pieces arriving at 1.5s, 3.2s, 5.0s; piece_count=10
         times = [1.5, 3.2, 5.0]
-        secs, pcts = build_cumulative_curve(times, 10)
+        secs, counts = build_cumulative_curve(times, 10)
         assert len(secs) > 0
-        assert len(secs) == len(pcts)
-        # After second 5, should have 3/10 = 30%
-        assert pcts[-1] == 30.0
+        assert len(secs) == len(counts)
+        # After second 5, should have 3 pieces
+        assert counts[-1] == 3
 
     def test_empty(self):
-        secs, pcts = build_cumulative_curve([], 100)
+        secs, counts = build_cumulative_curve([], 100)
         assert secs == []
-        assert pcts == []
+        assert counts == []
 
     def test_zero_piece_count(self):
-        secs, pcts = build_cumulative_curve([1.0], 0)
+        secs, counts = build_cumulative_curve([1.0], 0)
         assert secs == []
-        assert pcts == []
+        assert counts == []
 
     def test_unsorted_input(self):
         # Should sort internally
         times = [5.0, 1.0, 3.0]
-        secs, pcts = build_cumulative_curve(times, 10)
-        assert pcts[-1] == 30.0
-        # Percentages should be non-decreasing
-        for i in range(1, len(pcts)):
-            assert pcts[i] >= pcts[i - 1]
+        secs, counts = build_cumulative_curve(times, 10)
+        assert counts[-1] == 3
+        # Counts should be non-decreasing
+        for i in range(1, len(counts)):
+            assert counts[i] >= counts[i - 1]
 
     def test_all_at_same_time(self):
         times = [2.0, 2.0, 2.0]
-        secs, pcts = build_cumulative_curve(times, 3)
-        assert pcts[-1] == 100.0
+        secs, counts = build_cumulative_curve(times, 3)
+        assert counts[-1] == 3
 
 
 # --- build_piece_count_curve ---
@@ -188,30 +188,30 @@ class TestClassifyPeer:
 
 class TestExtrapolateFinishTime:
     def test_nearly_done(self):
-        # 96% complete at second 50 — should return 50
+        # 96 of 100 pieces at second 50 — should return 50
         secs = [10, 20, 30, 40, 50]
-        pcts = [20.0, 40.0, 60.0, 80.0, 96.0]
-        result = extrapolate_finish_time(secs, pcts, 100)
+        counts = [20, 40, 60, 80, 96]
+        result = extrapolate_finish_time(secs, counts, 100)
         assert result == 50
 
     def test_linear_projection(self):
-        # Linear 10%/10s rate, at 50% at second 50 → project 100% at 100s
+        # Linear 10 pieces/10s, at 50 pieces at second 50 → project 100 at 100s
         secs = [10, 20, 30, 40, 50]
-        pcts = [10.0, 20.0, 30.0, 40.0, 50.0]
-        result = extrapolate_finish_time(secs, pcts, 100)
+        counts = [10, 20, 30, 40, 50]
+        result = extrapolate_finish_time(secs, counts, 100)
         assert result is not None
-        assert abs(result - 100.0) < 1.0  # ~100 seconds
+        assert abs(result - 100.0) < 1.0
 
     def test_flat_curve(self):
-        # Stuck at 30% — can't extrapolate
+        # Stuck at 30 pieces — can't extrapolate
         secs = [10, 20, 30, 40, 50]
-        pcts = [30.0, 30.0, 30.0, 30.0, 30.0]
-        result = extrapolate_finish_time(secs, pcts, 100)
+        counts = [30, 30, 30, 30, 30]
+        result = extrapolate_finish_time(secs, counts, 100)
         assert result is None
 
     def test_insufficient_data(self):
         # Only 1 point
-        result = extrapolate_finish_time([10], [20.0], 100)
+        result = extrapolate_finish_time([10], [20], 100)
         assert result is None
 
     def test_empty(self):
@@ -220,14 +220,14 @@ class TestExtrapolateFinishTime:
     def test_decreasing_curve(self):
         # Regression — shouldn't extrapolate forward
         secs = [10, 20, 30, 40, 50]
-        pcts = [50.0, 45.0, 40.0, 35.0, 30.0]
-        result = extrapolate_finish_time(secs, pcts, 100)
+        counts = [50, 45, 40, 35, 30]
+        result = extrapolate_finish_time(secs, counts, 100)
         assert result is None
 
     def test_slow_peer(self):
-        # 2%/10s rate, at 20% at 100s → project 100% at 500s
+        # 2 pieces/10s, at 20 pieces at 100s → project 100 at 500s
         secs = list(range(10, 110, 10))
-        pcts = [2.0 * i for i in range(1, 11)]  # 2, 4, ..., 20
-        result = extrapolate_finish_time(secs, pcts, 100)
+        counts = [2 * i for i in range(1, 11)]  # 2, 4, ..., 20
+        result = extrapolate_finish_time(secs, counts, 100)
         assert result is not None
         assert abs(result - 500.0) < 5.0

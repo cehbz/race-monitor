@@ -164,6 +164,7 @@
         let selectedRaceId = null;
 
         function showAllRaces() {
+            const previousId = selectedRaceId;
             document.querySelectorAll('.race-item').forEach(item => {
                 item.style.display = 'block';
                 item.classList.remove('selected');
@@ -171,6 +172,11 @@
             });
             document.getElementById('visualization').classList.remove('active');
             selectedRaceId = null;
+
+            if (previousId != null) {
+                const el = document.querySelector(`.race-item[data-race-id="${previousId}"]`);
+                if (el) el.scrollIntoView({ block: 'start' });
+            }
         }
 
         function parseTS(ts) {
@@ -190,7 +196,7 @@
             legend: { bgcolor: '#0d1117', bordercolor: '#30363d', borderwidth: 1 }
         };
 
-        const plotlyConfig = { responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: true };
+        const plotlyConfig = { responsive: true, displayModeBar: true, displaylogo: false, scrollZoom: false };
 
         const peerColors = [
             '#3fb950', '#d29922', '#f85149', '#a371f7', '#f778ba',
@@ -290,15 +296,10 @@
 
                     <div class="chart-container">
                         <div class="chart-title">
-                            Race Progress &mdash; Per-Peer Completion
-                            <span class="chart-info">Click legend entries to show/hide. Scroll to zoom.</span>
+                            Race Progress &mdash; Per-Peer Pieces
+                            <span class="chart-info">Click legend entries to show/hide.</span>
                         </div>
                         <div id="peer-progress-chart"><div class="loading">Loading peer data...</div></div>
-                    </div>
-
-                    <div class="chart-container">
-                        <div class="chart-title">Piece Completion Progress</div>
-                        <div id="progress-chart"></div>
                     </div>
 
                     <div class="chart-container">
@@ -340,29 +341,6 @@
         function renderTimelineCharts(data) {
             const { race, timeline } = data;
             const times = timeline.map(t => t.elapsed_sec);
-
-            let cumulative = 0;
-            const cumulativePieces = timeline.map(t => {
-                cumulative += (t.piece_received || 0);
-                return cumulative;
-            });
-
-            Plotly.newPlot('progress-chart', [{
-                x: times, y: cumulativePieces,
-                mode: 'lines', name: 'Pieces Completed',
-                line: { color: '#58a6ff', width: 2 },
-                fill: 'tozeroy', fillcolor: 'rgba(88, 166, 255, 0.1)',
-                hovertemplate: '%{y} pieces at %{x}s<extra></extra>'
-            }, {
-                x: [times[0] || 0, times[times.length - 1] || 1],
-                y: [race.piece_count, race.piece_count],
-                mode: 'lines', name: 'Total Pieces',
-                line: { color: '#8b949e', width: 1, dash: 'dot' },
-                hoverinfo: 'skip'
-            }], {
-                ...commonLayout,
-                yaxis: { ...commonLayout.yaxis, title: 'Pieces Completed' }
-            }, plotlyConfig);
 
             Plotly.newPlot('event-chart', [
                 {
@@ -410,10 +388,10 @@
             const traces = [];
             if (data.self) {
                 traces.push({
-                    x: data.self.elapsed_secs, y: data.self.completion_pcts,
+                    x: data.self.elapsed_secs, y: data.self.piece_counts,
                     mode: 'lines', name: 'Us',
                     line: { color: '#58a6ff', width: 3 },
-                    hovertemplate: 'Us: %{y:.1f}% at %{x}s<extra></extra>'
+                    hovertemplate: 'Us: %{y} pieces at %{x}s<extra></extra>'
                 });
             }
 
@@ -421,10 +399,10 @@
             peersWithData.forEach((peer, idx) => {
                 const color = peerColors[idx % peerColors.length];
                 traces.push({
-                    x: peer.elapsed_secs, y: peer.completion_pcts,
+                    x: peer.elapsed_secs, y: peer.piece_counts,
                     mode: 'lines', name: peer.label,
                     line: { color: color, width: 1 }, opacity: 0.6,
-                    hovertemplate: peer.label + ': %{y:.1f}% at %{x}s<extra></extra>',
+                    hovertemplate: peer.label + ': %{y} pieces at %{x}s<extra></extra>',
                     visible: idx < 30 ? true : 'legendonly'
                 });
             });
@@ -432,7 +410,7 @@
             if (!seedersOnly) container.innerHTML = '';
             Plotly.newPlot(plotTarget, traces, {
                 ...commonLayout,
-                yaxis: { ...commonLayout.yaxis, title: 'Completion %', range: [0, 105] },
+                yaxis: { ...commonLayout.yaxis, title: 'Pieces' },
                 xaxis: { ...commonLayout.xaxis, title: 'Elapsed Time (seconds)' },
                 hovermode: 'x unified',
                 legend: {

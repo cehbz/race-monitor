@@ -171,7 +171,7 @@ def get_peer_progress(race_id):
                 'client': meta['client'],
                 'total_pieces': 0,
                 'elapsed_secs': [],
-                'completion_pcts': [],
+                'piece_counts': [],
                 'seeder': True,
             })
         return jsonify({
@@ -189,10 +189,10 @@ def get_peer_progress(race_id):
         if ts is not None:
             self_times.append((ts - epoch_ns) / _NS_PER_SEC)
 
-    self_elapsed, self_pcts = build_cumulative_curve(self_times, piece_count)
+    self_elapsed, self_pieces = build_cumulative_curve(self_times, piece_count)
     self_data = {
         'elapsed_secs': self_elapsed,
-        'completion_pcts': self_pcts,
+        'piece_counts': self_pieces,
     } if self_elapsed else None
 
     # Group peer pieces by connection_id, build timelines
@@ -219,7 +219,7 @@ def get_peer_progress(race_id):
             'client': meta['client'],
             'total_pieces': len(times),
             'elapsed_secs': elapsed,
-            'completion_pcts': pcts,
+            'piece_counts': pcts,
             'seeder': False,
         })
 
@@ -236,7 +236,7 @@ def get_peer_progress(race_id):
             'client': meta['client'],
             'total_pieces': 0,
             'elapsed_secs': [],
-            'completion_pcts': [],
+            'piece_counts': [],
             'seeder': True,
         })
 
@@ -337,8 +337,8 @@ def get_peers(race_id):
             finish_sec = 0.0
         else:
             # Project finish via extrapolation
-            peer_elapsed, peer_pcts = build_cumulative_curve(times, piece_count)
-            finish_sec = extrapolate_finish_time(peer_elapsed, peer_pcts, piece_count)
+            peer_elapsed, peer_pieces = build_cumulative_curve(times, piece_count)
+            finish_sec = extrapolate_finish_time(peer_elapsed, peer_pieces, piece_count)
 
         participants.append({
             'ip': meta.get('ip', ''),
