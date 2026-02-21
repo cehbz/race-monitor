@@ -8,20 +8,22 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 Module: `github.com/cehbz/race-monitor` (Go 1.24.0)
 
-## Two-Binary Architecture
+## Three-Binary Architecture
 
-The system is split into two binaries with distinct responsibilities:
+The system is split into three binaries with distinct responsibilities:
 
 - **`race-calibrate`** (`cmd/race-calibrate/main.go`, ~600 lines) — Offline tool that discovers 4 struct byte offsets by correlating eBPF memory dumps against the qBittorrent WebUI API. Run once per binary; results cached to `~/.config/race-monitor/calibration.json` keyed by binary SHA256.
-- **`race-monitor`** (`cmd/race-monitor/main.go`, ~320 lines) — Long-running daemon that attaches eBPF uprobes and records race data. Requires pre-calibrated offsets from `race-calibrate`. No subcommands; PID is the first positional argument.
+- **`race-monitor`** (`cmd/race-monitor/main.go`, ~320 lines) — Long-running daemon that attaches eBPF uprobes and records race data. Requires pre-calibrated offsets from `race-calibrate`. No subcommands; PID is the first positional argument. Enqueues new peer IPs for enrichment.
+- **`race-enricher`** (`cmd/race-enricher/main.go`, ~230 lines) — Long-running daemon that resolves peer IPs to ISP/datacenter/seedbox provider. Two-queue pipeline: IP queue (rDNS + Team Cymru, free) → prefix queue (ipapi.is, 900/day cap). Wakes via inotify on sentinel file. Flags: `--backfill`, `--once`, `--daily-limit`.
 
 ## Build Commands
 
 ```bash
 make generate       # Compile eBPF C (probe.c) → bytecode; requires clang + linux-headers
-make build          # generate + go build (both race-monitor and race-calibrate)
+make build          # generate + go build (race-monitor, race-calibrate, race-enricher)
 make build-quick    # Go build only (skips eBPF compilation, uses pre-generated .o)
 make install        # build + install to ~/bin + sudo setcap (sets BPF capabilities)
+make install-services  # install + venv + copy systemd units + daemon-reload
 make check          # fmt + vet + test
 ```
 
@@ -62,15 +64,31 @@ race-monitor $(pgrep -f 'qbittorrent-nox$') --detach --log-file ~/race-monitor.l
 race-monitor $(pgrep -f 'qbittorrent-nox$') --log-level debug  # foreground with debug logging
 ```
 
+### Enrichment
+
+```bash
+race-enricher --backfill --once  # enrich all existing IPs and exit
+race-enricher                    # long-running daemon with inotify wakeup
+race-enricher --once             # process current queue and exit
+```
+
 ### Dashboard
 
 ```bash
 cd race-viz && python3 app.py  # serves on http://localhost:8080
 ```
 
+### Systemd Services
+
+```bash
+systemctl start race-monitor@haynes    # eBPF daemon
+systemctl start race-enricher@haynes   # IP enricher
+systemctl start race-viz@haynes        # Flask dashboard
+```
+
 ### Config
 
-`~/.config/race-monitor/config.toml` (shared by both binaries):
+`~/.config/race-monitor/config.toml` (shared by all binaries):
 ```toml
 binary = "/usr/bin/qbittorrent-nox"
 webui_url = "http://127.0.0.1:8080"
@@ -96,8 +114,9 @@ Coordinator (internal/race/coordinator.go) — single-writer event router, all s
 Trackers (internal/race/tracker.go) — per-race event processing, SQLite batch writes
   ↓
 SQLite (internal/storage/store.go) — WAL mode for concurrent dashboard reads
-  ↓
-Dashboard (race-viz/) — Python Flask + Plotly.js
+  ↓                          ↓
+Dashboard (race-viz/)    Enricher (internal/enrichment/) — rDNS, Cymru, ipapi.is
+  Python Flask + Plotly.js   Go daemon, inotify wakeup, two-queue pipeline
 ```
 
 ### eBPF Probes and Event Types
@@ -184,6 +203,17 @@ SQLite with 5 tables. Schema version 5 — version mismatch drops and recreates 
 
 Indexes: `idx_events_race_ts` for timeline queries, `idx_events_peer_piece` covering index for per-peer piece queries.
 
+**Enrichment tables** (additive, created with `CREATE TABLE IF NOT EXISTS`, not part of versioned schema):
+
+| Table | Owner | Purpose |
+|-------|-------|---------|
+| `enrichment_queue` | daemon | IPs pending enrichment (populated by race-monitor) |
+| `ip_dns` | enricher | Per-IP: rDNS, BGP prefix FK, tier-1 provider |
+| `prefix_queue` | enricher | BGP prefixes pending ipapi.is lookup |
+| `network_enrichment` | enricher | Per-BGP-prefix: ASN, ISP, datacenter, geo, provider |
+
+Dashboard joins: `connections.ip → ip_dns → network_enrichment`.
+
 ## Key Files
 
 | File | Lines | Purpose |
@@ -198,13 +228,21 @@ Indexes: `idx_events_race_ts` for timeline queries, `idx_events_peer_piece` cove
 | `internal/race/calibration_cache.go` | 81 | JSON persistence of calibrated offsets |
 | `internal/race/offsets.go` | 127 | CalibratedOffsets struct + Extract* functions |
 | `internal/race/pidwatch.go` | 40 | pidfd_open-based process death detection |
-| `internal/storage/store.go` | 391 | SQLite schema, CRUD, UPSERT for connections |
+| `internal/storage/store.go` | 420 | SQLite schema, CRUD, UPSERT for connections, enrichment queue |
 | `internal/storage/types.go` | 65 | Race, Event, connection type definitions |
+| `internal/enrichment/domain.go` | 65 | Enrichment domain types (IPInfo, NetworkInfo, APIResult) |
+| `internal/enrichment/ports.go` | 56 | Repository and service interfaces (hexagonal ports) |
+| `internal/enrichment/provider.go` | 148 | Three-tier provider identification (rDNS, brand alias, passthrough) |
+| `internal/enrichment/store.go` | 275 | SQLite store for enrichment tables (4 tables, all interfaces) |
+| `internal/enrichment/dns.go` | 91 | rDNS + Team Cymru BGP/ASN resolver |
+| `internal/enrichment/ipapi.go` | 121 | ipapi.is HTTP client |
+| `internal/enrichment/service.go` | 247 | IPEnricher, PrefixEnricher, RateLimiter |
 | `cmd/race-monitor/main.go` | 317 | Daemon entry point — config, calibration loading, signal handling |
 | `cmd/race-monitor/qbclient.go` | 77 | EnrichmentAPI implementation (qBittorrent WebUI) |
 | `cmd/race-calibrate/main.go` | 597 | Standalone calibration tool — interactive offset discovery |
-| `race-viz/app.py` | 425 | Flask dashboard routes, SSE, peer progress/faster-peers analysis |
-| `race-viz/db.py` | 202 | All SQL queries for dashboard (no Flask dependency) |
+| `cmd/race-enricher/main.go` | 229 | Enricher entry point — inotify, two goroutines, --backfill/--once |
+| `race-viz/app.py` | 440 | Flask dashboard routes, SSE, peer progress, enrichment merge |
+| `race-viz/db.py` | 252 | All SQL queries for dashboard including enrichment JOIN |
 | `race-viz/analysis.py` | — | Pure computation: cumulative curves, classification, extrapolation |
 
 ## Dependencies
@@ -226,3 +264,7 @@ Capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`, `CAP_SYS_ADMIN` (set
 - **Schema recreation over migration**: Schema v5 drops and recreates all tables on version mismatch. Race data is transient; migration complexity is not justified.
 - **Three peer discovery probes**: `incoming_have` (fires when peers send HAVE), `incoming_piece` (fires when we receive piece data), and `incoming_bitfield` (fires when peers send BITFIELD at connect time). Seeders never send individual HAVE messages — they use BITFIELD/HAVE-ALL — so `incoming_bitfield` is essential for discovering seeder connections. `incoming_piece` catches peers during active transfer. All three share the `seen_peers` dedup map.
 - **Identity-based peer dedup**: BPF `seen_peers` uses `(torrent_ptr, ip, port)` as the dedup key instead of raw `peer_connection*` pointers. This prevents cross-race event contamination when libtorrent frees a connection and reuses the address for a different torrent. A `probe_config` BPF map passes calibrated offsets from userspace so probes can read these fields. Falls back to pointer-based dedup when offsets are unknown (calibration mode).
+- **Two-queue enrichment pipeline**: IP queue (unlimited, free DNS) feeds prefix queue (rate-limited ipapi.is). Each IP processed once (rDNS + Cymru), each BGP prefix looked up once (ipapi.is). 3NF: per-IP data in `ip_dns`, per-prefix data in `network_enrichment`.
+- **Three-tier provider identification**: Tier 1: rDNS hostname patterns (highest confidence, e.g. `*.feral.io`). Tier 2: brand alias map on ipapi.is fields — maps corporate entities to consumer brands (SlashN → Ultra.cc) via ASN, domain, abuse email. Tier 3: raw datacenter name passthrough from ipapi.is.
+- **Sentinel file wakeup**: Daemon touches `enrichment.notify` only when enqueuing new IPs. Enricher watches via inotify. Avoids false wakes from SQLite WAL writes.
+- **Additive enrichment schema**: Tables created with `CREATE TABLE IF NOT EXISTS`, not part of versioned schema. Survive daemon schema bumps without data loss.
