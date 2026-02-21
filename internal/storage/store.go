@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 // Store handles SQLite storage operations.
 type Store struct {
@@ -141,13 +141,15 @@ func (s *Store) createSchema() error {
 	CREATE TABLE IF NOT EXISTS connections (
 		id         INTEGER PRIMARY KEY AUTOINCREMENT,
 		race_id    INTEGER REFERENCES races(id),
-		conn_ptr   TEXT UNIQUE NOT NULL,
+		conn_ptr   TEXT NOT NULL,
 		first_seen TIMESTAMP NOT NULL,
 		ip         TEXT,
 		port       INTEGER,
 		peer_id    TEXT,
 		client     TEXT
 	);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_connections_race_ptr ON connections(race_id, conn_ptr);
 
 	CREATE TABLE IF NOT EXISTS packet_events (
 		id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -327,7 +329,7 @@ func (s *Store) InsertConnection(ctx context.Context, raceID int64, connPtr stri
 	err := s.db.QueryRowContext(ctx,
 		`INSERT INTO connections (race_id, conn_ptr, first_seen)
 		VALUES (?, ?, ?)
-		ON CONFLICT(conn_ptr) DO UPDATE SET conn_ptr = conn_ptr
+		ON CONFLICT(race_id, conn_ptr) DO UPDATE SET conn_ptr = conn_ptr
 		RETURNING id`,
 		raceID, connPtr, formatTS(firstSeen)).Scan(&id)
 	if err != nil {
@@ -345,7 +347,7 @@ func (s *Store) UpdateConnectionEndpoint(ctx context.Context, raceID int64, conn
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO connections (race_id, conn_ptr, first_seen, ip, port)
 		VALUES (?, ?, datetime('now'), ?, ?)
-		ON CONFLICT(conn_ptr) DO UPDATE SET ip = excluded.ip, port = excluded.port`,
+		ON CONFLICT(race_id, conn_ptr) DO UPDATE SET ip = excluded.ip, port = excluded.port`,
 		raceID, connPtr, ip, port)
 	return err
 }
@@ -361,7 +363,7 @@ func (s *Store) UpdateConnectionPeerInfo(ctx context.Context, raceID int64, conn
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO connections (race_id, conn_ptr, first_seen, ip, port, peer_id, client)
 		VALUES (?, ?, datetime('now'), ?, ?, ?, ?)
-		ON CONFLICT(conn_ptr) DO UPDATE SET
+		ON CONFLICT(race_id, conn_ptr) DO UPDATE SET
 			ip = excluded.ip, port = excluded.port,
 			peer_id = excluded.peer_id, client = excluded.client`,
 		raceID, connPtr, ip, port, peerID, client)
