@@ -1,0 +1,25 @@
+[Unit]
+Description=Race monitor eBPF daemon for %i
+Documentation=https://github.com/cehbz/race-monitor
+After=qbittorrent@%i.service
+Requires=qbittorrent@%i.service
+
+[Service]
+Type=exec
+User=%i
+Group=%i
+
+# Grant BPF capabilities without setcap on the binary
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_ADMIN
+
+# Resolve qBittorrent PID at start time
+ExecStartPre=/bin/bash -c 'systemctl show -P MainPID qbittorrent@%i.service > /run/%i/race-monitor.pid'
+ExecStart=/bin/bash -c 'exec /home/%i/.local/bin/race-monitor $$(cat /run/%i/race-monitor.pid) --log-level info'
+ExecStartPost=-/bin/rm -f /run/%i/race-monitor.pid
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

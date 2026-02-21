@@ -1,9 +1,10 @@
-.PHONY: build install clean test test-verbose test-coverage lint deps generate
+.PHONY: build install clean test test-verbose test-coverage lint deps generate venv install-services
 
 BINARY := race-monitor
 CALIBRATE_BINARY := race-calibrate
 INSTALL_PATH := $(HOME)/bin
 COVERAGE_FILE := coverage.out
+VENV_PATH := /opt/race-viz/venv
 
 # Generate eBPF bytecode from C source (requires clang, linux headers)
 generate:
@@ -76,6 +77,18 @@ vet:
 
 # Run all checks before commit
 check: fmt vet test
+
+# Create dedicated venv for race-viz service
+venv:
+	sudo mkdir -p $(dir $(VENV_PATH))
+	sudo python3 -m venv $(VENV_PATH)
+	sudo $(VENV_PATH)/bin/pip install -r race-viz/requirements.txt
+
+# Install systemd service units
+install-services: install venv
+	sudo cp systemd/race-monitor@.service /etc/systemd/system/
+	sudo cp systemd/race-viz@.service /etc/systemd/system/
+	sudo systemctl daemon-reload
 
 # Build for Linux amd64 (eBPF is Linux-only)
 build-linux:

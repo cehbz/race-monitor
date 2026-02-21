@@ -1,0 +1,17 @@
+[Unit]
+Description=Race monitor visualization dashboard for %i
+Documentation=https://github.com/cehbz/race-monitor
+After=race-monitor@%i.service
+
+[Service]
+Type=exec
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/projects/race-monitor/race-viz
+ExecStart=/opt/race-viz/venv/bin/python app.py
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

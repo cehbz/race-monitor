@@ -43,13 +43,13 @@ _NS_PER_SEC = 1_000_000_000
 
 
 def load_config():
-    """Load configuration from config.toml with sensible defaults."""
-    config_path = Path(__file__).parent / 'config.toml'
+    """Load configuration from ~/.config/race-monitor/viz.toml with sensible defaults."""
+    config_path = Path.home() / '.config' / 'race-monitor' / 'viz.toml'
     defaults = {
         'race_db': str(Path.home() / '.local/share/race-monitor/races.db'),
         'bind_host': '0.0.0.0',
         'bind_port': 8080,
-        'debug': True,
+        'debug': False,
     }
     if config_path.exists():
         try:
@@ -58,7 +58,7 @@ def load_config():
                 config['race_db'] = str(Path(config['race_db']).expanduser())
             return {**defaults, **config}
         except Exception as e:
-            print(f"Warning: Error loading config.toml: {e}")
+            print(f"Warning: Error loading {config_path}: {e}")
     return defaults
 
 
