@@ -272,6 +272,10 @@ def get_peers(race_id):
     self_pieces = db.fetch_self_pieces(conn, race_id)
     peer_pieces = db.fetch_peer_pieces(conn, race_id)
     conn_meta = db.fetch_connection_meta(conn, race_id)
+
+    # Collect peer IPs for enrichment lookup
+    peer_ips = {meta['ip'] for meta in conn_meta.values() if meta.get('ip')}
+    enrichment = db.fetch_ip_enrichment(conn, peer_ips)
     conn.close()
 
     # Compute race epoch
@@ -387,6 +391,15 @@ def get_peers(race_id):
             'ahead': 0,
             'finish_sec': 0.0,
         })
+
+    # Merge enrichment data into participants
+    for p in participants:
+        ip = p.get('ip', '')
+        net = enrichment.get(ip)
+        if net:
+            p['network'] = net
+        else:
+            p['network'] = None
 
     # Sort: seeders first (finish=0, by pieces desc), then all others
     # (including self) by finish_sec ascending, unknown last

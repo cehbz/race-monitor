@@ -487,6 +487,7 @@
                             <th class="sortable" data-col="ip">IP</th>
                             <th class="num sortable" data-col="port">Port</th>
                             <th class="sortable" data-col="client">Client</th>
+                            <th class="sortable" data-col="network">Network</th>
                             <th class="num sortable" data-col="pieces">Pieces</th>
                             <th class="num sortable" data-col="ahead">Ahead</th>
                             <th class="num sortable" data-col="finish">Finish</th>
@@ -509,12 +510,36 @@
                     const aheadStr = (isSelf || isSeeder) ? '\u2014' : p.ahead;
 
                     const peerKey = isSelf ? 'self' : `${p.ip}:${p.port}`;
+                    const net = p.network;
+                    let netName = '';
+                    let netGeo = '';
+                    let netTooltip = '';
+                    if (net) {
+                        if (net.provider) {
+                            netName = net.provider;
+                        } else if (net.isp) {
+                            const isp = cleanISP(net.isp);
+                            netName = net.is_datacenter ? isp + ' (DC)' : isp;
+                        }
+                        if (net.city || net.country) {
+                            netGeo = [net.city, net.country].filter(Boolean).join(', ');
+                        }
+                        const tipParts = [];
+                        if (net.rdns) tipParts.push('rDNS: ' + net.rdns);
+                        if (net.asn) tipParts.push('AS' + net.asn + (net.asn_org ? ' ' + net.asn_org : ''));
+                        netTooltip = tipParts.join('&#10;');
+                    }
+                    const netLabel = netName && netGeo ? `${netName} · ${netGeo}`
+                                   : netName ? netName
+                                   : netGeo ? netGeo
+                                   : '\u2014';
                     thtml += `
                         <tr class="${rowClass}" data-peer-key="${peerKey}">
                             <td class="num">${idx + 1}</td>
                             <td><code>${p.ip || '\u2014'}</code></td>
                             <td class="num">${p.port || '\u2014'}</td>
                             <td>${p.client || '\u2014'}</td>
+                            <td title="${netTooltip}">${netLabel}</td>
                             <td class="num">${p.pieces}</td>
                             <td class="num">${aheadStr}</td>
                             <td class="num">${finishStr}</td>
@@ -538,6 +563,10 @@
                             case 'port': return dir * ((a.port || 0) - (b.port || 0));
                             case 'pieces': return dir * (a.pieces - b.pieces);
                             case 'ahead': return dir * ((a.ahead || 0) - (b.ahead || 0));
+                            case 'network':
+                                va = (a.network && (a.network.provider || a.network.isp)) || '';
+                                vb = (b.network && (b.network.provider || b.network.isp)) || '';
+                                return dir * va.localeCompare(vb);
                             case 'finish':
                                 va = a.finish_sec != null ? a.finish_sec : Infinity;
                                 vb = b.finish_sec != null ? b.finish_sec : Infinity;
@@ -707,6 +736,11 @@
             if (!connPtr) return '';
             const s = connPtr.replace(/^0x/, '');
             return s.length > 8 ? '\u2026' + s.slice(-8) : s;
+        }
+
+        function cleanISP(name) {
+            if (!name) return '';
+            return name.replace(/\s*(B\.V\.|N\.V\.|LLC|GmbH|Inc\.?|Ltd\.?|S\.A\.S\.?|SAS|AG|PLC|Pty|UG\s*\(.*?\)|Co\.,?\s*Ltd\.?|Pte\.?\s*Ltd\.?|Corp\.?)\s*/gi, ' ').trim();
         }
 
         // --- SSE ---

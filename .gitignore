@@ -6,6 +6,8 @@ race-monitor-*
 race-calibrate
 !race-calibrate/
 !race-calibrate-*/
+race-enricher
+!race-enricher/
 internal/bpf/probe_bpfel.*
 internal/bpf/headers/vmlinux.h
 race-test.log

@@ -204,3 +204,48 @@ def fetch_peer_count(conn, race_id):
 def ktime_to_elapsed_sec(ts_ns, epoch_ns):
     """Convert BPF ktime nanoseconds to elapsed seconds relative to epoch."""
     return (ts_ns - epoch_ns) / _NS_PER_SEC
+
+
+def fetch_ip_enrichment(conn, ips):
+    """Fetch enrichment data for a list of IPs via ip_dns → network_enrichment.
+
+    Returns {ip: {rdns, provider, isp, city, country, asn, asn_org,
+                   is_datacenter, latitude, longitude}}.
+    Silently returns {} if enrichment tables don't exist yet.
+    """
+    if not ips:
+        return {}
+
+    try:
+        placeholders = ','.join('?' * len(ips))
+        cursor = conn.execute(f'''
+            SELECT d.ip, d.rdns, d.provider AS ip_provider,
+                   n.asn, n.asn_org, n.isp, n.company_type,
+                   n.is_datacenter, n.datacenter, n.provider AS net_provider,
+                   n.city, n.region, n.country,
+                   n.latitude, n.longitude
+            FROM ip_dns d
+            LEFT JOIN network_enrichment n ON d.bgp_prefix = n.bgp_prefix
+            WHERE d.ip IN ({placeholders})
+        ''', list(ips))
+
+        result = {}
+        for r in cursor.fetchall():
+            # ip_dns.provider (rDNS tier 1) overrides network_enrichment.provider
+            provider = r['ip_provider'] or r['net_provider'] or ''
+            result[r['ip']] = {
+                'rdns': r['rdns'] or '',
+                'provider': provider,
+                'isp': r['isp'] or '',
+                'city': r['city'] or '',
+                'country': r['country'] or '',
+                'asn': r['asn'],
+                'asn_org': r['asn_org'] or '',
+                'is_datacenter': bool(r['is_datacenter']),
+                'latitude': r['latitude'],
+                'longitude': r['longitude'],
+            }
+        return result
+    except Exception:
+        # Tables don't exist yet — enricher hasn't run
+        return {}

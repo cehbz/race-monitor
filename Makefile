@@ -2,6 +2,7 @@
 
 BINARY := race-monitor
 CALIBRATE_BINARY := race-calibrate
+ENRICHER_BINARY := race-enricher
 INSTALL_PATH := $(HOME)/bin
 COVERAGE_FILE := coverage.out
 VENV_PATH := /opt/race-viz/venv
@@ -13,11 +14,13 @@ generate:
 build: generate
 	go build -o $(BINARY) ./cmd/race-monitor
 	go build -o $(CALIBRATE_BINARY) ./cmd/race-calibrate
+	go build -o $(ENRICHER_BINARY) ./cmd/race-enricher
 
 # Build without regenerating eBPF (use pre-generated files)
 build-quick:
 	go build -o $(BINARY) ./cmd/race-monitor
 	go build -o $(CALIBRATE_BINARY) ./cmd/race-calibrate
+	go build -o $(ENRICHER_BINARY) ./cmd/race-enricher
 
 BPF_CAPS := cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep
 SETCAP := $(shell command -v setcap 2>/dev/null || echo /sbin/setcap)
@@ -26,11 +29,12 @@ install: build
 	install -d $(INSTALL_PATH)
 	install $(BINARY) $(INSTALL_PATH)/
 	install $(CALIBRATE_BINARY) $(INSTALL_PATH)/
+	install $(ENRICHER_BINARY) $(INSTALL_PATH)/
 	sudo $(SETCAP) '$(BPF_CAPS)' $(INSTALL_PATH)/$(BINARY)
 	sudo $(SETCAP) '$(BPF_CAPS)' $(INSTALL_PATH)/$(CALIBRATE_BINARY)
 
 clean:
-	rm -f $(BINARY) $(CALIBRATE_BINARY) $(COVERAGE_FILE)
+	rm -f $(BINARY) $(CALIBRATE_BINARY) $(ENRICHER_BINARY) $(COVERAGE_FILE)
 
 # Run all tests
 test:
@@ -88,6 +92,7 @@ venv:
 install-services: install venv
 	sudo cp systemd/race-monitor@.service /etc/systemd/system/
 	sudo cp systemd/race-viz@.service /etc/systemd/system/
+	sudo cp systemd/race-enricher@.service /etc/systemd/system/
 	sudo systemctl daemon-reload
 
 # Build for Linux amd64 (eBPF is Linux-only)

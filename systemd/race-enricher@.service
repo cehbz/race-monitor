@@ -1,0 +1,15 @@
+[Unit]
+Description=Race monitor IP enricher for %i
+Documentation=https://github.com/cehbz/race-monitor
+After=race-monitor@%i.service
+
+[Service]
+Type=exec
+User=%i
+Group=%i
+ExecStart=/home/%i/bin/race-enricher
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

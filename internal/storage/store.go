@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -15,7 +17,8 @@ const schemaVersion = 7
 
 // Store handles SQLite storage operations.
 type Store struct {
-	db *sql.DB
+	db           *sql.DB
+	sentinelPath string // touched on enrichment enqueue to wake the enricher
 }
 
 // DB returns the underlying *sql.DB for direct queries.
@@ -58,10 +61,21 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("enabling foreign keys: %w", err)
 	}
 
-	s := &Store{db: db}
+	s := &Store{
+		db:           db,
+		sentinelPath: filepath.Join(filepath.Dir(dbPath), "enrichment.notify"),
+	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
+
+	// Enrichment queue — additive table, not part of versioned schema.
+	// Created idempotently so it survives across schema versions.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS enrichment_queue (
+		ip TEXT PRIMARY KEY, queued_at TEXT NOT NULL)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating enrichment queue: %w", err)
 	}
 
 	return s, nil
@@ -201,6 +215,25 @@ func (s *Store) populateEventTypes() error {
 // Close closes the database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// enqueueEnrichment adds an IP to the enrichment queue and touches the sentinel
+// file to wake the enricher. Fire-and-forget: errors are silently ignored since
+// enrichment is best-effort and must not block the hot path.
+func (s *Store) enqueueEnrichment(ctx context.Context, ip string) {
+	if ip == "" {
+		return
+	}
+	s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO enrichment_queue (ip, queued_at) VALUES (?, ?)`,
+		ip, formatTS(time.Now()))
+	// Touch sentinel file to wake the enricher via inotify.
+	if s.sentinelPath != "" {
+		f, err := os.Create(s.sentinelPath)
+		if err == nil {
+			f.Close()
+		}
+	}
 }
 
 // --- Torrent operations ---
@@ -349,6 +382,7 @@ func (s *Store) UpdateConnectionEndpoint(ctx context.Context, raceID int64, conn
 		VALUES (?, ?, datetime('now'), ?, ?)
 		ON CONFLICT(race_id, conn_ptr) DO UPDATE SET ip = excluded.ip, port = excluded.port`,
 		raceID, connPtr, ip, port)
+	s.enqueueEnrichment(ctx, ip)
 	return err
 }
 
@@ -367,6 +401,7 @@ func (s *Store) UpdateConnectionPeerInfo(ctx context.Context, raceID int64, conn
 			ip = excluded.ip, port = excluded.port,
 			peer_id = excluded.peer_id, client = excluded.client`,
 		raceID, connPtr, ip, port, peerID, client)
+	s.enqueueEnrichment(ctx, ip)
 	return err
 }
 
