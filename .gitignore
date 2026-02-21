@@ -36,4 +36,4 @@ Thumbs.db
 *.db-wal
 
 race-viz/config.toml
-race-viz/__pycache__/
+__pycache__/
