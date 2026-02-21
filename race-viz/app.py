@@ -323,6 +323,7 @@ def get_peers(race_id):
     # Self
     self_pieces_count = len([r for r in self_pieces if r['first_ts'] is not None])
     participants.append({
+        'label': 'Us',
         'ip': '(self)',
         'port': 0,
         'client': '',
@@ -359,7 +360,9 @@ def get_peers(race_id):
             if our_ts is not None and pts < our_ts:
                 ahead += 1
 
+        label = meta.get('client') or (f"{meta.get('ip', '')}:{meta.get('port', 0)}" if meta.get('ip') else f'conn_{conn_id}')
         participants.append({
+            'label': label,
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
             'client': meta.get('client', ''),
@@ -373,7 +376,9 @@ def get_peers(race_id):
     for conn_id, meta in conn_meta.items():
         if conn_id in tracked_ids:
             continue
+        label = meta.get('client') or (f"{meta.get('ip', '')}:{meta.get('port', 0)}" if meta.get('ip') else f'conn_{conn_id}')
         participants.append({
+            'label': label,
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
             'client': meta.get('client', ''),

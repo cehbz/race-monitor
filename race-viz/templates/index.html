@@ -147,6 +147,8 @@
         .beat-us { color: #3fb950; font-weight: 600; font-size: 12px; }
         .self-row td { background: rgba(88, 166, 255, 0.05); }
         .seeder-row td { opacity: 0.7; }
+        .peer-table tbody tr { cursor: pointer; }
+        .peer-table tbody tr.highlighted td { background: rgba(88, 166, 255, 0.15); }
     </style>
 </head>
 <body>
@@ -300,7 +302,7 @@
                     <div class="chart-container">
                         <div class="chart-title">
                             Race Progress &mdash; Per-Peer Pieces
-                            <span class="chart-info">Click legend entries to show/hide.</span>
+                            <span class="chart-info">Click a trace or table row to highlight a peer.</span>
                         </div>
                         <div id="peer-progress-chart"><div class="loading">Loading peer data...</div></div>
                     </div>
@@ -332,7 +334,7 @@
                 const peersData = await peersResp.json();
 
                 renderPeerProgressChart(progressData, raceData.race.piece_count);
-                renderPeersTable(peersData);
+                renderPeersTable(peersData, progressData);
 
             } catch (error) {
                 viz.innerHTML = `<div class="error">Error loading race data: ${error.message}</div>`;
@@ -389,6 +391,7 @@
             const plotTarget = seedersOnly ? 'peer-progress-chart-plot' : 'peer-progress-chart';
 
             const traces = [];
+            const traceKeys = [];  // parallel: peer_key per trace for selection
             if (data.self) {
                 traces.push({
                     x: data.self.elapsed_secs, y: data.self.piece_counts,
@@ -396,11 +399,13 @@
                     line: { color: '#58a6ff', width: 3 },
                     hovertemplate: 'Us: %{y} pieces at %{x}s<extra></extra>'
                 });
+                traceKeys.push('self');
             }
 
             // Only add peers that have actual data to the chart
             peersWithData.forEach((peer, idx) => {
                 const color = peerColors[idx % peerColors.length];
+                const peerKey = `${peer.ip}:${peer.port}`;
                 traces.push({
                     x: peer.elapsed_secs, y: peer.piece_counts,
                     mode: 'lines', name: peer.label,
@@ -408,6 +413,7 @@
                     hovertemplate: peer.label + ': %{y} pieces at %{x}s<extra></extra>',
                     visible: idx < 30 ? true : 'legendonly'
                 });
+                traceKeys.push(peerKey);
             });
 
             if (!seedersOnly) container.innerHTML = '';
@@ -422,11 +428,15 @@
                     font: { size: 10, color: '#8b949e' }
                 }
             }, plotlyConfig);
+
+            // Attach key mapping to chart element for cross-highlighting
+            const plotEl = document.getElementById(plotTarget);
+            plotEl._traceKeys = traceKeys;
         }
 
         // --- Unified peers table ---
 
-        function renderPeersTable(data) {
+        function renderPeersTable(data, progressData) {
             const container = document.getElementById('peers-table-section');
             const participants = data.participants || [];
 
@@ -498,8 +508,9 @@
 
                     const aheadStr = (isSelf || isSeeder) ? '\u2014' : p.ahead;
 
+                    const peerKey = isSelf ? 'self' : `${p.ip}:${p.port}`;
                     thtml += `
-                        <tr class="${rowClass}">
+                        <tr class="${rowClass}" data-peer-key="${peerKey}">
                             <td class="num">${idx + 1}</td>
                             <td><code>${p.ip || '\u2014'}</code></td>
                             <td class="num">${p.port || '\u2014'}</td>
@@ -538,21 +549,75 @@
                 container.innerHTML = html + renderTable(sorted);
             }
 
+            let highlightedKey = null;
+
             sortAndRender();
 
-            // Event delegation for column sorting
+            // Find the chart element (may be nested div if seeders-only)
+            const chartEl = document.getElementById('peer-progress-chart-plot')
+                || document.getElementById('peer-progress-chart');
+
+            function highlightPeer(peerKey) {
+                highlightedKey = (highlightedKey === peerKey) ? null : peerKey;
+
+                // Highlight table row
+                container.querySelectorAll('tbody tr').forEach(tr => {
+                    tr.classList.toggle('highlighted',
+                        highlightedKey !== null && tr.dataset.peerKey === highlightedKey);
+                });
+
+                // Highlight chart trace — bold the selected, restore others
+                const traceKeys = chartEl && chartEl._traceKeys;
+                if (!traceKeys || !chartEl.data) return;
+
+                const widths = traceKeys.map(key => {
+                    if (key === highlightedKey) return 4;
+                    return key === 'self' ? 3 : 1;
+                });
+                Plotly.restyle(chartEl, { 'line.width': widths });
+            }
+
+            // Event delegation for column sorting and row clicks
             container.addEventListener('click', (e) => {
                 const th = e.target.closest('th.sortable');
-                if (!th) return;
-                const col = th.dataset.col;
-                if (sortCol === col) {
-                    sortAsc = !sortAsc;
-                } else {
-                    sortCol = col;
-                    sortAsc = col === 'ahead' || col === 'pieces' ? false : true;
+                if (th) {
+                    const col = th.dataset.col;
+                    if (sortCol === col) {
+                        sortAsc = !sortAsc;
+                    } else {
+                        sortCol = col;
+                        sortAsc = col === 'ahead' || col === 'pieces' ? false : true;
+                    }
+                    sortAndRender();
+                    if (highlightedKey) {
+                        container.querySelectorAll('tbody tr').forEach(tr => {
+                            tr.classList.toggle('highlighted',
+                                tr.dataset.peerKey === highlightedKey);
+                        });
+                    }
+                    return;
                 }
-                sortAndRender();
+
+                const tr = e.target.closest('tbody tr');
+                if (tr && tr.dataset.peerKey) {
+                    highlightPeer(tr.dataset.peerKey);
+                }
             });
+
+            // Chart interaction → highlight peer
+            if (chartEl && chartEl._traceKeys) {
+                chartEl.on('plotly_legendclick', (eventData) => {
+                    const key = chartEl._traceKeys[eventData.curveNumber];
+                    if (key) highlightPeer(key);
+                    return false;  // prevent default toggle-visibility
+                });
+                chartEl.on('plotly_click', (eventData) => {
+                    if (eventData.points && eventData.points.length > 0) {
+                        const key = chartEl._traceKeys[eventData.points[0].curveNumber];
+                        if (key) highlightPeer(key);
+                    }
+                });
+            }
         }
 
         // --- Stats ---
