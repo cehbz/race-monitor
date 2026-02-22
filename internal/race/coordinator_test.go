@@ -67,9 +67,9 @@ func waitForState(t *testing.T, c *Coordinator, predicate func(StateSnapshot) bo
 	}
 }
 
-// makeTorrentStartEvent creates a DumpEvent for EVT_TORRENT_STARTED with
-// the info_hash embedded at the given offset in the Data array.
-func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int) bpf.DumpEvent {
+// makeTorrentStartEvent creates a TorrentStartedEvent with the info_hash
+// embedded at the given offset in the Data array.
+func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int) *bpf.TorrentStartedEvent {
 	if len(infoHashBytes) != 20 {
 		panic("infoHashBytes must be exactly 20 bytes")
 	}
@@ -77,14 +77,25 @@ func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int)
 		panic("infoHashOffset too large for dump data")
 	}
 
-	event := bpf.DumpEvent{
-		EventType: bpf.EventTorrentStarted,
-		ObjPtr:    ptr,
-		Timestamp: uint64(time.Now().UnixNano()),
+	event := &bpf.TorrentStartedEvent{
+		TorrentPtr: ptr,
+		Timestamp:  uint64(time.Now().UnixNano()),
 	}
 
 	copy(event.Data[infoHashOffset:infoHashOffset+20], infoHashBytes)
 	return event
+}
+
+// startRun launches c.Run in a goroutine and returns the events channel and
+// error channel. Tests send typed events on eventsChan and read the final
+// error from errChan.
+func startRun(c *Coordinator, ctx context.Context) (chan bpf.ProbeEvent, chan error) {
+	eventsChan := make(chan bpf.ProbeEvent, 100)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- c.Run(ctx, eventsChan)
+	}()
+	return eventsChan, errChan
 }
 
 // --- Unit tests (direct method calls, no Run) ---
@@ -125,7 +136,7 @@ func TestNewCoordinator(t *testing.T) {
 	}
 }
 
-// TestTorrentStartCreatesRace tests that EVT_TORRENT_STARTED creates a race
+// TestTorrentStartCreatesRace tests that TorrentStartedEvent creates a race
 func TestTorrentStartCreatesRace(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
@@ -137,22 +148,15 @@ func TestTorrentStartCreatesRace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create a test info_hash
 	infoHashBytes := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	// Send EVT_TORRENT_STARTED
-	dumpsChan <- makeTorrentStartEvent(0x1000, infoHashBytes, infoHashOffset)
+	// Send TorrentStartedEvent
+	eventsChan <- makeTorrentStartEvent(0x1000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -160,14 +164,14 @@ func TestTorrentStartCreatesRace(t *testing.T) {
 	}, 2*time.Second)
 
 	if _, exists := snap.ActiveRaces[infoHashHex]; !exists {
-		t.Error("expected race to be created from EVT_TORRENT_STARTED")
+		t.Error("expected race to be created from TorrentStartedEvent")
 	}
 
 	close(eventsChan)
 	<-errChan
 }
 
-// TestTorrentFinishedSignalsCompletion tests that EVT_TORRENT_FINISHED completes a race
+// TestTorrentFinishedSignalsCompletion tests that TorrentFinishedEvent completes a race
 func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
@@ -179,14 +183,7 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create test info_hash
 	infoHashBytes := []byte{0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
@@ -194,8 +191,8 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 	torrentPtr := uint64(0x2000)
 
-	// Send EVT_TORRENT_STARTED
-	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	// Send TorrentStartedEvent
+	eventsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -206,10 +203,9 @@ func TestTorrentFinishedSignalsCompletion(t *testing.T) {
 		t.Fatal("expected race to be created")
 	}
 
-	// Send EVT_TORRENT_FINISHED
-	eventsChan <- bpf.Event{
-		EventType: bpf.EventTorrentFinished,
-		ObjPtr:    torrentPtr,
+	// Send TorrentFinishedEvent
+	eventsChan <- &bpf.TorrentFinishedEvent{
+		TorrentPtr: torrentPtr,
 	}
 
 	// Wait for race to be removed after completion
@@ -235,21 +231,14 @@ func TestWeHaveRoutesAndDrops(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
+	eventsChan, errChan := startRun(c, ctx)
 
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
-
-	// Create a single race via EVT_TORRENT_STARTED with torrent_ptr=0x3000
+	// Create a single race via TorrentStartedEvent with torrent_ptr=0x3000
 	infoHashBytes := []byte{0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
 		0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	dumpsChan <- makeTorrentStartEvent(0x3000, infoHashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x3000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -258,21 +247,18 @@ func TestWeHaveRoutesAndDrops(t *testing.T) {
 	raceID := snap.ActiveRaces[infoHashHex].RaceID
 
 	// Send we_have with the KNOWN torrent_ptr — should route to the race
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventWeHave,
-		ObjPtr:     0x3000,
+	eventsChan <- &bpf.WeHaveEvent{
+		TorrentPtr: 0x3000,
 		PieceIndex: 5,
 	}
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventWeHave,
-		ObjPtr:     0x3000,
+	eventsChan <- &bpf.WeHaveEvent{
+		TorrentPtr: 0x3000,
 		PieceIndex: 10,
 	}
 
 	// Send we_have with an UNKNOWN torrent_ptr — should be dropped
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventWeHave,
-		ObjPtr:     0xaaaa,
+	eventsChan <- &bpf.WeHaveEvent{
+		TorrentPtr: 0xaaaa,
 		PieceIndex: 99,
 	}
 
@@ -298,16 +284,9 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
+	eventsChan, errChan := startRun(c, ctx)
 
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
-
-	// Create two races via EVT_TORRENT_STARTED
+	// Create two races via TorrentStartedEvent
 	hash1Bytes := []byte{0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68,
 		0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f, 0x70, 0x71, 0x72, 0x73, 0x74}
 	hash1Hex := hex.EncodeToString(hash1Bytes)
@@ -316,8 +295,8 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 		0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94}
 	hash2Hex := hex.EncodeToString(hash2Bytes)
 
-	dumpsChan <- makeTorrentStartEvent(0x4000, hash1Bytes, infoHashOffset)
-	dumpsChan <- makeTorrentStartEvent(0x4001, hash2Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x4000, hash1Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x4001, hash2Bytes, infoHashOffset)
 
 	preCloseSnap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
@@ -332,9 +311,8 @@ func TestWeHaveRoutesKnownPtr(t *testing.T) {
 	c.mapTorrentPtr(0xbbbb, hash1Hex)
 
 	// Send we_have with the known ptr
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventWeHave,
-		ObjPtr:     0xbbbb,
+	eventsChan <- &bpf.WeHaveEvent{
+		TorrentPtr: 0xbbbb,
 		PieceIndex: 10,
 	}
 
@@ -361,14 +339,7 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create two races
 	hash1Bytes := []byte{0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8,
@@ -377,17 +348,16 @@ func TestWeHaveDropsMultipleRaces(t *testing.T) {
 	hash2Bytes := []byte{0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8,
 		0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4}
 
-	dumpsChan <- makeTorrentStartEvent(0x5000, hash1Bytes, infoHashOffset)
-	dumpsChan <- makeTorrentStartEvent(0x5001, hash2Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x5000, hash1Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x5001, hash2Bytes, infoHashOffset)
 
 	preCloseSnap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
 	}, 2*time.Second)
 
 	// Send we_have with unknown ptr — should be dropped
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventWeHave,
-		ObjPtr:     0xcccc,
+	eventsChan <- &bpf.WeHaveEvent{
+		TorrentPtr: 0xcccc,
 		PieceIndex: 5,
 	}
 
@@ -414,14 +384,7 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create two races
 	hash1Bytes := []byte{0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
@@ -432,8 +395,8 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 		0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25}
 	hash2Hex := hex.EncodeToString(hash2Bytes)
 
-	dumpsChan <- makeTorrentStartEvent(0x6000, hash1Bytes, infoHashOffset)
-	dumpsChan <- makeTorrentStartEvent(0x6001, hash2Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x6000, hash1Bytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x6001, hash2Bytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 2
@@ -445,9 +408,8 @@ func TestIncomingHaveExactRouting(t *testing.T) {
 	c.connToRace[0x5555] = hash1Hex
 
 	// Send incoming_have with exact routing
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
-		ObjPtr:     0x5555,
+	eventsChan <- &bpf.IncomingHaveEvent{
+		ConnPtr:    0x5555,
 		PieceIndex: 10,
 	}
 
@@ -475,21 +437,14 @@ func TestIncomingHaveDropsUnmapped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create a single race
 	hashBytes := []byte{0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
 		0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45}
 	hashHex := hex.EncodeToString(hashBytes)
 
-	dumpsChan <- makeTorrentStartEvent(0x7000, hashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0x7000, hashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		return len(s.ActiveRaces) == 1
@@ -497,9 +452,8 @@ func TestIncomingHaveDropsUnmapped(t *testing.T) {
 	raceID := snap.ActiveRaces[hashHex].RaceID
 
 	// Send incoming_have with an unmapped peer_connection ptr — should be dropped
-	eventsChan <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
-		ObjPtr:     0x7777,
+	eventsChan <- &bpf.IncomingHaveEvent{
+		ConnPtr:    0x7777,
 		PieceIndex: 25,
 	}
 
@@ -524,14 +478,7 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create a race
 	infoHashBytes := []byte{0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79,
@@ -539,7 +486,7 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 	torrentPtr := uint64(0x8000)
 
-	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -550,10 +497,9 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 		t.Fatal("expected race to be created")
 	}
 
-	// Complete the race via EVT_TORRENT_FINISHED
-	eventsChan <- bpf.Event{
-		EventType: bpf.EventTorrentFinished,
-		ObjPtr:    torrentPtr,
+	// Complete the race via TorrentFinishedEvent
+	eventsChan <- &bpf.TorrentFinishedEvent{
+		TorrentPtr: torrentPtr,
 	}
 
 	// Wait for race to be removed
@@ -566,7 +512,7 @@ func TestRaceCompleteCleansUp(t *testing.T) {
 	<-errChan
 }
 
-// TestPidDeathExitsRun tests pidDeathCh causes Run to return
+// TestPidDeathExitsRun tests that context cancellation with cause (pid death) causes Run to return
 func TestPidDeathExitsRun(t *testing.T) {
 	store, _ := storage.New(":memory:")
 	defer store.Close()
@@ -574,21 +520,18 @@ func TestPidDeathExitsRun(t *testing.T) {
 	logger := testLogger()
 	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
+	eventsChan := make(chan bpf.ProbeEvent, 10)
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan)
 	}()
 
-	// Send a pidDeath error
+	// Simulate pid death by cancelling with cause
 	testErr := errors.New("process exited")
-	pidDeathCh <- testErr
+	cancel(testErr)
 
 	select {
 	case err := <-errChan:
@@ -610,13 +553,10 @@ func TestContextCancelExitsRun(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
+	eventsChan := make(chan bpf.ProbeEvent, 10)
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan)
 	}()
 
 	// Give Run a moment to start
@@ -643,20 +583,20 @@ func TestRouteEventChannelFull(t *testing.T) {
 	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	state := &raceState{
-		eventChan:  make(chan bpf.Event, 1),
+		eventChan:  make(chan bpf.ProbeEvent, 1),
 		hash:       "testhash",
 		pieceCount: 100,
 	}
 
 	// Fill the channel
 	select {
-	case state.eventChan <- bpf.Event{PieceIndex: 1}:
+	case state.eventChan <- &bpf.WeHaveEvent{PieceIndex: 1}:
 	default:
 		t.Fatal("failed to fill channel")
 	}
 
 	// Try to route another event (should be dropped)
-	c.routeEvent(state, bpf.Event{PieceIndex: 2})
+	c.routeEvent(state, &bpf.WeHaveEvent{PieceIndex: 2})
 
 	if len(state.eventChan) != 1 {
 		t.Errorf("expected 1 event in channel (full), got %d", len(state.eventChan))
@@ -695,14 +635,7 @@ func TestLifecycleStartAndComplete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Start a race
 	infoHashBytes := []byte{0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
@@ -710,7 +643,7 @@ func TestLifecycleStartAndComplete(t *testing.T) {
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 	torrentPtr := uint64(0x9000)
 
-	dumpsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(torrentPtr, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -722,9 +655,8 @@ func TestLifecycleStartAndComplete(t *testing.T) {
 	}
 
 	// Complete the race
-	eventsChan <- bpf.Event{
-		EventType: bpf.EventTorrentFinished,
-		ObjPtr:    torrentPtr,
+	eventsChan <- &bpf.TorrentFinishedEvent{
+		TorrentPtr: torrentPtr,
 	}
 
 	waitForState(t, c, func(s StateSnapshot) bool {
@@ -748,14 +680,7 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Start multiple races
 	hashes := make([]string, 3)
@@ -768,7 +693,7 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 			byte(0xbf + i), byte(0xc0 + i), byte(0xc1 + i), byte(0xc2 + i), byte(0xc3 + i),
 		}
 		hashes[i] = hex.EncodeToString(infoHashBytes)
-		dumpsChan <- makeTorrentStartEvent(ptrs[i], infoHashBytes, infoHashOffset)
+		eventsChan <- makeTorrentStartEvent(ptrs[i], infoHashBytes, infoHashOffset)
 	}
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
@@ -780,9 +705,8 @@ func TestMultipleRacesWithLifecycle(t *testing.T) {
 	}
 
 	// Complete one race
-	eventsChan <- bpf.Event{
-		EventType: bpf.EventTorrentFinished,
-		ObjPtr:    ptrs[0],
+	eventsChan <- &bpf.TorrentFinishedEvent{
+		TorrentPtr: ptrs[0],
 	}
 
 	snap = waitForState(t, c, func(s StateSnapshot) bool {
@@ -818,13 +742,10 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
+	eventsChan := make(chan bpf.ProbeEvent, 100)
 	errChan := make(chan error, 1)
 	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
+		errChan <- c.Run(ctx, eventsChan)
 	}()
 
 	// Create multiple races
@@ -835,7 +756,7 @@ func TestContextCancelCleansUpAllRaces(t *testing.T) {
 			byte(0xda + i), byte(0xdb + i), byte(0xdc + i), byte(0xdd + i), byte(0xde + i),
 			byte(0xdf + i), byte(0xe0 + i), byte(0xe1 + i), byte(0xe2 + i), byte(0xe3 + i),
 		}
-		dumpsChan <- makeTorrentStartEvent(uint64(0xb000+i), infoHashBytes, infoHashOffset)
+		eventsChan <- makeTorrentStartEvent(uint64(0xb000+i), infoHashBytes, infoHashOffset)
 	}
 
 	waitForState(t, c, func(s StateSnapshot) bool {
@@ -870,21 +791,14 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create a race
 	infoHashBytes := []byte{0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
 		0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, 0x00, 0x01, 0x02, 0x03}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	dumpsChan <- makeTorrentStartEvent(0xc000, infoHashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0xc000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]
@@ -925,21 +839,14 @@ func TestQueryStateSnapshotConsistency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	eventsChan := make(chan bpf.Event, 10)
-	dumpsChan := make(chan bpf.DumpEvent, 10)
-	pidDeathCh := make(chan error, 1)
-
-	errChan := make(chan error, 1)
-	go func() {
-		errChan <- c.Run(ctx, eventsChan, dumpsChan, pidDeathCh)
-	}()
+	eventsChan, errChan := startRun(c, ctx)
 
 	// Create a race
 	infoHashBytes := []byte{0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b,
 		0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17}
 	infoHashHex := hex.EncodeToString(infoHashBytes)
 
-	dumpsChan <- makeTorrentStartEvent(0xd000, infoHashBytes, infoHashOffset)
+	eventsChan <- makeTorrentStartEvent(0xd000, infoHashBytes, infoHashOffset)
 
 	snap := waitForState(t, c, func(s StateSnapshot) bool {
 		_, exists := s.ActiveRaces[infoHashHex]

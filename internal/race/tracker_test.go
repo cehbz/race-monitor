@@ -16,7 +16,7 @@ func trackerTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-// testTimestamp returns a nanosecond timestamp for bpf.Event.Timestamp.
+// testTimestamp returns a nanosecond timestamp for event Timestamp fields.
 // The tracker stores timestamps as-is; any monotonic sequence is sufficient for tests.
 func testTimestamp(offset time.Duration) uint64 {
 	return uint64(offset.Nanoseconds())
@@ -56,7 +56,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 100)
+	events := make(chan bpf.ProbeEvent, 100)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -67,11 +67,10 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 
 	// Send 3 we_have events for different pieces
 	for i := 0; i < 3; i++ {
-		events <- bpf.Event{
-			EventType:  bpf.EventWeHave,
+		events <- &bpf.WeHaveEvent{
 			PieceIndex: uint32(i),
 			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
-			ObjPtr:     0,
+			TorrentPtr: 0,
 		}
 	}
 
@@ -99,7 +98,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 100)
+	events := make(chan bpf.ProbeEvent, 100)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -110,24 +109,21 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 
 	// Send incoming_have events from two different peer connections
 	ts := testTimestamp(0)
-	events <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
+	events <- &bpf.IncomingHaveEvent{
 		PieceIndex: 5,
 		Timestamp:  ts,
-		ObjPtr:     0xdeadbeef,
+		ConnPtr:    0xdeadbeef,
 	}
-	events <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
+	events <- &bpf.IncomingHaveEvent{
 		PieceIndex: 10,
 		Timestamp:  ts + 1000,
-		ObjPtr:     0xcafebabe,
+		ConnPtr:    0xcafebabe,
 	}
 	// Second event from same connection should reuse connMap entry
-	events <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
+	events <- &bpf.IncomingHaveEvent{
 		PieceIndex: 15,
 		Timestamp:  ts + 2000,
-		ObjPtr:     0xdeadbeef,
+		ConnPtr:    0xdeadbeef,
 	}
 
 	close(events)
@@ -154,7 +150,7 @@ func TestProcessEvents_CompletionDetection(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 100)
+	events := make(chan bpf.ProbeEvent, 100)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -165,8 +161,7 @@ func TestProcessEvents_CompletionDetection(t *testing.T) {
 
 	// Send we_have for all pieces
 	for i := 0; i < pieceCount; i++ {
-		events <- bpf.Event{
-			EventType:  bpf.EventWeHave,
+		events <- &bpf.WeHaveEvent{
 			PieceIndex: uint32(i),
 			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
 		}
@@ -174,12 +169,11 @@ func TestProcessEvents_CompletionDetection(t *testing.T) {
 
 	// After completing all pieces, incoming_have from new connections should be
 	// ignored (loggedComplete = true blocks new InsertConnection calls).
-	// Send one more incoming_have with a new ObjPtr.
-	events <- bpf.Event{
-		EventType:  bpf.EventIncomingHave,
+	// Send one more incoming_have with a new ConnPtr.
+	events <- &bpf.IncomingHaveEvent{
 		PieceIndex: 0,
 		Timestamp:  testTimestamp(10 * time.Millisecond),
-		ObjPtr:     0xfaceface,
+		ConnPtr:    0xfaceface,
 	}
 
 	close(events)
@@ -196,7 +190,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 200)
+	events := make(chan bpf.ProbeEvent, 200)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -208,8 +202,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 	// Send 150 events — first 100 should trigger a batch flush, remainder
 	// flushed on channel close.
 	for i := 0; i < 150; i++ {
-		events <- bpf.Event{
-			EventType:  bpf.EventWeHave,
+		events <- &bpf.WeHaveEvent{
 			PieceIndex: uint32(i),
 			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
 		}
@@ -228,7 +221,7 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	events := make(chan bpf.Event, 100)
+	events := make(chan bpf.ProbeEvent, 100)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -238,8 +231,7 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 	}()
 
 	// Send one event so processEvents is active
-	events <- bpf.Event{
-		EventType:  bpf.EventWeHave,
+	events <- &bpf.WeHaveEvent{
 		PieceIndex: 0,
 		Timestamp:  testTimestamp(0),
 	}
@@ -264,7 +256,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 100)
+	events := make(chan bpf.ProbeEvent, 100)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -274,8 +266,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 	}()
 
 	// Send some events
-	events <- bpf.Event{
-		EventType:  bpf.EventWeHave,
+	events <- &bpf.WeHaveEvent{
 		PieceIndex: 0,
 		Timestamp:  testTimestamp(0),
 	}
@@ -306,7 +297,7 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	events := make(chan bpf.Event, 10)
+	events := make(chan bpf.ProbeEvent, 10)
 	downloadCompleteCh := make(chan struct{}, 1)
 	logger := trackerTestLogger()
 
@@ -315,16 +306,15 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, events, downloadCompleteCh)
 	}()
 
-	// Send an event with unknown type — should be silently skipped
-	events <- bpf.Event{
-		EventType:  999,
-		PieceIndex: 0,
+	// Send a TorrentFinishedEvent — the tracker only handles WeHave and
+	// IncomingHave; other types hit the default branch and are skipped.
+	events <- &bpf.TorrentFinishedEvent{
+		TorrentPtr: 0x1234,
 		Timestamp:  testTimestamp(0),
 	}
 
 	// Send a valid event to confirm processing continues
-	events <- bpf.Event{
-		EventType:  bpf.EventWeHave,
+	events <- &bpf.WeHaveEvent{
 		PieceIndex: 0,
 		Timestamp:  testTimestamp(time.Millisecond),
 	}

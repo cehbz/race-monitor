@@ -11,30 +11,19 @@ import (
 )
 
 // processEvents is the main event processing loop for a single race.
-// It receives raw eBPF events, converts them to storage events, and persists them.
+// It receives typed eBPF probe events, converts them to storage events, and
+// persists them in batches.
 //
 // The downloadCompleteCh is closed by the coordinator when the download
 // completes (torrent::finished() event). After that, the tracker begins per-peer idle
 // monitoring and finalizes when all tracked peers have been idle for 10 seconds.
-//
-// New signature:
-//
-//	func processEvents(
-//	    ctx context.Context,
-//	    store *storage.Store,
-//	    logger *slog.Logger,
-//	    hash string,
-//	    raceID int64,
-//	    events <-chan bpf.Event,
-//	    downloadCompleteCh <-chan struct{},
-//	) error
 func processEvents(
 	ctx context.Context,
 	store *storage.Store,
 	logger *slog.Logger,
 	hash string,
 	raceID int64,
-	events <-chan bpf.Event,
+	events <-chan bpf.ProbeEvent,
 	downloadCompleteCh <-chan struct{},
 ) error {
 	const (
@@ -134,7 +123,7 @@ func processEvents(
 				return finalize(ctx, store, logger, raceID)
 			}
 
-		case event, ok := <-events:
+		case ev, ok := <-events:
 			if !ok {
 				logger.Debug("event channel closed",
 					"total_events", totalEvents,
@@ -143,19 +132,53 @@ func processEvents(
 				if err := flushEvents(); err != nil {
 					logger.Warn("failed to flush final events", "error", err)
 				}
-				// If download hasn't completed yet, finalize as abandoned
-				if !downloadCompleted {
-					return finalize(ctx, store, logger, raceID)
-				}
-				// Otherwise, return the normal finalize result
 				return finalize(ctx, store, logger, raceID)
 			}
 
 			totalEvents++
 
-			// Track event timestamp for idle monitoring (post-completion)
-			if downloadCompleted && event.ObjPtr > 0 {
-				lastEventTime[event.ObjPtr] = int64(event.Timestamp)
+			var dbEvent storage.Event
+			dbEvent.RaceID = raceID
+
+			switch e := ev.(type) {
+			case *bpf.WeHaveEvent:
+				weHaveCount++
+				have[int(e.PieceIndex)] = true
+				dbEvent.EventType = storage.EventTypePieceReceived
+				dbEvent.ConnectionID = selfConnID
+				dbEvent.Timestamp = int64(e.Timestamp)
+				dbEvent.PieceIndex = int(e.PieceIndex)
+
+				if downloadCompleted && e.TorrentPtr > 0 {
+					lastEventTime[e.TorrentPtr] = int64(e.Timestamp)
+				}
+
+			case *bpf.IncomingHaveEvent:
+				peerHaveCount++
+				connDBID, exists := connMap[e.ConnPtr]
+				if !exists {
+					if loggedComplete {
+						continue // Ignore new connections after download completes
+					}
+					connPtr := fmt.Sprintf("%x", e.ConnPtr)
+					connDBID, err = store.InsertConnection(ctx, raceID, connPtr, time.Now())
+					if err != nil {
+						logger.Warn("failed to insert connection", "error", err, "ptr", e.ConnPtr)
+						continue
+					}
+					connMap[e.ConnPtr] = connDBID
+				}
+				dbEvent.EventType = storage.EventTypeHave
+				dbEvent.ConnectionID = connDBID
+				dbEvent.Timestamp = int64(e.Timestamp)
+				dbEvent.PieceIndex = int(e.PieceIndex)
+
+				if downloadCompleted && e.ConnPtr > 0 {
+					lastEventTime[e.ConnPtr] = int64(e.Timestamp)
+				}
+
+			default:
+				continue
 			}
 
 			// Reset idle timer after download completes (for per-peer monitoring)
@@ -182,52 +205,12 @@ func processEvents(
 				lastLogTime = time.Now()
 			}
 
-			var dbEvent storage.Event
-			dbEvent.RaceID = raceID
-			dbEvent.Timestamp = int64(event.Timestamp)
-			dbEvent.PieceIndex = int(event.PieceIndex)
-
-			switch event.EventType {
-			case bpf.EventWeHave:
-				weHaveCount++
-				have[int(event.PieceIndex)] = true
-				dbEvent.EventType = storage.EventTypePieceReceived
-				dbEvent.ConnectionID = selfConnID
-
-			case bpf.EventIncomingHave:
-				peerHaveCount++
-				connDBID, exists := connMap[event.ObjPtr]
-				if !exists {
-					if loggedComplete {
-						continue // Ignore new connections after download completes
-					}
-					connPtr := fmt.Sprintf("%x", event.ObjPtr)
-					connDBID, err = store.InsertConnection(ctx, raceID, connPtr, time.Now())
-					if err != nil {
-						logger.Warn("failed to insert connection", "error", err, "ptr", event.ObjPtr)
-						continue
-					}
-					connMap[event.ObjPtr] = connDBID
-				}
-				dbEvent.EventType = storage.EventTypeHave
-				dbEvent.ConnectionID = connDBID
-
-			default:
-				continue
-			}
-
 			eventBatch = append(eventBatch, dbEvent)
 
 			if len(eventBatch) >= batchSize {
 				if err := flushEvents(); err != nil {
 					logger.Warn("failed to flush event batch", "error", err)
 				}
-			}
-
-			// Log when all pieces are received (before or during download)
-			if len(have) > 0 && !loggedComplete {
-				// Don't flag as complete until torrent::finished() fires
-				// but track that we've seen all pieces
 			}
 		}
 	}

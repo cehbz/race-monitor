@@ -26,7 +26,7 @@ type raceComplete struct {
 
 // raceState wraps an active race's event channel and metadata.
 type raceState struct {
-	eventChan          chan bpf.Event
+	eventChan          chan bpf.ProbeEvent
 	hash               string
 	pieceCount         int
 	raceID             int64
@@ -184,8 +184,10 @@ func (c *Coordinator) snapshotState() StateSnapshot {
 	return snap
 }
 
-// Run is the main event loop.
-func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, dumps <-chan bpf.DumpEvent, pidDeathCh <-chan error) error {
+// Run is the main event loop. The caller should cancel ctx (via
+// context.WithCancelCause) when the target process dies; Run uses
+// context.Cause to log the shutdown reason.
+func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) error {
 	c.logger.Info("coordinator started, waiting for eBPF events",
 		"sockaddr_offset", c.offsets.SockaddrOffset,
 		"peer_id_offset", c.offsets.PeerIDOffset,
@@ -207,18 +209,12 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, dumps <-
 	for {
 		select {
 		case <-ctx.Done():
-			c.logger.Info("coordinator shutting down")
+			cause := context.Cause(ctx)
+			c.logger.Info("coordinator shutting down", "cause", cause)
 			if err := c.waitForTrackerCompletions(ctx); err != nil {
 				return err
 			}
-			return ctx.Err()
-
-		case pidErr := <-pidDeathCh:
-			c.logger.Info("PID died, finalizing all races", "error", pidErr)
-			if err := c.waitForTrackerCompletions(ctx); err != nil {
-				return err
-			}
-			return pidErr
+			return cause
 
 		case complete := <-c.completeChan:
 			c.handleComplete(complete)
@@ -226,47 +222,40 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.Event, dumps <-
 		case q := <-c.stateQueryChan:
 			q.reply <- c.snapshotState()
 
-		case dump, ok := <-dumps:
-			if ok {
-				c.handleDump(ctx, dump)
-			}
-
-		case event, ok := <-events:
+		case ev, ok := <-events:
 			if !ok {
 				c.logger.Info("event channel closed")
 				return c.waitForTrackerCompletions(ctx)
 			}
-			c.handleEvent(ctx, event)
+			switch e := ev.(type) {
+			case *bpf.WeHaveEvent:
+				c.handleWeHave(ctx, e)
+			case *bpf.IncomingHaveEvent:
+				c.handleIncomingHave(e)
+			case *bpf.TorrentFinishedEvent:
+				c.handleTorrentFinished(e)
+			case *bpf.TorrentStartedEvent:
+				c.handleTorrentStarted(ctx, e)
+			case *bpf.TorrentDetailsEvent:
+				c.handleTorrentDetails(e)
+			case *bpf.PeerDetailsEvent:
+				c.handlePeerDetails(ctx, e)
+			}
 		}
-	}
-}
-
-// handleDump dispatches struct dump events by type.
-// With pre-calibrated offsets, this is purely extraction and routing.
-func (c *Coordinator) handleDump(ctx context.Context, dump bpf.DumpEvent) {
-	switch dump.EventType {
-	case bpf.EventTorrentStarted:
-		c.handleTorrentStarted(ctx, dump)
-	case bpf.EventTorrentDump:
-		// Torrent struct dump from we_have (first encounter of each torrent*).
-		// Register the torrent_ptr mapping so peer dumps can resolve it.
-		c.handleTorrentDump(dump)
-	case bpf.EventPeerDump:
-		c.handlePeerDump(ctx, dump)
 	}
 }
 
 // handleTorrentStarted extracts the info_hash from a torrent::start() dump
 // and creates a race.
-func (c *Coordinator) handleTorrentStarted(ctx context.Context, dump bpf.DumpEvent) {
-	ptr := dump.ObjPtr
+func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentStartedEvent) {
+	ptr := e.TorrentPtr
 
 	// Skip duplicate start events for the same torrent_ptr
 	if _, known := c.torrentPtrs[ptr]; known {
 		return
 	}
 
-	hashBytes, ok := ExtractInfoHash(dump.Data, c.offsets.InfoHashOffset)
+	hashBytes, ok := ExtractInfoHash(e.Data, c.offsets.InfoHashOffset)
 	if !ok {
 		c.logger.Warn("torrent_started: failed to extract info_hash",
 			"ptr", fmt.Sprintf("0x%x", ptr))
@@ -274,19 +263,19 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, dump bpf.DumpEve
 	}
 	hash := hex.EncodeToString(hashBytes)
 	c.mapTorrentPtr(ptr, hash)
-	c.startRace(ctx, hash, ptr, dump.Timestamp)
+	c.startRace(ctx, hash, ptr, e.Timestamp)
 }
 
-// handleTorrentDump registers a torrent_ptr → info_hash mapping from
+// handleTorrentDetails registers a torrent_ptr → info_hash mapping from
 // a we_have torrent struct dump. This handles torrents that were already active
 // before the daemon started (torrent_start already fired before we attached).
-func (c *Coordinator) handleTorrentDump(dump bpf.DumpEvent) {
-	ptr := dump.ObjPtr
+func (c *Coordinator) handleTorrentDetails(e *bpf.TorrentDetailsEvent) {
+	ptr := e.TorrentPtr
 	if _, known := c.torrentPtrs[ptr]; known {
 		return
 	}
 
-	hashBytes, ok := ExtractInfoHash(dump.Data, c.offsets.InfoHashOffset)
+	hashBytes, ok := ExtractInfoHash(e.Data, c.offsets.InfoHashOffset)
 	if !ok {
 		return
 	}
@@ -296,11 +285,11 @@ func (c *Coordinator) handleTorrentDump(dump bpf.DumpEvent) {
 		"ptr", fmt.Sprintf("0x%x", ptr), "hash", hash)
 }
 
-// handlePeerDump extracts torrent_ptr, sockaddr_in, and peer_id from
+// handlePeerDetails extracts torrent_ptr, sockaddr_in, and peer_id from
 // a peer_connection struct dump, then routes the connection to a race.
-func (c *Coordinator) handlePeerDump(ctx context.Context, dump bpf.DumpEvent) {
+func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsEvent) {
 	// Extract torrent* to map this peer_connection to a race
-	torrentPtr, ok := ExtractTorrentPtr(dump.Data, c.offsets.TorrentPtrOffset)
+	torrentPtr, ok := ExtractTorrentPtr(e.Data, c.offsets.TorrentPtrOffset)
 	if !ok {
 		return
 	}
@@ -311,16 +300,16 @@ func (c *Coordinator) handlePeerDump(ctx context.Context, dump bpf.DumpEvent) {
 		return
 	}
 
-	c.connToRace[dump.ObjPtr] = hash
+	c.connToRace[e.ConnPtr] = hash
 
 	// Extract IP:port
-	addr, hasAddr := ExtractEndpoint(dump.Data, c.offsets.SockaddrOffset)
+	addr, hasAddr := ExtractEndpoint(e.Data, c.offsets.SockaddrOffset)
 	if hasAddr {
-		c.connEndpoints[dump.ObjPtr] = addr
+		c.connEndpoints[e.ConnPtr] = addr
 	}
 
 	// Extract peer_id and decode client
-	peerID, hasPeerID := ExtractPeerID(dump.Data, c.offsets.PeerIDOffset)
+	peerID, hasPeerID := ExtractPeerID(e.Data, c.offsets.PeerIDOffset)
 	client := ""
 	if hasPeerID {
 		client = DecodePeerClient(peerID)
@@ -332,7 +321,7 @@ func (c *Coordinator) handlePeerDump(ctx context.Context, dump bpf.DumpEvent) {
 		return
 	}
 
-	connPtr := fmt.Sprintf("%x", dump.ObjPtr)
+	connPtr := fmt.Sprintf("%x", e.ConnPtr)
 	if hasAddr && hasPeerID {
 		if err := c.store.UpdateConnectionPeerInfo(ctx, state.raceID, connPtr, addr.Addr().String(), int(addr.Port()), peerID, client); err != nil {
 			c.logger.Debug("failed to update connection peer info", "error", err)
@@ -358,7 +347,7 @@ func (c *Coordinator) handlePeerDump(ctx context.Context, dump bpf.DumpEvent) {
 			"race_connections", raceConnCount)
 	} else {
 		c.logger.Log(ctx, levelTrace, "mapped peer_conn → race",
-			"peer_conn", fmt.Sprintf("0x%x", dump.ObjPtr),
+			"peer_conn", fmt.Sprintf("0x%x", e.ConnPtr),
 			"torrent", fmt.Sprintf("0x%x", torrentPtr),
 			"hash", hash,
 			"addr", addr.String(),
@@ -398,7 +387,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 			torrentSize = meta.Size
 			pieceCount = meta.PieceCount
 		} else {
-			c.logger.Debug("failed to fetch torrent properties", "hash", infoHash, "error", err)
+			c.logger.Warn("failed to fetch torrent properties", "hash", infoHash, "error", err)
 		}
 	}
 
@@ -419,7 +408,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	downloadCompleteCh := make(chan struct{})
 	raceCtx, cancel := context.WithCancel(ctx)
 	state := &raceState{
-		eventChan:          make(chan bpf.Event, 10000),
+		eventChan:          make(chan bpf.ProbeEvent, 10000),
 		hash:               infoHash,
 		pieceCount:         pieceCount,
 		raceID:             raceID,
@@ -428,7 +417,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	}
 	c.infoHashToRaceState[infoHash] = state
 
-	go func(hash string, raceID int64, eventChan <-chan bpf.Event, completeCh <-chan struct{}) {
+	go func(hash string, raceID int64, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
 		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, eventChan, completeCh)
 		c.completeChan <- raceComplete{hash: hash, err: err}
 	}(infoHash, raceID, state.eventChan, downloadCompleteCh)
@@ -451,52 +440,40 @@ func (c *Coordinator) notifyDashboard(raceID int64) {
 	}()
 }
 
-// handleEvent routes a single eBPF event.
-func (c *Coordinator) handleEvent(ctx context.Context, event bpf.Event) {
-	switch event.EventType {
-	case bpf.EventWeHave:
-		c.handleWeHave(ctx, event)
-	case bpf.EventIncomingHave:
-		c.handleIncomingHave(event)
-	case bpf.EventTorrentFinished:
-		c.handleTorrentFinished(event)
-	}
-}
-
-// handleWeHave processes a we_have event. obj_ptr is the torrent* pointer.
-func (c *Coordinator) handleWeHave(ctx context.Context, event bpf.Event) {
-	if hash, ok := c.torrentPtrs[event.ObjPtr]; ok {
+// handleWeHave processes a we_have event. TorrentPtr is the torrent* pointer.
+func (c *Coordinator) handleWeHave(ctx context.Context, e *bpf.WeHaveEvent) {
+	if hash, ok := c.torrentPtrs[e.TorrentPtr]; ok {
 		if state, ok := c.infoHashToRaceState[hash]; ok {
-			c.routeEvent(state, event)
+			c.routeEvent(state, e)
 		}
 		return
 	}
 
 	c.logger.Log(ctx, levelTrace, "we_have: dropped (unmapped torrent_ptr)",
-		"ptr", fmt.Sprintf("0x%x", event.ObjPtr),
+		"ptr", fmt.Sprintf("0x%x", e.TorrentPtr),
 		"active_races", len(c.infoHashToRaceState))
 }
 
 // handleIncomingHave routes incoming_have events via exact routing only.
-func (c *Coordinator) handleIncomingHave(event bpf.Event) {
-	if hash, ok := c.connToRace[event.ObjPtr]; ok {
+func (c *Coordinator) handleIncomingHave(e *bpf.IncomingHaveEvent) {
+	if hash, ok := c.connToRace[e.ConnPtr]; ok {
 		if state, ok := c.infoHashToRaceState[hash]; ok {
-			c.routeEvent(state, event)
+			c.routeEvent(state, e)
 			return
 		}
 	}
 
 	c.logger.Log(context.Background(), levelTrace, "incoming_have: dropped (unmapped peer_conn)",
-		"ptr", fmt.Sprintf("0x%x", event.ObjPtr),
-		"piece", event.PieceIndex)
+		"ptr", fmt.Sprintf("0x%x", e.ConnPtr),
+		"piece", e.PieceIndex)
 }
 
 // handleTorrentFinished signals download completion for a race.
-func (c *Coordinator) handleTorrentFinished(event bpf.Event) {
-	hash, ok := c.torrentPtrs[event.ObjPtr]
+func (c *Coordinator) handleTorrentFinished(e *bpf.TorrentFinishedEvent) {
+	hash, ok := c.torrentPtrs[e.TorrentPtr]
 	if !ok {
 		c.logger.Debug("torrent_finished for unmapped ptr",
-			"ptr", fmt.Sprintf("0x%x", event.ObjPtr))
+			"ptr", fmt.Sprintf("0x%x", e.TorrentPtr))
 		return
 	}
 
@@ -593,7 +570,7 @@ func (c *Coordinator) handleComplete(complete raceComplete) {
 }
 
 // routeEvent sends an event to an active race's channel.
-func (c *Coordinator) routeEvent(state *raceState, event bpf.Event) {
+func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
 	select {
 	case state.eventChan <- event:
 	default:

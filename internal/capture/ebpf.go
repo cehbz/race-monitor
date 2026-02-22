@@ -76,10 +76,9 @@ type ProbeConfig struct {
 	SockaddrOffset   uint32 // offset of sockaddr_in within peer_connection struct
 }
 
-// CaptureHandle wraps the event channels and BPF map handles returned by Capture.
+// CaptureHandle wraps the event channel and BPF map handles returned by Capture.
 type CaptureHandle struct {
-	Events       <-chan bpf.Event
-	Dumps        <-chan bpf.DumpEvent
+	Events       <-chan bpf.ProbeEvent
 	seenPeers    *ebpf.Map
 	seenTorrents *ebpf.Map
 }
@@ -114,10 +113,8 @@ func (h *CaptureHandle) ForgetTorrent(ptr uint64) error {
 }
 
 // Capture attaches eBPF uprobes to the qBittorrent binary and returns a
-// CaptureHandle with channels for slim events and struct dump events.
-// Struct dumps carry 4KB memory snapshots from peer_connection and torrent
-// objects, used for extracting peer identity (IP, port, peer_id) and torrent
-// identity (info_hash).
+// CaptureHandle with a single typed event channel carrying concrete
+// ProbeEvent values decoded from the perf buffer.
 //
 // If pid > 0, probes fire only for that process. If pid == 0, probes fire
 // for all processes executing the binary.
@@ -285,19 +282,17 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 		return nil, fmt.Errorf("creating perf reader: %w", err)
 	}
 
-	eventChan := make(chan bpf.Event, 10000)
-	dumpChan := make(chan bpf.DumpEvent, 100)
+	eventChan := make(chan bpf.ProbeEvent, 10000)
 
 	go func() {
 		defer close(eventChan)
-		defer close(dumpChan)
 		defer rd.Close()
 		defer closeAll()
 
 		logger.Info("perf reader started, waiting for events")
 
 		var totalLost uint64
-		var eventCount, dumpCount uint64
+		var eventCount uint64
 		var firstEventLogged bool
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -319,7 +314,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "dumps", dumpCount, "lost", totalLost)
+				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "lost", totalLost)
 			case r, ok := <-recCh:
 				if !ok {
 					logger.Debug("perf reader closed", "total_lost_samples", totalLost)
@@ -355,36 +350,48 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 					logger.Log(ctx, LevelTrace, "perf: first event received", "event_type", eventType)
 				}
 
+				eventCount++
+				var typed bpf.ProbeEvent
+
 				switch eventType {
 				case bpf.EventPeerDump, bpf.EventTorrentDump, bpf.EventTorrentStarted:
-					dumpCount++
-					// Large struct dump events routed to dump channel.
-					// TorrentStarted carries a full torrent struct dump like
-					// TorrentDump but also triggers race creation.
 					var dump bpf.DumpEvent
 					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &dump); err != nil {
 						logger.Warn("failed to decode struct dump event", "error", err)
 						continue
 					}
-					select {
-					case dumpChan <- dump:
-					case <-ctx.Done():
-						return
+					switch eventType {
+					case bpf.EventPeerDump:
+						typed = &bpf.PeerDetailsEvent{ConnPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
+					case bpf.EventTorrentDump:
+						typed = &bpf.TorrentDetailsEvent{TorrentPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
+					case bpf.EventTorrentStarted:
+						typed = &bpf.TorrentStartedEvent{TorrentPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
 					}
 
 				default:
-					eventCount++
-					// Slim events (24 bytes): we_have, incoming_have, torrent_finished
 					var event bpf.Event
 					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &event); err != nil {
 						logger.Warn("failed to decode event", "error", err)
 						continue
 					}
-					select {
-					case eventChan <- event:
-					case <-ctx.Done():
-						return
+					switch eventType {
+					case bpf.EventWeHave:
+						typed = &bpf.WeHaveEvent{TorrentPtr: event.ObjPtr, PieceIndex: event.PieceIndex, Timestamp: event.Timestamp}
+					case bpf.EventIncomingHave:
+						typed = &bpf.IncomingHaveEvent{ConnPtr: event.ObjPtr, PieceIndex: event.PieceIndex, Timestamp: event.Timestamp}
+					case bpf.EventTorrentFinished:
+						typed = &bpf.TorrentFinishedEvent{TorrentPtr: event.ObjPtr, Timestamp: event.Timestamp}
+					default:
+						logger.Warn("unknown event type", "type", eventType)
+						continue
 					}
+				}
+
+				select {
+				case eventChan <- typed:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}
@@ -398,7 +405,6 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 
 	return &CaptureHandle{
 		Events:       eventChan,
-		Dumps:        dumpChan,
 		seenPeers:    objs.SeenPeers,
 		seenTorrents: objs.SeenTorrents,
 	}, nil

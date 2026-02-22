@@ -150,13 +150,6 @@ func run() error {
 	}
 
 	events := handle.Events
-	dumps := handle.Dumps
-
-	// Drain events channel (we don't process piece events during calibration)
-	go func() {
-		for range events {
-		}
-	}()
 
 	// Calibration state
 	result := calibResult{
@@ -188,34 +181,44 @@ func run() error {
 	verified := false
 	var torrentStartCount, peerDumpCount int
 
-	for cal := range dumps {
+	for ev := range events {
 		if ctx.Err() != nil {
 			break
 		}
 
-		switch cal.EventType {
-		case bpf.EventTorrentStarted, bpf.EventTorrentDump:
-			// Both carry torrent struct dumps. EventTorrentStarted comes from
-			// torrent::start(), EventTorrentDump from first we_have()
+		switch cal := ev.(type) {
+		case *bpf.TorrentStartedEvent, *bpf.TorrentDetailsEvent:
+			// Both carry torrent struct dumps. TorrentStartedEvent comes from
+			// torrent::start(), TorrentDetailsEvent from first we_have()
 			// per torrent. Either can be used for info_hash discovery and to
 			// register torrent pointers.
-			isTorrentStart := cal.EventType == bpf.EventTorrentStarted
+			var data [4096]byte
+			var ptr uint64
+			isTorrentStart := false
+			switch e := cal.(type) {
+			case *bpf.TorrentStartedEvent:
+				data = e.Data
+				ptr = e.TorrentPtr
+				isTorrentStart = true
+			case *bpf.TorrentDetailsEvent:
+				data = e.Data
+				ptr = e.TorrentPtr
+			}
 			if isTorrentStart {
 				torrentStartCount++
 			}
 
 			if result.infoHashOffset >= 0 {
 				// Already calibrated — extract and register
-				hashBytes, ok := race.ExtractInfoHash(cal.Data, result.infoHashOffset)
+				hashBytes, ok := race.ExtractInfoHash(data, result.infoHashOffset)
 				if ok {
 					hash := hex.EncodeToString(hashBytes)
-					if _, already := torrentPtrs[cal.ObjPtr]; !already {
-						torrentPtrs[cal.ObjPtr] = hash
-						knownTorrentPtrSet[cal.ObjPtr] = true
+					if _, already := torrentPtrs[ptr]; !already {
+						torrentPtrs[ptr] = hash
+						knownTorrentPtrSet[ptr] = true
 						logger.Debug("registered torrent ptr",
-							"ptr", fmt.Sprintf("0x%x", cal.ObjPtr),
+							"ptr", fmt.Sprintf("0x%x", ptr),
 							"hash", hash,
-							"source", cal.EventType,
 							"total_ptrs", len(knownTorrentPtrSet))
 					}
 
@@ -235,27 +238,26 @@ func run() error {
 			// Try to discover info_hash offset by scanning for known API hashes.
 			// If no match, refresh the hash list from the API and retry — the
 			// torrent may have been added after our initial fetch.
-			offset, hash, ok := findInfoHashOffset(cal.Data, knownHashes)
+			offset, hash, ok := findInfoHashOffset(data, knownHashes)
 			if !ok {
 				logger.Debug("torrent dump: no match with cached hashes, refreshing from API",
-					"ptr", fmt.Sprintf("0x%x", cal.ObjPtr),
-					"source", cal.EventType)
+					"ptr", fmt.Sprintf("0x%x", ptr))
 				refreshHashes()
-				offset, hash, ok = findInfoHashOffset(cal.Data, knownHashes)
+				offset, hash, ok = findInfoHashOffset(data, knownHashes)
 			}
 			if !ok {
 				logger.Debug("torrent dump: no known hash found even after API refresh",
-					"ptr", fmt.Sprintf("0x%x", cal.ObjPtr))
+					"ptr", fmt.Sprintf("0x%x", ptr))
 				continue
 			}
 
 			result.infoHashOffset = offset
-			torrentPtrs[cal.ObjPtr] = hash
-			knownTorrentPtrSet[cal.ObjPtr] = true
+			torrentPtrs[ptr] = hash
+			knownTorrentPtrSet[ptr] = true
 			fmt.Printf("  info_hash offset: %d (matched hash: %s)\n", offset, hash)
 			fmt.Println("  Waiting for peer_connection events (need active peer traffic)...")
 
-		case bpf.EventPeerDump:
+		case *bpf.PeerDetailsEvent:
 			peerDumpCount++
 
 			if peerDumpCount == 1 {
@@ -306,6 +308,9 @@ func run() error {
 					}
 				}
 			}
+
+		default:
+			continue
 		}
 
 		// Check if all offsets are discovered

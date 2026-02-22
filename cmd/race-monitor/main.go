@@ -277,20 +277,25 @@ Config: ~/.config/race-monitor/config.toml
 	}
 	defer store.Close()
 
-	// Handle signals for graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Handle signals and pid death via context cancellation.
+	// WithCancelCause lets the coordinator log the shutdown reason
+	// (signal vs pid death) via context.Cause.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		<-sigCh
+		sig := <-sigCh
 		logger.Info("received shutdown signal")
-		cancel()
+		cancel(fmt.Errorf("received signal: %v", sig))
 	}()
 
-	// Watch for target process death
+	// Watch for target process death — cancels context with pid error as cause
 	pidDeathCh := race.WatchPID(pid)
+	go func() {
+		cancel(<-pidDeathCh)
+	}()
 
 	// Create enrichment API client (optional)
 	var enrichAPI race.EnrichmentAPI
@@ -316,5 +321,5 @@ Config: ~/.config/race-monitor/config.toml
 	}
 
 	coordinator := race.NewCoordinator(store, logger, dashboardURL, offsets, enrichAPI, handle)
-	return coordinator.Run(ctx, handle.Events, handle.Dumps, pidDeathCh)
+	return coordinator.Run(ctx, handle.Events)
 }
