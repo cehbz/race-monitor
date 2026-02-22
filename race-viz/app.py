@@ -26,9 +26,11 @@ from analysis import (
     parse_rfc3339,
     decode_peer_id,
     build_cumulative_curve,
+    build_event_histogram,
     build_piece_count_curve,
     classify_peer,
     extrapolate_finish_time,
+    _adaptive_step,
 )
 import db
 
@@ -247,11 +249,24 @@ def get_peer_progress(race_id):
         max((p['elapsed_secs'][-1] for p in peers_data if p['elapsed_secs']), default=0),
     )
 
+    # Event histograms for combined chart (adaptive resolution)
+    step = _adaptive_step(race_duration) if race_duration > 0 else 1.0
+    self_hist_bins, self_hist_counts = build_event_histogram(self_times, step)
+    all_peer_times = [t for times in peer_groups.values() for t in times]
+    peer_hist_bins, peer_hist_counts = build_event_histogram(all_peer_times, step)
+
     return jsonify({
         'piece_count': piece_count,
         'race_duration_secs': race_duration,
         'self': self_data,
         'peers': peers_data,
+        'event_histogram': {
+            'self_bins': self_hist_bins,
+            'self_counts': self_hist_counts,
+            'peer_bins': peer_hist_bins,
+            'peer_counts': peer_hist_counts,
+            'step': step,
+        },
     })
 
 
@@ -381,7 +396,7 @@ def get_peers(race_id):
             'client': meta.get('client', ''),
             'type': 'seeder' if is_seeder else 'leecher',
             'pieces': len(times),
-            'ahead': ahead,
+            'ahead': piece_count if is_seeder else ahead,
             'finish_sec': round(finish_sec, 1) if finish_sec is not None else None,
         }
         if conn_id in contaminated_conns:
@@ -400,7 +415,7 @@ def get_peers(race_id):
             'client': meta.get('client', ''),
             'type': 'seeder',
             'pieces': 0,
-            'ahead': 0,
+            'ahead': piece_count,
             'finish_sec': 0.0,
         })
 

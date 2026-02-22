@@ -10,9 +10,11 @@ from analysis import (
     parse_rfc3339,
     decode_peer_id,
     build_cumulative_curve,
+    build_event_histogram,
     build_piece_count_curve,
     classify_peer,
     extrapolate_finish_time,
+    _adaptive_step,
 )
 
 
@@ -107,6 +109,22 @@ class TestBuildCumulativeCurve:
         times = [2.0, 2.0, 2.0]
         secs, counts = build_cumulative_curve(times, 3)
         assert counts[-1] == 3
+
+    def test_sub_second_race(self):
+        # Fast race completing in ~0.15s — should produce multiple sample points
+        times = [0.05 + i * 0.0004 for i in range(246)]  # 246 pieces in 0.15s
+        secs, counts = build_cumulative_curve(times, 246)
+        assert len(secs) >= 3, f"expected multiple points for sub-second race, got {len(secs)}"
+        assert counts[-1] == 246
+        # All elapsed values should be in seconds
+        assert all(isinstance(s, float) for s in secs)
+
+    def test_long_race_capped(self):
+        # 1-hour race — should not produce 3600+ sample points
+        times = [float(i) for i in range(3600)]
+        secs, counts = build_cumulative_curve(times, 3600)
+        assert len(secs) <= 600, f"expected capped points for long race, got {len(secs)}"
+        assert counts[-1] == 3600
 
 
 # --- build_piece_count_curve ---
@@ -231,3 +249,50 @@ class TestExtrapolateFinishTime:
         result = extrapolate_finish_time(secs, counts, 100)
         assert result is not None
         assert abs(result - 500.0) < 5.0
+
+
+# --- _adaptive_step ---
+
+class TestAdaptiveStep:
+    def test_sub_second(self):
+        assert _adaptive_step(0.5) == 0.01
+
+    def test_medium(self):
+        assert _adaptive_step(15) == 0.1
+
+    def test_long(self):
+        assert _adaptive_step(100) == 1.0
+
+    def test_very_long(self):
+        step = _adaptive_step(1000)
+        assert abs(step - 2.0) < 0.01
+
+
+# --- build_event_histogram ---
+
+class TestBuildEventHistogram:
+    def test_basic(self):
+        times = [0.5, 1.2, 1.8, 3.0]
+        bins, counts = build_event_histogram(times, 1.0)
+        assert bins == [0.0, 1.0, 2.0, 3.0]
+        assert counts == [1, 2, 0, 1]
+
+    def test_empty(self):
+        assert build_event_histogram([], 1.0) == ([], [])
+
+    def test_sub_second(self):
+        times = [0.01, 0.02, 0.05, 0.10]
+        bins, counts = build_event_histogram(times, 0.01)
+        assert len(bins) >= 10
+        assert sum(counts) == 4
+
+    def test_unsorted_input(self):
+        times = [3.0, 0.5, 1.8, 1.2]
+        bins, counts = build_event_histogram(times, 1.0)
+        assert counts == [1, 2, 0, 1]
+
+    def test_all_same_bin(self):
+        times = [0.1, 0.2, 0.3]
+        bins, counts = build_event_histogram(times, 1.0)
+        assert bins == [0.0]
+        assert counts == [3]

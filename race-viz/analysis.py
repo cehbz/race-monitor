@@ -37,6 +37,24 @@ def decode_peer_id(raw):
     return ''.join(prefix) + (tail.hex() if tail else '')
 
 
+def _adaptive_step(span):
+    """Choose sampling step size based on time span.
+
+        < 2s    → 10ms steps
+        < 30s   → 100ms steps
+        < 300s  → 1s steps
+        >= 300s → span / 500 (caps at ~500 points)
+    """
+    if span < 2:
+        return 0.01
+    elif span < 30:
+        return 0.1
+    elif span < 300:
+        return 1.0
+    else:
+        return span / 500
+
+
 def build_cumulative_curve(piece_times, piece_count):
     """Build (elapsed_secs, piece_counts) from elapsed-second floats.
 
@@ -46,29 +64,58 @@ def build_cumulative_curve(piece_times, piece_count):
         piece_count: Total pieces in the torrent (used only for validation).
 
     Returns:
-        (elapsed_secs, piece_counts) — parallel lists sampled at 1-second
-        boundaries. Only emits a point when the cumulative count changes.
+        (elapsed_secs, piece_counts) — parallel lists with adaptive sampling
+        resolution. Only emits a point when the cumulative count changes.
+        elapsed_secs are always in seconds (floats).
     """
     if not piece_times or piece_count <= 0:
         return [], []
 
     times = sorted(piece_times)
+    span = times[-1]
+    step = _adaptive_step(span)
+
     elapsed_secs = []
     cumulative_pieces = []
     piece_idx = 0
-    max_sec = int(times[-1]) + 1
+    num_steps = int(span / step) + 2  # +2 for rounding and final point
 
-    for sec in range(0, max_sec + 1):
-        while piece_idx < len(times) and times[piece_idx] <= sec:
+    for i in range(num_steps):
+        t = round(i * step, 3)
+        while piece_idx < len(times) and times[piece_idx] <= t:
             piece_idx += 1
         if piece_idx > 0 and (
             not cumulative_pieces
             or piece_idx != cumulative_pieces[-1]
         ):
-            elapsed_secs.append(sec)
+            elapsed_secs.append(t)
             cumulative_pieces.append(piece_idx)
 
     return elapsed_secs, cumulative_pieces
+
+
+def build_event_histogram(times, step):
+    """Bucket event times into bins of width `step`.
+
+    Args:
+        times: List of elapsed-second floats. Need not be sorted.
+        step: Bin width in seconds (from _adaptive_step).
+
+    Returns:
+        (bin_starts, counts) — parallel lists. bin_starts[i] is the left edge
+        of the bin, counts[i] is the number of events in [bin_start, bin_start+step).
+    """
+    if not times:
+        return [], []
+    sorted_t = sorted(times)
+    span = sorted_t[-1]
+    num_bins = int(span / step) + 1
+    counts = [0] * num_bins
+    for t in sorted_t:
+        idx = min(int(t / step), num_bins - 1)
+        counts[idx] += 1
+    bin_starts = [round(i * step, 3) for i in range(num_bins)]
+    return bin_starts, counts
 
 
 def build_piece_count_curve(sorted_times, duration):

@@ -303,15 +303,10 @@
 
                     <div class="chart-container">
                         <div class="chart-title">
-                            Race Progress &mdash; Per-Peer Pieces
+                            Race Progress
                             <span class="chart-info">Click a trace or table row to highlight a peer.</span>
                         </div>
                         <div id="peer-progress-chart"><div class="loading">Loading peer data...</div></div>
-                    </div>
-
-                    <div class="chart-container">
-                        <div class="chart-title">Event Activity (events per second)</div>
-                        <div id="event-chart"></div>
                     </div>
 
                     <div class="chart-container">
@@ -325,7 +320,6 @@
                 `;
 
                 displayRaceStats(raceData);
-                renderTimelineCharts(raceData);
 
                 const [progressResp, peersResp] = await Promise.all([
                     fetch(`/api/race/${raceId}/peer_progress`),
@@ -344,29 +338,6 @@
         }
 
         // --- Charts ---
-
-        function renderTimelineCharts(data) {
-            const { race, timeline } = data;
-            const times = timeline.map(t => t.elapsed_sec);
-
-            Plotly.newPlot('event-chart', [
-                {
-                    x: times, y: timeline.map(t => t.piece_received || 0),
-                    mode: 'lines', name: 'Piece Received (we_have)',
-                    line: { width: 0 }, fillcolor: 'rgba(86, 211, 100, 0.5)',
-                    fill: 'tozeroy', stackgroup: 'one'
-                },
-                {
-                    x: times, y: timeline.map(t => t.have_count || 0),
-                    mode: 'lines', name: 'Peer Have (incoming_have)',
-                    line: { width: 0 }, fillcolor: 'rgba(88, 166, 255, 0.5)',
-                    fill: 'tozeroy', stackgroup: 'one'
-                }
-            ], {
-                ...commonLayout,
-                yaxis: { ...commonLayout.yaxis, title: 'Events per Second' }
-            }, plotlyConfig);
-        }
 
         function renderPeerProgressChart(data, pieceCount) {
             const container = document.getElementById('peer-progress-chart');
@@ -394,6 +365,36 @@
 
             const traces = [];
             const traceKeys = [];  // parallel: peer_key per trace for selection
+
+            // Event histogram as background bars (y2 axis) — added first so they render behind lines
+            const hist = data.event_histogram;
+            if (hist) {
+                // Our pieces on bottom (green), peer pieces stacked on top (blue)
+                if (hist.self_bins && hist.self_counts && hist.self_counts.some(c => c > 0)) {
+                    traces.push({
+                        x: hist.self_bins, y: hist.self_counts,
+                        type: 'bar', name: 'Our pieces/bucket',
+                        marker: { color: 'rgba(86, 211, 100, 0.35)' },
+                        width: hist.step,
+                        yaxis: 'y2',
+                        hovertemplate: '%{y} our pieces<extra></extra>',
+                    });
+                    traceKeys.push(null);
+                }
+                if (hist.peer_bins && hist.peer_counts && hist.peer_counts.some(c => c > 0)) {
+                    traces.push({
+                        x: hist.peer_bins, y: hist.peer_counts,
+                        type: 'bar', name: 'Peer pieces/bucket',
+                        marker: { color: 'rgba(88, 166, 255, 0.35)' },
+                        width: hist.step,
+                        yaxis: 'y2',
+                        hovertemplate: '%{y} peer pieces<extra></extra>',
+                    });
+                    traceKeys.push(null);
+                }
+            }
+
+            // Self cumulative progress line
             if (data.self) {
                 traces.push({
                     x: data.self.elapsed_secs, y: data.self.piece_counts,
@@ -404,7 +405,7 @@
                 traceKeys.push('self');
             }
 
-            // Only add peers that have actual data to the chart
+            // Peer cumulative progress lines
             peersWithData.forEach((peer, idx) => {
                 const color = peerColors[idx % peerColors.length];
                 const peerKey = `${peer.ip}:${peer.port}`;
@@ -421,14 +422,19 @@
             if (!seedersOnly) container.innerHTML = '';
             Plotly.newPlot(plotTarget, traces, {
                 ...commonLayout,
-                yaxis: { ...commonLayout.yaxis, title: 'Pieces' },
+                margin: { l: 80, r: 80, t: 20, b: 60 },
+                yaxis: { ...commonLayout.yaxis, title: 'Pieces', rangemode: 'tozero' },
+                yaxis2: {
+                    title: 'Events / bucket',
+                    overlaying: 'y', side: 'right',
+                    showgrid: false, rangemode: 'tozero',
+                    zerolinecolor: '#30363d',
+                    color: '#8b949e',
+                },
                 xaxis: { ...commonLayout.xaxis, title: 'Elapsed Time (seconds)' },
                 hovermode: 'x unified',
-                legend: {
-                    ...commonLayout.legend,
-                    y: 1, yanchor: 'top', x: 1.02, xanchor: 'left',
-                    font: { size: 10, color: '#8b949e' }
-                }
+                barmode: 'stack',
+                showlegend: false
             }, plotlyConfig);
 
             // Attach key mapping to chart element for cross-highlighting
