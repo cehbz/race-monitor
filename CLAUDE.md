@@ -185,9 +185,9 @@ Event routing: `we_have` events route via `torrentPtrs` (obj_ptr is torrent*). `
 
 `race.EnrichmentAPI` interface (implemented by `qbSyncClient` in `cmd/race-monitor/qbclient.go`):
 - `Sync()` — incremental maindata fetch (uses stored rid); returns metadata keyed by hex info_hash for changed torrents. Provides torrent Name, Size.
-- `FetchTorrentMeta(hash)` — per-torrent properties (PieceCount, Size only — not Name).
+- `FetchTorrentMeta(hash)` — per-torrent properties (Name, PieceCount, Size). Uses the properties endpoint which resolves by hash against libtorrent's handle map, independent of qBittorrent's `m_torrents`.
 
-The coordinator primes the metadata cache at startup via `Sync()`. On cache miss (newly-added torrent), it re-syncs to pick up the new entry.
+The coordinator primes the metadata cache at startup via `Sync()`. At race start, `FetchTorrentMeta()` fetches name, size, and piece_count directly from the properties endpoint.
 
 ### Storage Schema
 
@@ -268,4 +268,4 @@ Capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`, `CAP_SYS_ADMIN` (set
 - **Three-tier provider identification**: Tier 1: rDNS hostname patterns (highest confidence, e.g. `*.feral.io`). Tier 2: brand alias map on ipapi.is fields — maps corporate entities to consumer brands (SlashN → Ultra.cc) via ASN, domain, abuse email. Tier 3: raw datacenter name passthrough from ipapi.is.
 - **Sentinel file wakeup**: Daemon touches `enrichment.notify` only when enqueuing new IPs. Enricher watches via inotify. Avoids false wakes from SQLite WAL writes.
 - **Additive enrichment schema**: Tables created with `CREATE TABLE IF NOT EXISTS`, not part of versioned schema. Survive daemon schema bumps without data loss.
-- **Deferred torrent name resolution**: In libtorrent 1.2.x, `session_impl::add_torrent()` calls `torrent::start()` (firing our eBPF probe) before posting `add_torrent_alert`. qBittorrent only inserts the torrent into `m_torrents` (visible to the sync API) after the alert is dispatched via `Qt::QueuedConnection`. This creates a window where the sync API doesn't yet have the torrent name. The coordinator records when the name is unresolved and retries at race completion via `retryTorrentName()`, when the API is guaranteed to have the torrent registered.
+- **Properties endpoint for name resolution**: In libtorrent 1.2.x, `session_impl::add_torrent()` calls `torrent::start()` (firing our eBPF probe) before posting `add_torrent_alert`. qBittorrent only inserts the torrent into `m_torrents` (visible to the sync/maindata API) after the alert is dispatched via `Qt::QueuedConnection`. The properties endpoint (`/api/v2/torrents/properties`) bypasses this window because it resolves the hash directly against libtorrent's handle map, so name, size, and piece_count are available immediately at race start.
