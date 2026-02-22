@@ -2,7 +2,6 @@
 package capture
 
 import (
-	"bytes"
 	"context"
 	"debug/elf"
 	"encoding/binary"
@@ -55,10 +54,64 @@ func findSymbol(binPath, prefix string) (string, error) {
 	return "", fmt.Errorf("no symbol with prefix %q in %s", prefix, binPath)
 }
 
-// readResult carries a perf record and error from the read goroutine.
-type readResult struct {
-	rec perf.Record
-	err error
+// decodeProbeEvent decodes a raw perf sample into a typed ProbeEvent.
+// Zero-copy for slim events: reads fields directly from the slice via
+// binary.LittleEndian without intermediate structs or reflection.
+// For dump events, allocates a typed struct and copies Data once.
+// Returns nil for malformed or unknown events.
+func decodeProbeEvent(raw []byte) bpf.ProbeEvent {
+	if len(raw) < 24 { // minimum: event_t is 24 bytes
+		return nil
+	}
+
+	eventType := binary.LittleEndian.Uint32(raw[0:4])
+
+	switch eventType {
+	case bpf.EventPeerDump, bpf.EventTorrentDump, bpf.EventTorrentStarted:
+		// struct_dump_t layout: EventType(4) | Pad(4) | Timestamp(8) | ObjPtr(8) | Data(4096)
+		if len(raw) < 24+4096 {
+			return nil
+		}
+		timestamp := binary.LittleEndian.Uint64(raw[8:16])
+		objPtr := binary.LittleEndian.Uint64(raw[16:24])
+		switch eventType {
+		case bpf.EventPeerDump:
+			ev := &bpf.PeerDetailsEvent{ConnPtr: objPtr, Timestamp: timestamp}
+			copy(ev.Data[:], raw[24:24+4096])
+			return ev
+		case bpf.EventTorrentDump:
+			ev := &bpf.TorrentDetailsEvent{TorrentPtr: objPtr, Timestamp: timestamp}
+			copy(ev.Data[:], raw[24:24+4096])
+			return ev
+		case bpf.EventTorrentStarted:
+			ev := &bpf.TorrentStartedEvent{TorrentPtr: objPtr, Timestamp: timestamp}
+			copy(ev.Data[:], raw[24:24+4096])
+			return ev
+		}
+
+	case bpf.EventWeHave:
+		// event_t layout: EventType(4) | PieceIndex(4) | Timestamp(8) | ObjPtr(8)
+		return &bpf.WeHaveEvent{
+			TorrentPtr: binary.LittleEndian.Uint64(raw[16:24]),
+			PieceIndex: binary.LittleEndian.Uint32(raw[4:8]),
+			Timestamp:  binary.LittleEndian.Uint64(raw[8:16]),
+		}
+
+	case bpf.EventIncomingHave:
+		return &bpf.IncomingHaveEvent{
+			ConnPtr:    binary.LittleEndian.Uint64(raw[16:24]),
+			PieceIndex: binary.LittleEndian.Uint32(raw[4:8]),
+			Timestamp:  binary.LittleEndian.Uint64(raw[8:16]),
+		}
+
+	case bpf.EventTorrentFinished:
+		return &bpf.TorrentFinishedEvent{
+			TorrentPtr: binary.LittleEndian.Uint64(raw[16:24]),
+			Timestamp:  binary.LittleEndian.Uint64(raw[8:16]),
+		}
+	}
+
+	return nil
 }
 
 // HasTorrentStartSymbol checks whether the qBittorrent binary contains the
@@ -284,6 +337,9 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 
 	eventChan := make(chan bpf.ProbeEvent, 10000)
 
+	// Reader goroutine: uses ReadInto to reuse the Record and its RawSample
+	// backing array across reads (zero allocation after warmup). Decodes
+	// inline before the next ReadInto overwrites the buffer.
 	go func() {
 		defer close(eventChan)
 		defer rd.Close()
@@ -291,113 +347,65 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 
 		logger.Info("perf reader started, waiting for events")
 
-		var totalLost uint64
-		var eventCount uint64
-		var firstEventLogged bool
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		recCh := make(chan readResult, 1)
-		go func() {
-			for {
-				rec, err := rd.Read()
-				recCh <- readResult{rec: rec, err: err}
-				if err != nil {
-					close(recCh)
-					return
-				}
-			}
-		}()
+		var (
+			rec              perf.Record
+			totalLost        uint64
+			eventCount       uint64
+			firstEventLogged bool
+			lastLogTime      = time.Now()
+		)
 
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "lost", totalLost)
-			case r, ok := <-recCh:
-				if !ok {
+			if err := rd.ReadInto(&rec); err != nil {
+				if errors.Is(err, perf.ErrClosed) {
 					logger.Debug("perf reader closed", "total_lost_samples", totalLost)
 					return
 				}
-				if r.err != nil {
-					if errors.Is(r.err, perf.ErrClosed) {
-						logger.Debug("perf reader closed", "total_lost_samples", totalLost)
-						return
-					}
-					logger.Warn("perf read error", "error", r.err)
-					continue
+				logger.Warn("perf read error", "error", err)
+				continue
+			}
+
+			if rec.LostSamples > 0 {
+				totalLost += rec.LostSamples
+				logger.Warn("lost perf samples", "batch", rec.LostSamples, "total_lost", totalLost)
+				continue
+			}
+
+			if !firstEventLogged && len(rec.RawSample) >= 4 {
+				firstEventLogged = true
+				logger.Log(ctx, LevelTrace, "perf: first event received",
+					"event_type", binary.LittleEndian.Uint32(rec.RawSample[:4]))
+			}
+
+			// Decode directly from RawSample — no intermediate structs,
+			// no bytes.Buffer, no reflection. Must complete before next
+			// ReadInto reuses the backing array.
+			typed := decodeProbeEvent(rec.RawSample)
+			if typed == nil {
+				if len(rec.RawSample) >= 4 {
+					logger.Warn("failed to decode event",
+						"type", binary.LittleEndian.Uint32(rec.RawSample[:4]),
+						"len", len(rec.RawSample))
 				}
-				rec := r.rec
+				continue
+			}
 
-				if rec.LostSamples > 0 {
-					totalLost += rec.LostSamples
-					logger.Warn("lost perf samples", "batch", rec.LostSamples, "total_lost", totalLost)
-					continue
-				}
+			eventCount++
 
-				// Polymorphic decode: peek at first 4 bytes for event type
-				if len(rec.RawSample) < 4 {
-					logger.Warn("perf record too short", "len", len(rec.RawSample))
-					continue
-				}
+			if since := time.Since(lastLogTime); since >= 5*time.Second {
+				logger.Log(ctx, LevelTrace, "perf: event count", "events", eventCount, "lost", totalLost)
+				lastLogTime = time.Now()
+			}
 
-				eventType := binary.LittleEndian.Uint32(rec.RawSample[:4])
-
-				// Trace: first event received (confirms events reach Go)
-				if !firstEventLogged {
-					firstEventLogged = true
-					logger.Log(ctx, LevelTrace, "perf: first event received", "event_type", eventType)
-				}
-
-				eventCount++
-				var typed bpf.ProbeEvent
-
-				switch eventType {
-				case bpf.EventPeerDump, bpf.EventTorrentDump, bpf.EventTorrentStarted:
-					var dump bpf.DumpEvent
-					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &dump); err != nil {
-						logger.Warn("failed to decode struct dump event", "error", err)
-						continue
-					}
-					switch eventType {
-					case bpf.EventPeerDump:
-						typed = &bpf.PeerDetailsEvent{ConnPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
-					case bpf.EventTorrentDump:
-						typed = &bpf.TorrentDetailsEvent{TorrentPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
-					case bpf.EventTorrentStarted:
-						typed = &bpf.TorrentStartedEvent{TorrentPtr: dump.ObjPtr, Timestamp: dump.Timestamp, Data: dump.Data}
-					}
-
-				default:
-					var event bpf.Event
-					if err := binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &event); err != nil {
-						logger.Warn("failed to decode event", "error", err)
-						continue
-					}
-					switch eventType {
-					case bpf.EventWeHave:
-						typed = &bpf.WeHaveEvent{TorrentPtr: event.ObjPtr, PieceIndex: event.PieceIndex, Timestamp: event.Timestamp}
-					case bpf.EventIncomingHave:
-						typed = &bpf.IncomingHaveEvent{ConnPtr: event.ObjPtr, PieceIndex: event.PieceIndex, Timestamp: event.Timestamp}
-					case bpf.EventTorrentFinished:
-						typed = &bpf.TorrentFinishedEvent{TorrentPtr: event.ObjPtr, Timestamp: event.Timestamp}
-					default:
-						logger.Warn("unknown event type", "type", eventType)
-						continue
-					}
-				}
-
-				select {
-				case eventChan <- typed:
-				case <-ctx.Done():
-					return
-				}
+			select {
+			case eventChan <- typed:
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
-	// Close the perf reader when context is cancelled (unblocks rd.Read)
+	// Close the perf reader when context is cancelled (unblocks ReadInto)
 	go func() {
 		<-ctx.Done()
 		rd.Close()
