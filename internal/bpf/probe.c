@@ -206,26 +206,6 @@ int trace_incoming_have(struct pt_regs *ctx) {
 	return 0;
 }
 
-// trace_incoming_piece hooks libtorrent::peer_connection::incoming_piece().
-// Called when we receive a piece fragment from a peer during active download.
-// Unlike incoming_have (which only fires when peers announce new pieces),
-// incoming_piece fires for every piece transfer — critical for peer discovery
-// when the swarm is dominated by seeders who never send HAVE messages.
-//
-// Uses the same seen_peers dedup map as incoming_have.
-// x86_64 ABI: RDI = this (peer_connection*).
-SEC("uprobe/incoming_piece")
-int trace_incoming_piece(struct pt_regs *ctx) {
-	u64 ptr = PT_REGS_PARM1(ctx);
-
-	// Emit struct dump on first encounter of this peer identity
-	emit_peer_dump_if_new(ctx, ptr);
-
-	// No slim event emitted — incoming_piece is only used for peer discovery.
-	// The piece data is tracked via we_have (after verification).
-	return 0;
-}
-
 // trace_incoming_bitfield hooks libtorrent::peer_connection::incoming_bitfield().
 // Called when a peer sends a BITFIELD message at connect time, announcing all
 // pieces they already have. Seeders use BITFIELD (or HAVE-ALL) instead of

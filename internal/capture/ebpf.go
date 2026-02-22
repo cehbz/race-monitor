@@ -28,7 +28,6 @@ import (
 var symbolPrefixes = map[string]string{
 	"we_have":           "_ZN10libtorrent7torrent7we_haveE",
 	"incoming_have":     "_ZN10libtorrent15peer_connection13incoming_haveE",
-	"incoming_piece":    "_ZN10libtorrent15peer_connection14incoming_pieceE",
 	"incoming_bitfield": "_ZN10libtorrent15peer_connection17incoming_bitfieldE",
 	"torrent_start":     "_ZN10libtorrent7torrent5startE",
 	"torrent_finished":  "_ZN10libtorrent7torrent8finishedE",
@@ -154,11 +153,6 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}
 
 	// Resolve peer discovery symbols (optional — improve peer discovery)
-	incomingPieceSym, err := findSymbol(binPath, symbolPrefixes["incoming_piece"])
-	if err != nil {
-		logger.Warn("peer discovery probe: incoming_piece() not found, peer discovery relies on incoming_have only", "error", err)
-		incomingPieceSym = ""
-	}
 	incomingBitfieldSym, err := findSymbol(binPath, symbolPrefixes["incoming_bitfield"])
 	if err != nil {
 		logger.Warn("peer discovery probe: incoming_bitfield() not found, seeders using BITFIELD may not be discovered", "error", err)
@@ -180,7 +174,6 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	logger.Info("resolved probe symbols",
 		"we_have", weHaveSym,
 		"incoming_have", incomingHaveSym,
-		"incoming_piece", incomingPieceSym,
 		"incoming_bitfield", incomingBitfieldSym,
 		"torrent_start", torrentStartSym,
 		"torrent_finished", torrentFinishedSym)
@@ -249,15 +242,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}
 	closers = append(closers, func() { upIncomingHave.Close() })
 
-	// Attach optional peer discovery probes
-	if incomingPieceSym != "" {
-		upIncomingPiece, err := ex.Uprobe(incomingPieceSym, objs.TraceIncomingPiece, uprobeOpts)
-		if err != nil {
-			logger.Warn("failed to attach incoming_piece uprobe (non-fatal)", "error", err)
-		} else {
-			closers = append(closers, func() { upIncomingPiece.Close() })
-		}
-	}
+	// Attach optional peer discovery probe
 	if incomingBitfieldSym != "" {
 		upIncomingBitfield, err := ex.Uprobe(incomingBitfieldSym, objs.TraceIncomingBitfield, uprobeOpts)
 		if err != nil {
