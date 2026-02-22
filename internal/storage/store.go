@@ -78,6 +78,18 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("creating enrichment queue: %w", err)
 	}
 
+	// Race errors — additive table for surfacing daemon-detected anomalies
+	// (e.g. sustained cross-race event contamination) in the dashboard.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS race_errors (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		race_id     INTEGER NOT NULL,
+		detected_at TEXT NOT NULL,
+		error_type  TEXT NOT NULL,
+		message     TEXT NOT NULL)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating race_errors table: %w", err)
+	}
+
 	return s, nil
 }
 
@@ -220,6 +232,18 @@ func (s *Store) Close() error {
 // enqueueEnrichment adds an IP to the enrichment queue and touches the sentinel
 // file to wake the enricher. Fire-and-forget: errors are silently ignored since
 // enrichment is best-effort and must not block the hot path.
+// InsertRaceError records a daemon-detected anomaly for a race.
+// Best-effort: errors are logged but do not propagate to the caller.
+func (s *Store) InsertRaceError(ctx context.Context, raceID int64, errorType, message string) {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO race_errors (race_id, detected_at, error_type, message) VALUES (?, ?, ?, ?)`,
+		raceID, formatTS(time.Now()), errorType, message)
+	if err != nil {
+		// Swallow — anomaly recording must not disrupt the hot path.
+		_ = err
+	}
+}
+
 func (s *Store) enqueueEnrichment(ctx context.Context, ip string) {
 	if ip == "" {
 		return

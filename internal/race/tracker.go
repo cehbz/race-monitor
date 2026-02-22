@@ -23,6 +23,7 @@ func processEvents(
 	logger *slog.Logger,
 	hash string,
 	raceID int64,
+	pieceCount int,
 	events <-chan bpf.ProbeEvent,
 	downloadCompleteCh <-chan struct{},
 ) error {
@@ -30,6 +31,11 @@ func processEvents(
 		batchSize               = 100
 		postCompleteIdleTimeout = 10 * time.Second
 		maxDuration             = 30 * time.Minute
+
+		// A few out-of-range events per source are expected from cross-CPU
+		// perf buffer interleaving during peer_connection* reuse. Sustained
+		// contamination above this threshold indicates a routing bug.
+		contaminationThreshold = 10
 	)
 
 	var (
@@ -44,6 +50,11 @@ func processEvents(
 		downloadCompleteSel = downloadCompleteCh // local copy we nil after receiving
 		maxTimer            = time.NewTimer(maxDuration)
 		eventBatch          = make([]storage.Event, 0, batchSize)
+
+		// contaminationCount tracks out-of-range piece_index events per source
+		// (conn_ptr for incoming_have, torrent_ptr for we_have). A few are
+		// expected from cross-CPU timing; many indicate a bug.
+		contaminationCount = make(map[uint64]int)
 
 		totalEvents   uint64
 		weHaveCount   uint64
@@ -142,6 +153,21 @@ func processEvents(
 
 			switch e := ev.(type) {
 			case *bpf.WeHaveEvent:
+				if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
+					contaminationCount[e.TorrentPtr]++
+					n := contaminationCount[e.TorrentPtr]
+					if n == contaminationThreshold {
+						logger.Error("CONTAMINATION: sustained we_have piece_index out of range",
+							"hash", hash, "race_id", raceID,
+							"piece_index", e.PieceIndex, "piece_count", pieceCount,
+							"torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr),
+							"count", n)
+						store.InsertRaceError(ctx, raceID, "piece_index_out_of_range",
+							fmt.Sprintf("we_have piece_index %d >= piece_count %d from torrent_ptr 0x%x (%d events)",
+								e.PieceIndex, pieceCount, e.TorrentPtr, n))
+					}
+					continue
+				}
 				weHaveCount++
 				have[int(e.PieceIndex)] = true
 				dbEvent.EventType = storage.EventTypePieceReceived
@@ -154,6 +180,21 @@ func processEvents(
 				}
 
 			case *bpf.IncomingHaveEvent:
+				if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
+					contaminationCount[e.ConnPtr]++
+					n := contaminationCount[e.ConnPtr]
+					if n == contaminationThreshold {
+						logger.Error("CONTAMINATION: sustained incoming_have piece_index out of range",
+							"hash", hash, "race_id", raceID,
+							"piece_index", e.PieceIndex, "piece_count", pieceCount,
+							"conn_ptr", fmt.Sprintf("0x%x", e.ConnPtr),
+							"count", n)
+						store.InsertRaceError(ctx, raceID, "piece_index_out_of_range",
+							fmt.Sprintf("incoming_have piece_index %d >= piece_count %d from conn_ptr 0x%x (%d events)",
+								e.PieceIndex, pieceCount, e.ConnPtr, n))
+					}
+					continue
+				}
 				peerHaveCount++
 				connDBID, exists := connMap[e.ConnPtr]
 				if !exists {

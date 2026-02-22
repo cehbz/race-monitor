@@ -2,10 +2,12 @@ package race
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -825,6 +827,75 @@ func TestEventChannelCloseCleansUp(t *testing.T) {
 	if !raceRecord.CompletedAt.Valid {
 		t.Error("expected race to be completed after channel close")
 	}
+}
+
+// TestPeerDumpCleansStaleConnToRace tests that when a PeerDetailsEvent arrives
+// for a connPtr that has a stale connToRace mapping (because the peer_connection*
+// was reused for an untracked torrent), the stale mapping is removed and an
+// ERROR is logged.
+func TestPeerDumpCleansStaleConnToRace(t *testing.T) {
+	store, _ := storage.New(":memory:")
+	defer store.Close()
+
+	const infoHashOffset = 64
+	const torrentPtrOffset = 400
+	offsets := testOffsets(infoHashOffset)
+
+	// Capture logs — stale routing cleanup is Info level (expected operational event)
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	c := NewCoordinator(store, logger, "", offsets, nil, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	eventsChan, errChan := startRun(c, ctx)
+
+	// Create a race via TorrentStartedEvent
+	infoHashBytes := []byte{0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+		0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x5e, 0x5f, 0x60, 0x61, 0x62, 0x63}
+	infoHashHex := hex.EncodeToString(infoHashBytes)
+	trackedTorrentPtr := uint64(0xe000)
+
+	eventsChan <- makeTorrentStartEvent(trackedTorrentPtr, infoHashBytes, infoHashOffset)
+
+	waitForState(t, c, func(s StateSnapshot) bool {
+		_, exists := s.ActiveRaces[infoHashHex]
+		return exists
+	}, 2*time.Second)
+
+	// Manually set a stale connToRace mapping — simulates a previous peer
+	// connection at this address that belonged to this race.
+	staleConnPtr := uint64(0x7f0e5c34e150)
+	c.connToRace[staleConnPtr] = infoHashHex
+
+	// Now send a PeerDetailsEvent for the same connPtr but with an UNTRACKED
+	// torrent_ptr. This simulates libtorrent reusing the peer_connection*
+	// address for a connection to a different, untracked torrent.
+	untrackedTorrentPtr := uint64(0xdead0000)
+	peerDump := &bpf.PeerDetailsEvent{
+		ConnPtr:   staleConnPtr,
+		Timestamp: uint64(time.Now().UnixNano()),
+	}
+	// Embed the untracked torrent_ptr at the correct offset
+	binary.LittleEndian.PutUint64(peerDump.Data[torrentPtrOffset:], untrackedTorrentPtr)
+
+	eventsChan <- peerDump
+
+	// Wait for the stale mapping to be cleaned up
+	waitForState(t, c, func(s StateSnapshot) bool {
+		return s.ConnToRace == 0
+	}, 2*time.Second)
+
+	// Verify Info log about stale routing cleanup
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "stale routing") {
+		t.Errorf("expected log about stale routing, got: %s", logOutput)
+	}
+
+	close(eventsChan)
+	<-errChan
 }
 
 // TestQueryStateSnapshotConsistency tests that QueryState returns consistent snapshots

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "wehave_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "wehave_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send 3 we_have events for different pieces
@@ -104,7 +105,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "incoming_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "incoming_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send incoming_have events from two different peer connections
@@ -156,7 +157,7 @@ func TestProcessEvents_CompletionDetection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "complete_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "complete_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send we_have for all pieces
@@ -196,7 +197,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "batch_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "batch_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send 150 events — first 100 should trigger a batch flush, remainder
@@ -227,7 +228,7 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "cancel_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "cancel_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send one event so processEvents is active
@@ -262,7 +263,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "downloadcomplete_test", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "downloadcomplete_test", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send some events
@@ -303,7 +304,7 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, 0, events, downloadCompleteCh)
 	}()
 
 	// Send a TorrentFinishedEvent — the tracker only handles WeHave and
@@ -323,6 +324,106 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("processEvents returned error: %v", err)
+	}
+}
+
+func TestProcessEvents_ContaminationDetected(t *testing.T) {
+	const pieceCount = 100
+	store, raceID, cleanup := setupTrackerTest(t, "contamination_test")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	events := make(chan bpf.ProbeEvent, 200)
+	downloadCompleteCh := make(chan struct{}, 1)
+
+	// Use a logger that captures output so we can verify ERROR was logged
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- processEvents(ctx, store, logger, "contamination_test", raceID, pieceCount, events, downloadCompleteCh)
+	}()
+
+	// Send valid events
+	events <- &bpf.WeHaveEvent{PieceIndex: 0, Timestamp: testTimestamp(0)}
+	events <- &bpf.IncomingHaveEvent{PieceIndex: 5, Timestamp: testTimestamp(time.Millisecond), ConnPtr: 0xaaa}
+
+	// Send 10 contaminated we_have events from the same source to hit the
+	// threshold (contaminationThreshold = 10). Below threshold is expected
+	// cross-CPU jitter; at threshold it escalates to ERROR + race_errors.
+	for i := 0; i < 10; i++ {
+		events <- &bpf.WeHaveEvent{
+			PieceIndex: uint32(200 + i),
+			Timestamp:  testTimestamp(time.Duration(2+i) * time.Millisecond),
+			TorrentPtr: 0xbbb,
+		}
+	}
+
+	// Send 10 contaminated incoming_have events from the same source
+	for i := 0; i < 10; i++ {
+		events <- &bpf.IncomingHaveEvent{
+			PieceIndex: uint32(1360 + i),
+			Timestamp:  testTimestamp(time.Duration(12+i) * time.Millisecond),
+			ConnPtr:    0xccc,
+		}
+	}
+
+	// Send another valid event to confirm processing continues
+	events <- &bpf.WeHaveEvent{PieceIndex: 1, Timestamp: testTimestamp(22 * time.Millisecond)}
+
+	close(events)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("processEvents returned error: %v", err)
+	}
+
+	// Verify ERROR was logged for both contamination sources at threshold
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "CONTAMINATION") {
+		t.Error("expected CONTAMINATION error in logs")
+	}
+	if !strings.Contains(logOutput, "we_have") {
+		t.Error("expected we_have contamination logged")
+	}
+	if !strings.Contains(logOutput, "incoming_have") {
+		t.Error("expected incoming_have contamination logged")
+	}
+
+	// Verify contaminated events were NOT persisted — only 3 valid events
+	var eventCount int
+	err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ?", raceID).Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+	if eventCount != 3 {
+		t.Errorf("expected 3 persisted events (contaminated skipped), got %d", eventCount)
+	}
+
+	// Verify race_errors were written to the DB
+	rows, err := store.DB().QueryContext(ctx,
+		"SELECT error_type, message FROM race_errors WHERE race_id = ?", raceID)
+	if err != nil {
+		t.Fatalf("failed to query race_errors: %v", err)
+	}
+	defer rows.Close()
+
+	var errorCount int
+	for rows.Next() {
+		var errorType, message string
+		if err := rows.Scan(&errorType, &message); err != nil {
+			t.Fatalf("failed to scan race_error: %v", err)
+		}
+		if errorType != "piece_index_out_of_range" {
+			t.Errorf("unexpected error_type: %s", errorType)
+		}
+		errorCount++
+	}
+	if errorCount != 2 {
+		t.Errorf("expected 2 race_errors (one per source), got %d", errorCount)
 	}
 }
 

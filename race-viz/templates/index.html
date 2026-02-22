@@ -144,6 +144,8 @@
         .badge.seeder { background: rgba(63, 185, 80, 0.2); color: #3fb950; }
         .badge.leecher { background: rgba(121, 192, 255, 0.2); color: #79c0ff; }
         .badge.competitive { background: rgba(248, 81, 73, 0.2); color: #f85149; }
+        .badge.contaminated { background: rgba(248, 81, 73, 0.3); color: #f85149; }
+        .contaminated-row td { background: rgba(248, 81, 73, 0.08); }
         .beat-us { color: #3fb950; font-weight: 600; font-size: 12px; }
         .self-row td { background: rgba(88, 166, 255, 0.05); }
         .seeder-row td { opacity: 0.7; }
@@ -450,7 +452,24 @@
             const selfIdx = participants.findIndex(p => p.type === 'self');
             const ourPlace = selfIdx >= 0 ? selfIdx + 1 : null;
 
-            let html = `
+            const raceErrors = data.errors || [];
+
+            let html = '';
+            if (raceErrors.length > 0) {
+                const details = raceErrors.map(e =>
+                    `<li><code>${e.error_type}</code>: ${e.message} <span style="color:#6e7681">(${e.detected_at})</span></li>`
+                ).join('');
+                html += `
+                    <div class="error" style="margin-bottom: 15px">
+                        Contamination detected: ${raceErrors.length} error(s) &mdash; cross-race event misrouting exceeded threshold.
+                        <details style="margin-top: 8px"><summary>Details</summary>
+                            <ul style="margin-top: 8px; padding-left: 20px">${details}</ul>
+                        </details>
+                    </div>
+                `;
+            }
+
+            html += `
                 <div class="analysis-stats">
                     <div class="stat-mini">
                         <div class="stat-label">Participants</div>
@@ -499,7 +518,8 @@
                 parts.forEach((p, idx) => {
                     const isSelf = p.type === 'self';
                     const isSeeder = p.type === 'seeder';
-                    const rowClass = isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : '');
+                    const isContaminated = p.contaminated === true;
+                    const rowClass = isContaminated ? 'contaminated-row' : (isSelf ? 'self-row' : (isSeeder ? 'seeder-row' : ''));
 
                     let finishStr;
                     if (isSeeder && (p.finish_sec === 0 || p.finish_sec == null))
@@ -538,7 +558,7 @@
                             <td class="num">${idx + 1}</td>
                             <td><code>${p.ip || '\u2014'}</code></td>
                             <td class="num">${p.port || '\u2014'}</td>
-                            <td>${p.client || '\u2014'}</td>
+                            <td>${isContaminated ? '<span class="badge contaminated">CONTAMINATED</span> ' : ''}${p.client || '\u2014'}</td>
                             <td title="${netTooltip}">${netLabel}</td>
                             <td class="num">${p.pieces}</td>
                             <td class="num">${aheadStr}</td>

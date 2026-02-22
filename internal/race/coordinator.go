@@ -296,7 +296,19 @@ func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsE
 
 	hash, ok := c.torrentPtrs[torrentPtr]
 	if !ok {
-		// This peer_connection belongs to a torrent we're not tracking
+		// This peer_connection belongs to a torrent we're not tracking.
+		// If connToRace has a stale mapping for this connPtr (from a previous
+		// connection that reused this peer_connection* address), remove it.
+		// Without cleanup, incoming_have events for the untracked torrent
+		// would be misrouted to the old race via the stale mapping.
+		if staleHash, stale := c.connToRace[e.ConnPtr]; stale {
+			c.logger.Info("peer_connection* reused for untracked torrent, removing stale routing",
+				"conn_ptr", fmt.Sprintf("0x%x", e.ConnPtr),
+				"stale_hash", staleHash,
+				"new_torrent_ptr", fmt.Sprintf("0x%x", torrentPtr))
+			delete(c.connToRace, e.ConnPtr)
+			delete(c.connEndpoints, e.ConnPtr)
+		}
 		return
 	}
 
@@ -417,10 +429,10 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	}
 	c.infoHashToRaceState[infoHash] = state
 
-	go func(hash string, raceID int64, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
-		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, eventChan, completeCh)
+	go func(hash string, raceID int64, pieceCount int, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
+		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, pieceCount, eventChan, completeCh)
 		c.completeChan <- raceComplete{hash: hash, err: err}
-	}(infoHash, raceID, state.eventChan, downloadCompleteCh)
+	}(infoHash, raceID, pieceCount, state.eventChan, downloadCompleteCh)
 }
 
 // notifyDashboard sends a fire-and-forget POST to the dashboard SSE endpoint.

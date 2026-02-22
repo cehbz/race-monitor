@@ -276,6 +276,7 @@ def get_peers(race_id):
     # Collect peer IPs for enrichment lookup
     peer_ips = {meta['ip'] for meta in conn_meta.values() if meta.get('ip')}
     enrichment = db.fetch_ip_enrichment(conn, peer_ips)
+    race_errors = db.fetch_race_errors(conn, race_id)
     conn.close()
 
     # Compute race epoch
@@ -337,6 +338,14 @@ def get_peers(race_id):
         'finish_sec': our_finish_sec,
     })
 
+    # Detect contaminated connections (piece_index >= piece_count)
+    contaminated_conns = set()
+    if piece_count > 1:
+        for conn_id, raw_events in peer_raw.items():
+            max_piece = max(pidx for pidx, _ in raw_events)
+            if max_piece >= piece_count:
+                contaminated_conns.add(conn_id)
+
     # Peers with HAVE data
     tracked_ids = set()
     for conn_id, times in peer_groups.items():
@@ -365,7 +374,7 @@ def get_peers(race_id):
                 ahead += 1
 
         label = meta.get('client') or (f"{meta.get('ip', '')}:{meta.get('port', 0)}" if meta.get('ip') else f'conn_{conn_id}')
-        participants.append({
+        entry = {
             'label': label,
             'ip': meta.get('ip', ''),
             'port': meta.get('port', 0),
@@ -374,7 +383,10 @@ def get_peers(race_id):
             'pieces': len(times),
             'ahead': ahead,
             'finish_sec': round(finish_sec, 1) if finish_sec is not None else None,
-        })
+        }
+        if conn_id in contaminated_conns:
+            entry['contaminated'] = True
+        participants.append(entry)
 
     # Peers without HAVE data (seeders discovered via struct dumps only)
     for conn_id, meta in conn_meta.items():
@@ -416,6 +428,7 @@ def get_peers(race_id):
         'piece_count': piece_count,
         'our_finish_sec': our_finish_sec,
         'participants': participants,
+        'errors': race_errors,
     })
 
 

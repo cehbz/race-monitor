@@ -249,3 +249,18 @@ def fetch_ip_enrichment(conn, ips):
     except Exception:
         # Tables don't exist yet — enricher hasn't run
         return {}
+
+
+def fetch_race_errors(conn, race_id):
+    """Fetch daemon-detected anomalies for a race.
+
+    Returns list of dicts with error_type, message, detected_at.
+    Silently returns [] if race_errors table doesn't exist yet.
+    """
+    try:
+        cursor = conn.execute(
+            'SELECT error_type, message, detected_at FROM race_errors WHERE race_id = ? ORDER BY detected_at',
+            (race_id,))
+        return [dict(row) for row in cursor.fetchall()]
+    except Exception:
+        return []
