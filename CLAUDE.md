@@ -222,7 +222,7 @@ Dashboard joins: `connections.ip → ip_dns → network_enrichment`.
 | `internal/bpf/probe_bpfel.go` | 185 | Auto-generated Go bindings (do not edit; gitignored) |
 | `internal/bpf/gen.go` | 32 | Event type constants and `go:generate` directive |
 | `internal/capture/ebpf.go` | 340 | ELF symbol resolution, uprobe attachment, perf reader, CaptureHandle, ProbeConfig |
-| `internal/race/coordinator.go` | 600 | Single-writer event router — all state mutations, SeenCache cleanup |
+| `internal/race/coordinator.go` | 650 | Single-writer event router — all state mutations, SeenCache cleanup, deferred name resolution |
 | `internal/race/tracker.go` | 257 | Per-race event processing, batch SQLite writes, idle monitoring |
 | `internal/race/calibration.go` | 564 | Two-phase offset discovery (sockaddr, peer_id, info_hash, torrent_ptr) |
 | `internal/race/calibration_cache.go` | 81 | JSON persistence of calibrated offsets |
@@ -268,3 +268,4 @@ Capabilities: `CAP_BPF`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`, `CAP_SYS_ADMIN` (set
 - **Three-tier provider identification**: Tier 1: rDNS hostname patterns (highest confidence, e.g. `*.feral.io`). Tier 2: brand alias map on ipapi.is fields — maps corporate entities to consumer brands (SlashN → Ultra.cc) via ASN, domain, abuse email. Tier 3: raw datacenter name passthrough from ipapi.is.
 - **Sentinel file wakeup**: Daemon touches `enrichment.notify` only when enqueuing new IPs. Enricher watches via inotify. Avoids false wakes from SQLite WAL writes.
 - **Additive enrichment schema**: Tables created with `CREATE TABLE IF NOT EXISTS`, not part of versioned schema. Survive daemon schema bumps without data loss.
+- **Deferred torrent name resolution**: In libtorrent 1.2.x, `session_impl::add_torrent()` calls `torrent::start()` (firing our eBPF probe) before posting `add_torrent_alert`. qBittorrent only inserts the torrent into `m_torrents` (visible to the sync API) after the alert is dispatched via `Qt::QueuedConnection`. This creates a window where the sync API doesn't yet have the torrent name. The coordinator records when the name is unresolved and retries at race completion via `retryTorrentName()`, when the API is guaranteed to have the torrent registered.
