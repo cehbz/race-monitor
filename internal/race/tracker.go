@@ -23,7 +23,7 @@ func processEvents(
 	logger *slog.Logger,
 	hash string,
 	raceID int64,
-	pieceCount int,
+	metaChan <-chan int,
 	events <-chan bpf.ProbeEvent,
 	downloadCompleteCh <-chan struct{},
 ) error {
@@ -43,6 +43,10 @@ func processEvents(
 		connMap = make(map[uint64]int64)
 		// selfConnID is the connection record for our own piece completions
 		selfConnID int64
+
+		// pieceCount is delivered asynchronously via metaChan. Zero until
+		// metadata resolves; contamination detection is inactive until then.
+		pieceCount int
 
 		have                = make(map[int]bool)
 		loggedComplete      bool
@@ -93,6 +97,13 @@ func processEvents(
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+
+		case pc, ok := <-metaChan:
+			if ok {
+				pieceCount = pc
+				metaChan = nil // one-shot; stop selecting
+				logger.Info("metadata resolved", "hash", hash, "piece_count", pieceCount)
+			}
 
 		case <-maxTimer.C:
 			logger.Info("max duration reached", "hash", hash)

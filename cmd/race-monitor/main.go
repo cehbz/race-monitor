@@ -300,7 +300,7 @@ Config: ~/.config/race-monitor/config.toml
 	// Create enrichment API client (optional)
 	var enrichAPI race.EnrichmentAPI
 	if webuiURL != "" {
-		api, err := newQBSyncClient(webuiURL, webuiUser, webuiPass, logger)
+		api, err := newQBClient(webuiURL, webuiUser, webuiPass, logger)
 		if err != nil {
 			logger.Warn("webui_url set but failed to create qBittorrent client (enrichment disabled)",
 				"error", err)

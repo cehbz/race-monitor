@@ -28,10 +28,16 @@ type raceComplete struct {
 type raceState struct {
 	eventChan          chan bpf.ProbeEvent
 	hash               string
-	pieceCount         int
 	raceID             int64
 	downloadCompleteCh chan struct{} // closed by coordinator when torrent::finished() fires
 	cancel             context.CancelFunc
+}
+
+// metaRequest asks the resolver goroutine to fetch torrent metadata
+// asynchronously and deliver pieceCount to the tracker.
+type metaRequest struct {
+	hash     string
+	metaChan chan<- int // one-shot: delivers pieceCount to tracker, then closed
 }
 
 // StateSnapshot provides a point-in-time view of coordinator state.
@@ -45,10 +51,9 @@ type StateSnapshot struct {
 
 // RaceSnap captures a race's metadata at a point in time.
 type RaceSnap struct {
-	Hash       string
-	PieceCount int
-	ChanLen    int
-	RaceID     int64
+	Hash    string
+	ChanLen int
+	RaceID  int64
 }
 
 type stateQuery struct {
@@ -65,10 +70,6 @@ type TorrentMeta struct {
 // EnrichmentAPI provides torrent metadata from qBittorrent's web API.
 // Used for name and piece_count enrichment only — not for calibration.
 type EnrichmentAPI interface {
-	// Sync fetches maindata (uses stored rid). Returns metadata keyed by
-	// hex info_hash for changed torrents.
-	Sync() (torrents map[string]TorrentMeta, err error)
-
 	// FetchTorrentMeta fetches per-torrent properties (piece_count, size).
 	FetchTorrentMeta(hash string) (TorrentMeta, error)
 }
@@ -120,8 +121,8 @@ type Coordinator struct {
 	// Nil when webui_url is not configured.
 	enrichAPI EnrichmentAPI
 
-	// torrentMeta caches metadata (name, size, piece_count) from the API.
-	torrentMeta map[string]TorrentMeta
+	// metaReqChan feeds the metadata resolver goroutine.
+	metaReqChan chan metaRequest
 
 	// seenCache manages BPF dedup map entries. Nil when not available
 	// (e.g., in tests). Used to clean up seen_peers and seen_torrents
@@ -152,7 +153,6 @@ func NewCoordinator(
 		connEndpoints:       make(map[uint64]netip.AddrPort),
 		completeChan:        make(chan raceComplete, 10),
 		stateQueryChan:      make(chan stateQuery),
-		torrentMeta:         make(map[string]TorrentMeta),
 		enrichAPI:           enrichAPI,
 		seenCache:           seenCache,
 	}
@@ -175,10 +175,9 @@ func (c *Coordinator) snapshotState() StateSnapshot {
 	}
 	for h, s := range c.infoHashToRaceState {
 		snap.ActiveRaces[h] = RaceSnap{
-			Hash:       s.hash,
-			PieceCount: s.pieceCount,
-			ChanLen:    len(s.eventChan),
-			RaceID:     s.raceID,
+			Hash:    s.hash,
+			ChanLen: len(s.eventChan),
+			RaceID:  s.raceID,
 		}
 	}
 	return snap
@@ -194,17 +193,10 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 		"info_hash_offset", c.offsets.InfoHashOffset,
 		"torrent_ptr_offset", c.offsets.TorrentPtrOffset)
 
-	// Prime metadata cache from API so torrent names are available when races start.
-	if c.enrichAPI != nil {
-		if torrents, err := c.enrichAPI.Sync(); err == nil {
-			for h, meta := range torrents {
-				c.torrentMeta[h] = meta
-			}
-			c.logger.Info("metadata cache primed from API", "torrents", len(torrents))
-		} else {
-			c.logger.Warn("failed to prime metadata cache", "error", err)
-		}
-	}
+	// Launch async metadata resolver — fetches torrent name/size/pieceCount
+	// off the event loop, delivering pieceCount to trackers via channel.
+	c.metaReqChan = make(chan metaRequest, 16)
+	go c.runMetaResolver(ctx)
 
 	for {
 		select {
@@ -370,6 +362,9 @@ func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsE
 // startRace creates a new race for the given info_hash and torrent_ptr.
 // startKtime is the BPF ktime from the torrent::start() event (0 if unavailable).
 // Idempotent: does nothing if a race already exists for this hash.
+//
+// Metadata (name, size, pieceCount) is resolved asynchronously by the
+// metadata resolver goroutine to keep the event loop fast.
 func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr uint64, startKtime uint64) {
 	if _, exists := c.infoHashToRaceState[infoHash]; exists {
 		return
@@ -382,28 +377,9 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		c.mapTorrentPtr(torrentPtr, infoHash)
 	}
 
-	// Fetch metadata from the per-torrent properties endpoint.
-	// This uses the info_hash directly (not the sync/maindata delta), so it
-	// works even during the window where torrent::start() has fired but
-	// qBittorrent hasn't yet processed the add_torrent_alert on its Qt
-	// thread. The properties endpoint resolves the hash to the libtorrent
-	// torrent handle independently of m_torrents.
-	torrentName := infoHash
-	var torrentSize int64
-	var pieceCount int
-	if c.enrichAPI != nil {
-		if meta, err := c.enrichAPI.FetchTorrentMeta(infoHash); err == nil {
-			if meta.Name != "" {
-				torrentName = meta.Name
-			}
-			torrentSize = meta.Size
-			pieceCount = meta.PieceCount
-		} else {
-			c.logger.Warn("failed to fetch torrent properties", "hash", infoHash, "error", err)
-		}
-	}
-
-	torrentID, err := c.store.CreateTorrent(ctx, infoHash, torrentName, torrentSize, pieceCount)
+	// Create DB records immediately with placeholder metadata.
+	// The async resolver will UPSERT real values once available.
+	torrentID, err := c.store.CreateTorrent(ctx, infoHash, infoHash, 0, 0)
 	if err != nil {
 		c.logger.Error("failed to create torrent record", "hash", infoHash, "error", err)
 		return
@@ -418,21 +394,75 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	c.notifyDashboard(raceID)
 
 	downloadCompleteCh := make(chan struct{})
+	metaChan := make(chan int, 1)
 	raceCtx, cancel := context.WithCancel(ctx)
 	state := &raceState{
 		eventChan:          make(chan bpf.ProbeEvent, 10000),
 		hash:               infoHash,
-		pieceCount:         pieceCount,
 		raceID:             raceID,
 		downloadCompleteCh: downloadCompleteCh,
 		cancel:             cancel,
 	}
 	c.infoHashToRaceState[infoHash] = state
 
-	go func(hash string, raceID int64, pieceCount int, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
-		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, pieceCount, eventChan, completeCh)
+	go func(hash string, raceID int64, metaCh <-chan int, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
+		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, metaCh, eventChan, completeCh)
 		c.completeChan <- raceComplete{hash: hash, err: err}
-	}(infoHash, raceID, pieceCount, state.eventChan, downloadCompleteCh)
+	}(infoHash, raceID, metaChan, state.eventChan, downloadCompleteCh)
+
+	// Request async metadata resolution (non-blocking).
+	select {
+	case c.metaReqChan <- metaRequest{hash: infoHash, metaChan: metaChan}:
+	default:
+		c.logger.Warn("metadata resolver backlogged, skipping", "hash", infoHash)
+		close(metaChan)
+	}
+}
+
+// runMetaResolver processes metadata requests off the event loop.
+// Runs as a goroutine; exits when ctx is cancelled or metaReqChan is closed.
+func (c *Coordinator) runMetaResolver(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case req, ok := <-c.metaReqChan:
+			if !ok {
+				return
+			}
+			c.resolveMetadata(ctx, req)
+		}
+	}
+}
+
+// resolveMetadata fetches torrent metadata from the API, updates the DB,
+// and delivers pieceCount to the tracker.
+func (c *Coordinator) resolveMetadata(ctx context.Context, req metaRequest) {
+	defer close(req.metaChan)
+
+	if c.enrichAPI == nil {
+		return
+	}
+
+	meta, err := c.enrichAPI.FetchTorrentMeta(req.hash)
+	if err != nil {
+		c.logger.Warn("async metadata fetch failed", "hash", req.hash, "error", err)
+		return
+	}
+
+	// UPSERT updates placeholder values in the DB.
+	name := meta.Name
+	if name == "" {
+		name = req.hash
+	}
+	if _, err := c.store.CreateTorrent(ctx, req.hash, name, meta.Size, meta.PieceCount); err != nil {
+		c.logger.Warn("failed to update torrent metadata", "hash", req.hash, "error", err)
+	}
+
+	// Deliver pieceCount to tracker for contamination detection.
+	if meta.PieceCount > 0 {
+		req.metaChan <- meta.PieceCount
+	}
 }
 
 // notifyDashboard sends a fire-and-forget POST to the dashboard SSE endpoint.

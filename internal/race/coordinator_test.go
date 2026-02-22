@@ -585,9 +585,8 @@ func TestRouteEventChannelFull(t *testing.T) {
 	c := NewCoordinator(store, logger, "", testOffsets(64), nil, nil)
 
 	state := &raceState{
-		eventChan:  make(chan bpf.ProbeEvent, 1),
-		hash:       "testhash",
-		pieceCount: 100,
+		eventChan: make(chan bpf.ProbeEvent, 1),
+		hash:      "testhash",
 	}
 
 	// Fill the channel

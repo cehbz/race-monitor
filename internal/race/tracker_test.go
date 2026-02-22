@@ -63,7 +63,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "wehave_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "wehave_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send 3 we_have events for different pieces
@@ -105,7 +105,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "incoming_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "incoming_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send incoming_have events from two different peer connections
@@ -157,7 +157,7 @@ func TestProcessEvents_CompletionDetection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "complete_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "complete_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send we_have for all pieces
@@ -197,7 +197,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "batch_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "batch_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send 150 events — first 100 should trigger a batch flush, remainder
@@ -228,7 +228,7 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "cancel_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "cancel_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send one event so processEvents is active
@@ -263,7 +263,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "downloadcomplete_test", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "downloadcomplete_test", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send some events
@@ -304,7 +304,7 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, 0, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, nil, events, downloadCompleteCh)
 	}()
 
 	// Send a TorrentFinishedEvent — the tracker only handles WeHave and
@@ -342,9 +342,14 @@ func TestProcessEvents_ContaminationDetected(t *testing.T) {
 	var logBuf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
 
+	// Pre-load pieceCount into a buffered channel so it's available immediately
+	metaChan := make(chan int, 1)
+	metaChan <- pieceCount
+	close(metaChan)
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "contamination_test", raceID, pieceCount, events, downloadCompleteCh)
+		errCh <- processEvents(ctx, store, logger, "contamination_test", raceID, metaChan, events, downloadCompleteCh)
 	}()
 
 	// Send valid events
@@ -424,6 +429,83 @@ func TestProcessEvents_ContaminationDetected(t *testing.T) {
 	}
 	if errorCount != 2 {
 		t.Errorf("expected 2 race_errors (one per source), got %d", errorCount)
+	}
+}
+
+func TestProcessEvents_MetadataArrivesMidRace(t *testing.T) {
+	const pieceCount = 50
+	store, raceID, cleanup := setupTrackerTest(t, "meta_midrace")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	events := make(chan bpf.ProbeEvent, 200)
+	downloadCompleteCh := make(chan struct{}, 1)
+
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	// Metadata channel — we'll send pieceCount mid-race
+	metaChan := make(chan int, 1)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- processEvents(ctx, store, logger, "meta_midrace", raceID, metaChan, events, downloadCompleteCh)
+	}()
+
+	// Send out-of-range events BEFORE metadata arrives — should be accepted
+	// (pieceCount == 0, validation inactive)
+	for i := 0; i < 5; i++ {
+		events <- &bpf.WeHaveEvent{
+			PieceIndex: uint32(100 + i),
+			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
+		}
+	}
+
+	// Allow events to be processed
+	time.Sleep(50 * time.Millisecond)
+
+	// Now deliver metadata
+	metaChan <- pieceCount
+	close(metaChan)
+
+	// Allow metadata to be processed
+	time.Sleep(50 * time.Millisecond)
+
+	// Send out-of-range events AFTER metadata — should be dropped
+	for i := 0; i < 5; i++ {
+		events <- &bpf.WeHaveEvent{
+			PieceIndex: uint32(200 + i),
+			Timestamp:  testTimestamp(time.Duration(10+i) * time.Millisecond),
+			TorrentPtr: 0xddd,
+		}
+	}
+
+	// Send a valid event
+	events <- &bpf.WeHaveEvent{PieceIndex: 1, Timestamp: testTimestamp(20 * time.Millisecond)}
+
+	close(events)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("processEvents returned error: %v", err)
+	}
+
+	// Verify: 5 pre-metadata events + 1 valid post-metadata event = 6 persisted
+	var eventCount int
+	err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ?", raceID).Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+	if eventCount != 6 {
+		t.Errorf("expected 6 persisted events (5 pre-meta + 1 valid post-meta), got %d", eventCount)
+	}
+
+	// Verify "metadata resolved" was logged
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "metadata resolved") {
+		t.Errorf("expected 'metadata resolved' log, got: %s", logOutput)
 	}
 }
 
