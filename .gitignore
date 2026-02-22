@@ -19,6 +19,9 @@ coverage.html
 *.test
 test.out
 
+# AI assistant
+CLAUDE.md
+
 # IDE
 .idea/
 .vscode/
