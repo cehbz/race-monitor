@@ -59,9 +59,7 @@ func (q *qbSyncClient) Sync() (map[string]race.TorrentMeta, error) {
 }
 
 // FetchTorrentMeta implements race.EnrichmentAPI.
-// Calls TorrentsProperties for piece_count (PiecesNum) and total_size.
-// Name is NOT populated by the properties endpoint; caller should fall back
-// to the Sync cache for the torrent name.
+// Calls TorrentsProperties for name, piece_count (PiecesNum), and total_size.
 func (q *qbSyncClient) FetchTorrentMeta(hash string) (race.TorrentMeta, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -71,6 +69,7 @@ func (q *qbSyncClient) FetchTorrentMeta(hash string) (race.TorrentMeta, error) {
 		return race.TorrentMeta{}, fmt.Errorf("fetching torrent properties: %w", err)
 	}
 	return race.TorrentMeta{
+		Name:       props.Name,
 		Size:       props.TotalSize,
 		PieceCount: int(props.PiecesNum),
 	}, nil

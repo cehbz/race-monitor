@@ -30,8 +30,7 @@ type raceState struct {
 	hash               string
 	pieceCount         int
 	raceID             int64
-	torrentName        string         // may equal hash if API lookup raced with torrent::start()
-	downloadCompleteCh chan struct{}   // closed by coordinator when torrent::finished() fires
+	downloadCompleteCh chan struct{} // closed by coordinator when torrent::finished() fires
 	cancel             context.CancelFunc
 }
 
@@ -382,53 +381,22 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		c.mapTorrentPtr(torrentPtr, infoHash)
 	}
 
-	// Enrich metadata from API cache and per-torrent properties.
-	//
-	// This lookup may fail for newly-added torrents due to a race condition
-	// between libtorrent and qBittorrent's WebUI API. In libtorrent 1.2.x,
-	// session_impl::add_torrent() calls torrent::start() (which fires our
-	// eBPF probe) BEFORE posting the add_torrent_alert. qBittorrent only
-	// inserts the torrent into m_torrents (visible to the sync API) after
-	// the alert is dispatched via Qt::QueuedConnection to the main thread.
-	// So there is a multi-millisecond window where torrent::start() has
-	// fired but the torrent is not yet in the sync API response.
-	//
-	// When this happens, torrentName remains the raw info_hash. We record
-	// it on raceState and retry at race completion — see handleComplete().
+	// Fetch metadata from the per-torrent properties endpoint.
+	// This uses the info_hash directly (not the sync/maindata delta), so it
+	// works even during the window where torrent::start() has fired but
+	// qBittorrent hasn't yet processed the add_torrent_alert on its Qt
+	// thread. The properties endpoint resolves the hash to the libtorrent
+	// torrent handle independently of m_torrents.
 	torrentName := infoHash
 	var torrentSize int64
 	var pieceCount int
-	if meta, ok := c.torrentMeta[infoHash]; ok {
-		if meta.Name != "" {
-			torrentName = meta.Name
-		}
-		torrentSize = meta.Size
-		pieceCount = meta.PieceCount
-	} else if c.enrichAPI != nil {
-		// Cache miss — re-sync to pick up newly added torrents
-		if torrents, err := c.enrichAPI.Sync(); err == nil {
-			for h, meta := range torrents {
-				c.torrentMeta[h] = meta
-			}
-			if meta, ok := c.torrentMeta[infoHash]; ok {
-				if meta.Name != "" {
-					torrentName = meta.Name
-				}
-				torrentSize = meta.Size
-				pieceCount = meta.PieceCount
-			}
-		} else {
-			c.logger.Warn("failed to re-sync metadata cache", "error", err)
-		}
-	}
 	if c.enrichAPI != nil {
-		if propsMeta, err := c.enrichAPI.FetchTorrentMeta(infoHash); err == nil {
-			if propsMeta.Size > 0 {
-				torrentSize = propsMeta.Size
+		if meta, err := c.enrichAPI.FetchTorrentMeta(infoHash); err == nil {
+			if meta.Name != "" {
+				torrentName = meta.Name
 			}
-			if propsMeta.PieceCount > 0 {
-				pieceCount = propsMeta.PieceCount
-			}
+			torrentSize = meta.Size
+			pieceCount = meta.PieceCount
 		} else {
 			c.logger.Debug("failed to fetch torrent properties", "hash", infoHash, "error", err)
 		}
@@ -455,7 +423,6 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		hash:               infoHash,
 		pieceCount:         pieceCount,
 		raceID:             raceID,
-		torrentName:        torrentName,
 		downloadCompleteCh: downloadCompleteCh,
 		cancel:             cancel,
 	}
@@ -465,34 +432,6 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, eventChan, completeCh)
 		c.completeChan <- raceComplete{hash: hash, err: err}
 	}(infoHash, raceID, state.eventChan, downloadCompleteCh)
-}
-
-// retryTorrentName re-fetches metadata from the API and updates the torrent
-// record if a name is now available. Called at race completion when the initial
-// lookup at torrent::start() time failed due to the libtorrent/qBittorrent
-// threading race (see comment in startRace).
-func (c *Coordinator) retryTorrentName(infoHash string) {
-	if torrents, err := c.enrichAPI.Sync(); err == nil {
-		for h, meta := range torrents {
-			c.torrentMeta[h] = meta
-		}
-	} else {
-		c.logger.Warn("failed to re-sync metadata on completion", "error", err)
-		return
-	}
-
-	meta, ok := c.torrentMeta[infoHash]
-	if !ok || meta.Name == "" {
-		c.logger.Warn("torrent name still unavailable at completion", "hash", infoHash)
-		return
-	}
-
-	ctx := context.Background()
-	if _, err := c.store.CreateTorrent(ctx, infoHash, meta.Name, meta.Size, meta.PieceCount); err != nil {
-		c.logger.Error("failed to update torrent name", "hash", infoHash, "error", err)
-		return
-	}
-	c.logger.Info("resolved torrent name at completion", "hash", infoHash, "name", meta.Name)
 }
 
 // notifyDashboard sends a fire-and-forget POST to the dashboard SSE endpoint.
@@ -585,14 +524,6 @@ func (c *Coordinator) mapTorrentPtr(ptr uint64, hash string) {
 // handleComplete processes a race tracker completion signal.
 func (c *Coordinator) handleComplete(complete raceComplete) {
 	if state, exists := c.infoHashToRaceState[complete.hash]; exists {
-		// If the torrent name is still the raw info_hash, retry the API lookup.
-		// This handles the race condition where torrent::start() fired before
-		// qBittorrent registered the torrent in its WebUI API — by completion
-		// time the torrent is guaranteed to be in the API.
-		if state.torrentName == state.hash && c.enrichAPI != nil {
-			c.retryTorrentName(state.hash)
-		}
-
 		state.cancel()
 		delete(c.infoHashToRaceState, complete.hash)
 		if complete.err != nil && complete.err != context.Canceled {
