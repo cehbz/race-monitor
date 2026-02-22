@@ -25,11 +25,11 @@ func TestReverseIP(t *testing.T) {
 
 func TestParseCymruOrigin(t *testing.T) {
 	tests := []struct {
-		name      string
-		txt       string
-		wantASN   int
-		wantPfx   string
-		wantCC    string
+		name    string
+		txt     string
+		wantASN int
+		wantPfx string
+		wantCC  string
 	}{
 		{
 			name:    "standard response",

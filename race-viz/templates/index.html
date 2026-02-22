@@ -546,6 +546,15 @@
                         } else if (net.isp) {
                             const isp = cleanISP(net.isp);
                             netName = net.is_datacenter ? isp + ' (DC)' : isp;
+                        } else if (net.rdns) {
+                            // Last resort: extract registrable domain from rDNS
+                            const parts = net.rdns.split('.');
+                            const n = parts.length;
+                            if (n >= 3 && parts[n-1].length <= 2 && parts[n-2].length <= 3) {
+                                netName = parts.slice(-3).join('.');
+                            } else if (n >= 2) {
+                                netName = parts.slice(-2).join('.');
+                            }
                         }
                         if (net.city || net.country) {
                             netGeo = [net.city, net.country].filter(Boolean).join(', ');

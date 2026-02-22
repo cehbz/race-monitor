@@ -19,17 +19,17 @@ type IPInfo struct {
 
 // NetworkInfo holds per-BGP-prefix enrichment data from API lookups.
 type NetworkInfo struct {
-	BGPPrefix    string  // CIDR, e.g. "185.21.216.0/22"
-	ASN          int     // AS number
-	ASNOrg       string  // AS organization name
-	ISP          string  // company name
-	CompanyType  string  // "hosting", "isp", "business"
-	IsDatacenter bool    // datacenter flag
-	Datacenter   string  // raw datacenter provider name from API
-	Provider     string  // resolved brand name (derived)
+	BGPPrefix    string // CIDR, e.g. "185.21.216.0/22"
+	ASN          int    // AS number
+	ASNOrg       string // AS organization name
+	ISP          string // company name
+	CompanyType  string // "hosting", "isp", "business"
+	IsDatacenter bool   // datacenter flag
+	Datacenter   string // raw datacenter provider name from API
+	Provider     string // resolved brand name (derived)
 	City         string
 	Region       string
-	Country      string  // 2-letter code
+	Country      string // 2-letter code
 	Latitude     float64
 	Longitude    float64
 	EnrichedAt   time.Time
@@ -47,19 +47,19 @@ type DNSResult struct {
 
 // APIResult holds the full output of an ipapi.is lookup.
 type APIResult struct {
-	ASN          int
-	ASNOrg       string
-	BGPPrefix    string // asn.route
-	ISP          string // company.name
-	CompanyType  string // company.type
+	ASN           int
+	ASNOrg        string
+	BGPPrefix     string // asn.route
+	ISP           string // company.name
+	CompanyType   string // company.type
 	CompanyDomain string // company.domain
-	IsDatacenter bool
-	Datacenter   string // datacenter.datacenter
-	DCDomain     string // datacenter.domain
-	AbuseEmail   string // abuse.email
-	City         string
-	Region       string
-	Country      string
-	Latitude     float64
-	Longitude    float64
+	IsDatacenter  bool
+	Datacenter    string // datacenter.datacenter
+	DCDomain      string // datacenter.domain
+	AbuseEmail    string // abuse.email
+	City          string
+	Region        string
+	Country       string
+	Latitude      float64
+	Longitude     float64
 }

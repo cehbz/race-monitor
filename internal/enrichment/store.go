@@ -147,6 +147,16 @@ func (s *SQLiteStore) PutIP(ctx context.Context, info *IPInfo) error {
 	return err
 }
 
+// UpdateBGPPrefix migrates ip_dns rows from one prefix to another.
+// Called when ipapi.is returns a more specific prefix than Cymru,
+// so the ip_dns → network_enrichment JOIN stays consistent.
+func (s *SQLiteStore) UpdateBGPPrefix(ctx context.Context, oldPrefix, newPrefix string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE ip_dns SET bgp_prefix = ? WHERE bgp_prefix = ?`,
+		newPrefix, oldPrefix)
+	return err
+}
+
 func (s *SQLiteStore) BackfillProvider(ctx context.Context, bgpPrefix, provider string) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE ip_dns SET provider = ? WHERE bgp_prefix = ? AND (provider IS NULL OR provider = '')`,

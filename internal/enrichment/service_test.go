@@ -212,6 +212,81 @@ func TestPrefixEnricherRateLimited(t *testing.T) {
 	}
 }
 
+func TestMoreSpecificPrefix(t *testing.T) {
+	tests := []struct {
+		name   string
+		cymru  string
+		api    string
+		want   string
+	}{
+		{"api more specific", "115.69.32.0/19", "115.69.36.0/24", "115.69.36.0/24"},
+		{"cymru more specific", "115.69.36.0/24", "115.69.32.0/19", "115.69.36.0/24"},
+		{"equal", "10.0.0.0/24", "10.0.0.0/24", "10.0.0.0/24"},
+		{"api empty", "10.0.0.0/24", "", "10.0.0.0/24"},
+		{"api malformed", "10.0.0.0/24", "garbage", "10.0.0.0/24"},
+		{"cymru malformed", "garbage", "10.0.0.0/24", "10.0.0.0/24"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := moreSpecificPrefix(tt.cymru, tt.api)
+			if got != tt.want {
+				t.Errorf("moreSpecificPrefix(%q, %q) = %q, want %q", tt.cymru, tt.api, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrefixEnricherPrefixMismatch(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Cymru returned /24, API will return /19
+	store.PutIP(ctx, &IPInfo{IP: "115.69.36.55", BGPPrefix: "115.69.36.0/24"})
+	store.EnqueuePrefix(ctx, "115.69.36.0/24")
+
+	lookup := &fakeNetworkLookup{
+		results: map[string]*APIResult{
+			"115.69.36.55": {
+				ASN: 18390, ASNOrg: "Spintel Pty Ltd",
+				BGPPrefix: "115.69.32.0/19", ISP: "Spintel Pty Ltd",
+				CompanyType: "isp",
+				City: "Sydney", Country: "AU",
+			},
+		},
+	}
+
+	limiter := NewRateLimiter(900)
+	enricher := NewPrefixEnricher(store, lookup, limiter, testLogger)
+	processed, _, err := enricher.ProcessBatch(ctx, 10)
+	if err != nil {
+		t.Fatalf("ProcessBatch: %v", err)
+	}
+	if processed != 1 {
+		t.Errorf("processed = %d, want 1", processed)
+	}
+
+	// Cymru /24 is more specific — network_enrichment should be keyed by it
+	net, _ := store.GetNetwork(ctx, "115.69.36.0/24")
+	if net == nil {
+		t.Fatal("network_enrichment not found under Cymru /24 prefix")
+	}
+	if net.ISP != "Spintel Pty Ltd" {
+		t.Errorf("ISP = %q", net.ISP)
+	}
+
+	// ip_dns.bgp_prefix should still be the Cymru /24 (unchanged)
+	ip, _ := store.GetIP(ctx, "115.69.36.55")
+	if ip.BGPPrefix != "115.69.36.0/24" {
+		t.Errorf("ip_dns.bgp_prefix = %q, want %q", ip.BGPPrefix, "115.69.36.0/24")
+	}
+
+	// Should NOT exist under the less-specific API prefix
+	netWrong, _ := store.GetNetwork(ctx, "115.69.32.0/19")
+	if netWrong != nil {
+		t.Error("network_enrichment should NOT exist under the API /19 prefix")
+	}
+}
+
 func TestRateLimiterDailyReset(t *testing.T) {
 	limiter := NewRateLimiter(2)
 

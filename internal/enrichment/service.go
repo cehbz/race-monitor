@@ -3,6 +3,7 @@ package enrichment
 import (
 	"context"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 )
@@ -51,6 +52,29 @@ func (r *RateLimiter) Remaining() int {
 		return r.limit
 	}
 	return r.limit - r.count
+}
+
+// moreSpecificPrefix returns whichever CIDR prefix has the longer mask
+// (more specific in BGP routing terms). Falls back to cymru if the API
+// prefix is empty or unparseable.
+func moreSpecificPrefix(cymru, api string) string {
+	if api == "" {
+		return cymru
+	}
+	_, cymruNet, errC := net.ParseCIDR(cymru)
+	_, apiNet, errA := net.ParseCIDR(api)
+	if errC != nil {
+		return api
+	}
+	if errA != nil {
+		return cymru
+	}
+	cymruOnes, _ := cymruNet.Mask.Size()
+	apiOnes, _ := apiNet.Mask.Size()
+	if apiOnes > cymruOnes {
+		return api
+	}
+	return cymru
 }
 
 // IPEnricher processes the IP queue: rDNS + Cymru lookups, writes ip_dns,
@@ -196,14 +220,21 @@ func (e *PrefixEnricher) ProcessBatch(ctx context.Context, batchSize int) (proce
 			provider = apiResult.Datacenter
 		}
 
-		// Use the prefix from API if available (may be more specific than Cymru)
-		actualPrefix := prefix
-		if apiResult.BGPPrefix != "" {
-			actualPrefix = apiResult.BGPPrefix
+		// Use the most specific prefix across both sources. In BGP the
+		// longest match determines actual routing and gives the most
+		// precise grouping.
+		canonical := moreSpecificPrefix(prefix, apiResult.BGPPrefix)
+
+		// If the API returned a more specific prefix, update ip_dns
+		// so the LEFT JOIN stays consistent.
+		if canonical != prefix {
+			if err := e.store.UpdateBGPPrefix(ctx, prefix, canonical); err != nil {
+				e.logger.Warn("updating bgp_prefix", "from", prefix, "to", canonical, "error", err)
+			}
 		}
 
 		netInfo := &NetworkInfo{
-			BGPPrefix:    actualPrefix,
+			BGPPrefix:    canonical,
 			ASN:          apiResult.ASN,
 			ASNOrg:       apiResult.ASNOrg,
 			ISP:          apiResult.ISP,
@@ -221,17 +252,17 @@ func (e *PrefixEnricher) ProcessBatch(ctx context.Context, batchSize int) (proce
 		}
 
 		if err := e.store.PutNetwork(ctx, netInfo); err != nil {
-			e.logger.Warn("storing network info", "prefix", actualPrefix, "error", err)
+			e.logger.Warn("storing network info", "prefix", canonical, "error", err)
 			continue
 		}
 
 		// Backfill provider on ip_dns rows where provider is not yet set
 		if provider != "" {
-			if err := e.store.BackfillProvider(ctx, actualPrefix, provider); err != nil {
-				e.logger.Warn("backfilling provider", "prefix", actualPrefix, "error", err)
+			if err := e.store.BackfillProvider(ctx, canonical, provider); err != nil {
+				e.logger.Warn("backfilling provider", "prefix", canonical, "error", err)
 			}
 			// Also backfill the Cymru prefix if it differs from the API prefix
-			if prefix != actualPrefix {
+			if prefix != canonical {
 				e.store.BackfillProvider(ctx, prefix, provider)
 			}
 		}
