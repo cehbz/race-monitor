@@ -1,76 +1,47 @@
-# Race Monitor Visualization Dashboard
+# Race Monitor Dashboard
 
-Web-based visualization dashboard for race-monitor SQLite data.
+Web-based visualization for race-monitor SQLite data. Shows piece-level progress for each peer during a torrent race.
 
 ## Features
 
-- Browse all races in reverse chronological order
-- Interactive Plotly.js visualizations:
-  - Download rate (bytes since previous sample) per peer
-  - Upload rate (bytes since previous sample) per peer
-  - Progress percentage over time per peer
-- Synchronized zoom/pan across all charts
-- Tooltips with detailed peer information
-- Dark theme optimized for readability
+- Race list with metadata (name, size, pieces, duration, peer count)
+- Per-peer cumulative piece progress curves with adaptive resolution
+- Combined progress chart (all peers overlaid)
+- Peer table with IP, client, ASN, network segment, provider, city/country
+- Enrichment data from rDNS, Team Cymru, and ipapi.is
+- Self-row highlighting (gold accent) based on configured IP
+- Server-Sent Events for real-time race notifications
+- Plotly.js interactive charts with dark theme
 
 ## Installation
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
+```
 
-# Or using a virtual environment (recommended)
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+## Configuration
+
+`~/.config/race-monitor/viz.toml`:
+
+```toml
+race_db = "~/.local/share/race-monitor/races.db"
+bind_host = "0.0.0.0"
+bind_port = 8080
+debug = false
+our_ip = ""   # your public IP for self-row identification
 ```
 
 ## Usage
 
 ```bash
-# Run with default settings (binds to 0.0.0.0:8080)
-python3 app.py
-
-# Or activate virtual environment first
-source venv/bin/activate
 python3 app.py
 ```
 
-The dashboard will be accessible at: `http://localhost:8080`
-
-## Configuration
-
-Edit `config.toml` to customize settings:
-
-```toml
-# Path to the SQLite database
-race_db = "~/.local/share/race-monitor/races.db"
-
-# Network bind address (IP to listen on)
-# Use "0.0.0.0" to listen on all interfaces
-# Use specific IP like "192.168.1.100" to restrict to that interface
-bind_host = "0.0.0.0"
-
-# Port to listen on
-bind_port = 8080
-
-# Enable Flask debug mode (shows detailed errors, auto-reloads on code changes)
-# Set to false in production
-debug = true
-```
+Or via systemd: `systemctl start race-viz@$USER`
 
 ## Architecture
 
-- **Backend**: Flask with SQLite
+- **Backend**: Flask with SQLite (WAL mode, read-only)
 - **Frontend**: Single-page HTML/JS with Plotly.js
-- **API Endpoints**:
-  - `GET /` - Dashboard UI
-  - `GET /api/races` - List all races
-  - `GET /api/race/<id>` - Get detailed race data
-
-## Data Processing
-
-- Download/upload deltas calculated client-side from cumulative totals
-- "You" (your client) shown as distinct trace with bold line
-- Each peer gets unique color and label (IP:port + client)
-- Progress normalized to 0-100% scale
+- **Modules**: `app.py` (routes, SSE), `db.py` (SQL queries), `analysis.py` (computation)
+- **API**: `/api/races`, `/api/race/<id>/events`, `/api/race/<id>/peers`, `/events` (SSE)
