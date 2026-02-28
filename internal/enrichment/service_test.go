@@ -214,10 +214,10 @@ func TestPrefixEnricherRateLimited(t *testing.T) {
 
 func TestMoreSpecificPrefix(t *testing.T) {
 	tests := []struct {
-		name   string
-		cymru  string
-		api    string
-		want   string
+		name  string
+		cymru string
+		api   string
+		want  string
 	}{
 		{"api more specific", "115.69.32.0/19", "115.69.36.0/24", "115.69.36.0/24"},
 		{"cymru more specific", "115.69.36.0/24", "115.69.32.0/19", "115.69.36.0/24"},
@@ -250,7 +250,7 @@ func TestPrefixEnricherPrefixMismatch(t *testing.T) {
 				ASN: 18390, ASNOrg: "Spintel Pty Ltd",
 				BGPPrefix: "115.69.32.0/19", ISP: "Spintel Pty Ltd",
 				CompanyType: "isp",
-				City: "Sydney", Country: "AU",
+				City:        "Sydney", Country: "AU",
 			},
 		},
 	}

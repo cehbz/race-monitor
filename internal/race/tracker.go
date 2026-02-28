@@ -10,13 +10,34 @@ import (
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
+// Grace period constants for post-download event capture.
+const (
+	graceFraction = 0.5
+	graceMin      = 5 * time.Second
+	graceMax      = 60 * time.Second
+)
+
+// graceDuration computes the post-download grace period: 50% of the download
+// duration, clamped to [5s, 60s].
+func graceDuration(downloadElapsed time.Duration) time.Duration {
+	d := time.Duration(float64(downloadElapsed) * graceFraction)
+	if d < graceMin {
+		return graceMin
+	}
+	if d > graceMax {
+		return graceMax
+	}
+	return d
+}
+
 // processEvents is the main event processing loop for a single race.
 // It receives typed eBPF probe events, converts them to storage events, and
 // persists them in batches.
 //
 // The downloadCompleteCh is closed by the coordinator when the download
-// completes (torrent::finished() event). After that, the tracker begins per-peer idle
-// monitoring and finalizes when all tracked peers have been idle for 10 seconds.
+// completes (torrent::finished() event). After that, the tracker runs a
+// proportional grace period — 50% of the download duration, clamped to
+// [5s, 60s] — then finalizes unconditionally. The grace timer never resets.
 func processEvents(
 	ctx context.Context,
 	store *storage.Store,
@@ -28,9 +49,8 @@ func processEvents(
 	downloadCompleteCh <-chan struct{},
 ) error {
 	const (
-		batchSize               = 100
-		postCompleteIdleTimeout = 10 * time.Second
-		maxDuration             = 30 * time.Minute
+		batchSize   = 100
+		maxDuration = 30 * time.Minute
 
 		// A few out-of-range events per source are expected from cross-CPU
 		// perf buffer interleaving during peer_connection* reuse. Sustained
@@ -49,7 +69,6 @@ func processEvents(
 		pieceCount int
 
 		have                = make(map[int]bool)
-		loggedComplete      bool
 		downloadCompleted   bool
 		downloadCompleteSel = downloadCompleteCh // local copy we nil after receiving
 		maxTimer            = time.NewTimer(maxDuration)
@@ -67,10 +86,10 @@ func processEvents(
 		lastLogTime   = time.Now()
 		logInterval   = 30 * time.Second
 
-		// Post-completion idle tracking: lastEventTime[connPtr] = timestamp
-		lastEventTime = make(map[uint64]int64)
-		idleTimer     *time.Timer      // initialized after download completes
-		idleTimerCh   <-chan time.Time // nil until idleTimer is created (nil channels block forever in select)
+		// Post-completion grace timer: fires once after a proportional delay,
+		// never resets. nil channel blocks forever in select until initialized.
+		graceTimer   *time.Timer
+		graceTimerCh <-chan time.Time
 	)
 
 	defer maxTimer.Stop()
@@ -113,37 +132,37 @@ func processEvents(
 			return finalize(ctx, store, logger, raceID)
 
 		case <-downloadCompleteSel:
-			// Download is complete. Start monitoring per-peer idle.
+			// Download is complete. Start a proportional grace period.
 			downloadCompleted = true
 			downloadCompleteSel = nil // prevent re-entry (closed channels are always selectable)
-			logger.Info("download completed, starting idle monitoring",
-				"hash", hash,
-				"elapsed", time.Since(startTime),
-				"connections", len(connMap))
+			elapsed := time.Since(startTime)
+
 			// No peers to monitor — finalize immediately
 			if len(connMap) == 0 {
+				logger.Info("download completed, no peers tracked",
+					"hash", hash, "elapsed", elapsed)
 				if err := flushEvents(); err != nil {
 					logger.Warn("failed to flush final events", "error", err)
 				}
 				return finalize(ctx, store, logger, raceID)
 			}
-			// Initialize idle timer for post-completion monitoring
-			idleTimer = time.NewTimer(postCompleteIdleTimeout)
-			idleTimerCh = idleTimer.C
-			defer idleTimer.Stop()
 
-		case <-idleTimerCh:
-			if downloadCompleted {
-				// All tracked peers have been idle for the timeout
-				logger.Info("all peers idle after download completion",
-					"hash", hash,
-					"idle_timeout", postCompleteIdleTimeout,
-					"connections", len(connMap))
-				if err := flushEvents(); err != nil {
-					logger.Warn("failed to flush final events", "error", err)
-				}
-				return finalize(ctx, store, logger, raceID)
+			// Grace = 50% of download duration, clamped to [5s, 60s]
+			grace := graceDuration(elapsed)
+			graceTimer = time.NewTimer(grace)
+			graceTimerCh = graceTimer.C
+			defer graceTimer.Stop()
+			logger.Info("download completed, grace period started",
+				"hash", hash, "elapsed", elapsed,
+				"grace", grace, "connections", len(connMap))
+
+		case <-graceTimerCh:
+			logger.Info("grace period expired",
+				"hash", hash, "connections", len(connMap))
+			if err := flushEvents(); err != nil {
+				logger.Warn("failed to flush final events", "error", err)
 			}
+			return finalize(ctx, store, logger, raceID)
 
 		case ev, ok := <-events:
 			if !ok {
@@ -186,10 +205,6 @@ func processEvents(
 				dbEvent.Timestamp = int64(e.Timestamp)
 				dbEvent.PieceIndex = int(e.PieceIndex)
 
-				if downloadCompleted && e.TorrentPtr > 0 {
-					lastEventTime[e.TorrentPtr] = int64(e.Timestamp)
-				}
-
 			case *bpf.IncomingHaveEvent:
 				if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
 					contaminationCount[e.ConnPtr]++
@@ -209,9 +224,6 @@ func processEvents(
 				peerHaveCount++
 				connDBID, exists := connMap[e.ConnPtr]
 				if !exists {
-					if loggedComplete {
-						continue // Ignore new connections after download completes
-					}
 					connPtr := fmt.Sprintf("%x", e.ConnPtr)
 					connDBID, err = store.InsertConnection(ctx, raceID, connPtr, time.Now())
 					if err != nil {
@@ -225,23 +237,8 @@ func processEvents(
 				dbEvent.Timestamp = int64(e.Timestamp)
 				dbEvent.PieceIndex = int(e.PieceIndex)
 
-				if downloadCompleted && e.ConnPtr > 0 {
-					lastEventTime[e.ConnPtr] = int64(e.Timestamp)
-				}
-
 			default:
 				continue
-			}
-
-			// Reset idle timer after download completes (for per-peer monitoring)
-			if downloadCompleted && idleTimer != nil {
-				if !idleTimer.Stop() {
-					select {
-					case <-idleTimer.C:
-					default:
-					}
-				}
-				idleTimer.Reset(postCompleteIdleTimeout)
 			}
 
 			if time.Since(lastLogTime) >= logInterval {

@@ -50,6 +50,32 @@ func setupTrackerTest(t *testing.T, hash string) (*storage.Store, int64, func())
 	return store, raceID, cleanup
 }
 
+func TestGraceDuration(t *testing.T) {
+	tests := []struct {
+		name     string
+		elapsed  time.Duration
+		expected time.Duration
+	}{
+		{"floor: 0s download", 0, 5 * time.Second},
+		{"floor: 2s download", 2 * time.Second, 5 * time.Second},
+		{"floor: 9s download", 9 * time.Second, 5 * time.Second},
+		{"exact floor: 10s download", 10 * time.Second, 5 * time.Second},
+		{"proportional: 20s download", 20 * time.Second, 10 * time.Second},
+		{"proportional: 60s download", 60 * time.Second, 30 * time.Second},
+		{"exact ceiling: 120s download", 120 * time.Second, 60 * time.Second},
+		{"ceiling: 5min download", 5 * time.Minute, 60 * time.Second},
+		{"ceiling: 30min download", 30 * time.Minute, 60 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := graceDuration(tt.elapsed)
+			if got != tt.expected {
+				t.Errorf("graceDuration(%v) = %v, want %v", tt.elapsed, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "wehave_test")
 	defer cleanup()
@@ -82,13 +108,15 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 		t.Fatalf("processEvents returned error: %v", err)
 	}
 
-	// Verify race was completed
-	race, err := store.GetRace(ctx, raceID)
-	if err != nil {
-		t.Fatalf("failed to get race: %v", err)
+	// Verify all 3 we_have events were persisted as piece_received (event_type_id=2)
+	var eventCount int
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ? AND event_type_id = 2",
+		raceID).Scan(&eventCount); err != nil {
+		t.Fatalf("failed to count events: %v", err)
 	}
-	if !race.CompletedAt.Valid {
-		t.Error("expected race to be completed after channel close")
+	if eventCount != 3 {
+		t.Errorf("expected 3 piece_received events, got %d", eventCount)
 	}
 }
 
@@ -133,54 +161,26 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 		t.Fatalf("processEvents returned error: %v", err)
 	}
 
-	// Verify race was finalized
-	race, err := store.GetRace(ctx, raceID)
-	if err != nil {
-		t.Fatalf("failed to get race: %v", err)
+	// Verify 2 peer connections created (0xdeadbeef + 0xcafebabe), plus "self"
+	var connCount int
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM connections WHERE race_id = ? AND conn_ptr != 'self'",
+		raceID).Scan(&connCount); err != nil {
+		t.Fatalf("failed to count connections: %v", err)
 	}
-	if !race.CompletedAt.Valid {
-		t.Error("expected race to be completed")
-	}
-}
-
-func TestProcessEvents_CompletionDetection(t *testing.T) {
-	const pieceCount = 5
-	store, raceID, cleanup := setupTrackerTest(t, "complete_test")
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	events := make(chan bpf.ProbeEvent, 100)
-	downloadCompleteCh := make(chan struct{}, 1)
-	logger := trackerTestLogger()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- processEvents(ctx, store, logger, "complete_test", raceID, nil, events, downloadCompleteCh)
-	}()
-
-	// Send we_have for all pieces
-	for i := 0; i < pieceCount; i++ {
-		events <- &bpf.WeHaveEvent{
-			PieceIndex: uint32(i),
-			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
-		}
+	if connCount != 2 {
+		t.Errorf("expected 2 peer connections, got %d", connCount)
 	}
 
-	// After completing all pieces, incoming_have from new connections should be
-	// ignored (loggedComplete = true blocks new InsertConnection calls).
-	// Send one more incoming_have with a new ConnPtr.
-	events <- &bpf.IncomingHaveEvent{
-		PieceIndex: 0,
-		Timestamp:  testTimestamp(10 * time.Millisecond),
-		ConnPtr:    0xfaceface,
+	// Verify all 3 incoming_have events persisted as have (event_type_id=1)
+	var eventCount int
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ? AND event_type_id = 1",
+		raceID).Scan(&eventCount); err != nil {
+		t.Fatalf("failed to count events: %v", err)
 	}
-
-	close(events)
-
-	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+	if eventCount != 3 {
+		t.Errorf("expected 3 have events, got %d", eventCount)
 	}
 }
 
@@ -213,6 +213,17 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 
 	if err := <-errCh; err != nil {
 		t.Fatalf("processEvents returned error: %v", err)
+	}
+
+	// Verify all 150 events were persisted (batch flush at 100 + final flush of 50)
+	var eventCount int
+	if err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ?",
+		raceID).Scan(&eventCount); err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+	if eventCount != 150 {
+		t.Errorf("expected 150 events (100 batch + 50 final flush), got %d", eventCount)
 	}
 }
 
@@ -506,6 +517,126 @@ func TestProcessEvents_MetadataArrivesMidRace(t *testing.T) {
 	logOutput := logBuf.String()
 	if !strings.Contains(logOutput, "metadata resolved") {
 		t.Errorf("expected 'metadata resolved' log, got: %s", logOutput)
+	}
+}
+
+func TestProcessEvents_GraceTimerTerminates(t *testing.T) {
+	// Verify that the grace timer fires and terminates the race even when
+	// events keep arriving (the old idle timer would reset and never fire).
+	store, raceID, cleanup := setupTrackerTest(t, "grace_terminates")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	events := make(chan bpf.ProbeEvent, 1000)
+	downloadCompleteCh := make(chan struct{})
+	logger := trackerTestLogger()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- processEvents(ctx, store, logger, "grace_terminates", raceID, nil, events, downloadCompleteCh)
+	}()
+
+	// Establish a peer connection before download completes
+	events <- &bpf.IncomingHaveEvent{
+		PieceIndex: 0, Timestamp: testTimestamp(0), ConnPtr: 0xaaa,
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Signal download complete — grace = clamp(elapsed*0.5, 5s, 60s) = 5s (floor)
+	close(downloadCompleteCh)
+	graceStart := time.Now()
+	time.Sleep(50 * time.Millisecond)
+
+	// Pump events every 100ms for 8 seconds — well past the 5s grace period.
+	// Under the old idle timer, this would keep the race alive forever.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 80; i++ {
+			select {
+			case events <- &bpf.IncomingHaveEvent{
+				PieceIndex: uint32(i + 1),
+				Timestamp:  testTimestamp(time.Duration(i) * 100 * time.Millisecond),
+				ConnPtr:    0xaaa,
+			}:
+			case <-ctx.Done():
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("processEvents returned error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("race did not terminate — grace timer failed to fire")
+	}
+
+	// Verify the grace timer enforced the expected duration.
+	// Should be ~5s (the floor), not instant and not unbounded.
+	graceElapsed := time.Since(graceStart)
+	if graceElapsed < 4*time.Second {
+		t.Errorf("grace period too short: %v (expected ~5s)", graceElapsed)
+	}
+	if graceElapsed > 8*time.Second {
+		t.Errorf("grace period too long: %v (expected ~5s, events should not extend it)", graceElapsed)
+	}
+}
+
+func TestProcessEvents_EventsRecordedDuringGrace(t *testing.T) {
+	store, raceID, cleanup := setupTrackerTest(t, "grace_events")
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	events := make(chan bpf.ProbeEvent, 100)
+	downloadCompleteCh := make(chan struct{})
+	logger := trackerTestLogger()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- processEvents(ctx, store, logger, "grace_events", raceID, nil, events, downloadCompleteCh)
+	}()
+
+	// Establish peer + send pre-completion event
+	events <- &bpf.IncomingHaveEvent{
+		PieceIndex: 0, Timestamp: testTimestamp(0), ConnPtr: 0xaaa,
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Signal download complete
+	close(downloadCompleteCh)
+	time.Sleep(50 * time.Millisecond)
+
+	// Send events from the known peer during grace period
+	events <- &bpf.IncomingHaveEvent{
+		PieceIndex: 1, Timestamp: testTimestamp(time.Second), ConnPtr: 0xaaa,
+	}
+	events <- &bpf.IncomingHaveEvent{
+		PieceIndex: 2, Timestamp: testTimestamp(2 * time.Second), ConnPtr: 0xaaa,
+	}
+
+	close(events)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("processEvents returned error: %v", err)
+	}
+
+	// All 3 events from 0xaaa should be persisted (1 pre + 2 during grace)
+	var eventCount int
+	err := store.DB().QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM packet_events WHERE race_id = ?", raceID).Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+	if eventCount != 3 {
+		t.Errorf("expected 3 events (pre + during grace), got %d", eventCount)
 	}
 }
 
