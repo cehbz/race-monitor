@@ -7,6 +7,46 @@ independently testable and reusable across different contexts.
 from datetime import datetime
 
 
+# Maps ASN → clean infrastructure/hosting provider name.
+# Used to build "Brand @ Infrastructure" display strings when the end-user
+# brand (from rDNS tier-1) is a reseller on shared hosting.
+_ASN_INFRA = {
+    60781:  'Leaseweb',
+    24940:  'Hetzner',
+    16276:  'OVH',
+    197540: 'netcup',
+    43350:  'NForce',
+    49981:  'WorldStream',
+    49453:  'Global Layer',
+    8473:   'Bahnhof',
+    60068:  'DataPacket',
+    212238: 'DataPacket',
+    11878:  'tzulo',
+    12876:  'Scaleway',
+    # Providers with their own ASN and IP space — brand == network operator,
+    # so no "@" needed (they colocate in third-party DCs but own the BGP layer)
+    208959: 'Ultra.cc',
+    200052: 'Feral',
+    394151: 'Whatbox',
+    205689: 'Whatbox',
+    139225: 'Whatbox',
+    202954: 'Seedboxes.cc',
+    211839: 'seedit4.me',
+}
+
+
+def format_provider(brand, asn):
+    """Build display string combining end-user brand with infrastructure.
+
+    Returns "Brand @ Infra" when the brand is a reseller on shared hosting,
+    or just "Brand" / "Infra" when they are the same entity.
+    """
+    infra = _ASN_INFRA.get(asn or 0, '')
+    if brand and infra and brand.lower() != infra.lower():
+        return f'{brand} @ {infra}'
+    return brand or infra or ''
+
+
 def parse_rfc3339(ts):
     """Parse RFC 3339 timestamp string into a datetime. Returns None on failure."""
     if not ts or not isinstance(ts, str):

@@ -14,8 +14,52 @@ from analysis import (
     build_piece_count_curve,
     classify_peer,
     extrapolate_finish_time,
+    format_provider,
     _adaptive_step,
 )
+
+
+# --- format_provider ---
+
+class TestFormatProvider:
+    def test_reseller_on_shared_infra(self):
+        # Xirvik is a reseller on Leaseweb (AS60781)
+        assert format_provider('Xirvik', 60781) == 'Xirvik @ Leaseweb'
+
+    def test_reseller_on_nforce(self):
+        assert format_provider('DediSeedbox', 43350) == 'DediSeedbox @ NForce'
+
+    def test_own_asn_feral(self):
+        # Feral owns AS200052 — brand == infra, no '@'
+        assert format_provider('Feral', 200052) == 'Feral'
+
+    def test_own_asn_ultra(self):
+        assert format_provider('Ultra.cc', 208959) == 'Ultra.cc'
+
+    def test_own_asn_whatbox(self):
+        # Whatbox NL
+        assert format_provider('Whatbox', 205689) == 'Whatbox'
+
+    def test_brand_unknown_asn(self):
+        # ASN not in _ASN_INFRA — just show brand
+        assert format_provider('SomeSeedbox', 99999) == 'SomeSeedbox'
+
+    def test_no_brand_known_infra(self):
+        # No rDNS brand but we know the infra from ASN
+        assert format_provider('', 60781) == 'Leaseweb'
+
+    def test_none_brand_known_infra(self):
+        assert format_provider(None, 60781) == 'Leaseweb'
+
+    def test_none_brand_none_asn(self):
+        assert format_provider(None, None) == ''
+
+    def test_empty_brand_unknown_asn(self):
+        assert format_provider('', 99999) == ''
+
+    def test_asn_zero(self):
+        # ASN 0 is not in the map
+        assert format_provider('SomeBrand', 0) == 'SomeBrand'
 
 
 # --- parse_rfc3339 ---

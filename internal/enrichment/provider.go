@@ -14,6 +14,8 @@ var rdnsPatterns = []struct {
 	{"whatbox", false, "Whatbox"},
 	{"bytesized", false, "Bytesized"},
 	{"seedboxes.cc", false, "Seedboxes.cc"},
+	{"xirvik", false, "Xirvik"},
+	{"dediseedbox", false, "DediSeedbox"},
 	{"ultraseedbox", false, "Ultra.cc"},
 	{".ultra.cc", true, "Ultra.cc"},
 	{"rapidseedbox", false, "RapidSeedbox"},
@@ -21,6 +23,16 @@ var rdnsPatterns = []struct {
 	{"pulsedmedia", false, "PulsedMedia"},
 	{"hostingbydesign", false, "HostingByDesign"},
 	{"sbdx", false, "HostingByDesign"},
+	{"walkerservers", false, "HostingByDesign"},
+	{"andy10gb", false, "Andy10gbit"},
+	{"hostbrr", false, "HostBrr"},
+	{"worldstream", false, "WorldStream"},
+	{"global-layer.com", false, "Global Layer"},
+	{".bahnhof.se", true, "Bahnhof"},
+	{"datapacket.com", false, "DataPacket"},
+	{"cdn77.com", false, "DataPacket"},
+	{"tzulo.com", false, "tzulo"},
+	{"seedit4.me", false, "seedit4.me"},
 	{"leaseweb", false, "Leaseweb"},
 	{"hostdzire", false, "Leaseweb"},
 	{"hetzner", false, "Hetzner"},
@@ -35,8 +47,22 @@ var rdnsPatterns = []struct {
 // ipapi.is returns corporate entity names; these map to well-known brands.
 var (
 	asnBrands = map[int]string{
-		208959: "Ultra.cc", // SlashN Services
-		200052: "Feral",    // Feral Hosting
+		208959: "Ultra.cc",     // SlashN Services
+		200052: "Feral",        // Feral Hosting
+		394151: "Whatbox",      // Whatbox CA
+		205689: "Whatbox",      // Whatbox NL
+		139225: "Whatbox",      // Whatbox AP
+		202954: "Seedboxes.cc", // Rapiddot Hosting
+		24940:  "Hetzner",      // Hetzner Online
+		197540: "netcup",       // netcup GmbH
+		16276:  "OVH",          // OVH SAS
+		49981:  "WorldStream",  // WorldStream B.V.
+		49453:  "Global Layer", // Global Layer B.V.
+		8473:   "Bahnhof",      // Bahnhof AB
+		60068:  "DataPacket",   // DataCamp Limited (CDN77/DataPacket)
+		212238: "DataPacket",   // DataCamp Limited (CDNEXT)
+		11878:  "tzulo",        // tzulo Inc.
+		211839: "seedit4.me",   // JMT Paso Limited
 	}
 
 	domainBrands = map[string]string{
@@ -47,11 +73,23 @@ var (
 		"feralhosting.com":      "Feral",
 		"whatbox.ca":            "Whatbox",
 		"bytesized-hosting.com": "Bytesized",
+		"xirvik.com":            "Xirvik",
+		"dediseedbox.com":       "DediSeedbox",
 		"seedhost.eu":           "Seedhost.eu",
 		"pulsedmedia.com":       "PulsedMedia",
 		"rapidseedbox.com":      "RapidSeedbox",
 		"seedboxes.cc":          "Seedboxes.cc",
 		"hostingbydesign.com":   "HostingByDesign",
+		"andy10gbit.xyz":        "Andy10gbit",
+		"hostbrr.com":           "HostBrr",
+		"walkerservers.com":     "HostingByDesign",
+		"worldstream.net":       "WorldStream",
+		"global-layer.com":      "Global Layer",
+		"bahnhof.se":            "Bahnhof",
+		"datapacket.com":        "DataPacket",
+		"cdn77.com":             "DataPacket",
+		"tzulo.com":             "tzulo",
+		"seedit4.me":            "seedit4.me",
 		"leaseweb.com":          "Leaseweb",
 		"leaseweb.nl":           "Leaseweb",
 		"hetzner.com":           "Hetzner",

@@ -30,6 +30,7 @@ from analysis import (
     build_piece_count_curve,
     classify_peer,
     extrapolate_finish_time,
+    format_provider,
     _adaptive_step,
 )
 import db
@@ -69,6 +70,7 @@ DB_PATH = config['race_db']
 BIND_HOST = config['bind_host']
 BIND_PORT = config['bind_port']
 DEBUG = config['debug']
+OUR_IP = config.get('our_ip', '')
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +290,10 @@ def get_peers(race_id):
     peer_pieces = db.fetch_peer_pieces(conn, race_id)
     conn_meta = db.fetch_connection_meta(conn, race_id)
 
-    # Collect peer IPs for enrichment lookup
+    # Collect peer IPs for enrichment lookup (include our own IP)
     peer_ips = {meta['ip'] for meta in conn_meta.values() if meta.get('ip')}
+    if OUR_IP:
+        peer_ips.add(OUR_IP)
     enrichment = db.fetch_ip_enrichment(conn, peer_ips)
     race_errors = db.fetch_race_errors(conn, race_id)
     conn.close()
@@ -344,7 +348,7 @@ def get_peers(race_id):
     self_pieces_count = len([r for r in self_pieces if r['first_ts'] is not None])
     participants.append({
         'label': 'Us',
-        'ip': '(self)',
+        'ip': OUR_IP or '(self)',
         'port': 0,
         'client': '',
         'type': 'self',
@@ -424,6 +428,7 @@ def get_peers(race_id):
         ip = p.get('ip', '')
         net = enrichment.get(ip)
         if net:
+            net['provider'] = format_provider(net['ip_provider'], net.get('asn'))
             p['network'] = net
         else:
             p['network'] = None

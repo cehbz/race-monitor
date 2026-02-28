@@ -148,9 +148,11 @@
         .contaminated-row td { background: rgba(248, 81, 73, 0.08); }
         .beat-us { color: #3fb950; font-weight: 600; font-size: 12px; }
         .self-row td { background: rgba(88, 166, 255, 0.05); }
+        .self-row td:first-child { border-left: 3px solid #d29922; }
         .seeder-row td { opacity: 0.7; }
         .peer-table tbody tr { cursor: pointer; }
         .peer-table tbody tr.highlighted td { background: rgba(88, 166, 255, 0.15); }
+        .peer-table td.cell-highlight { background: rgba(86, 211, 100, 0.25); }
     </style>
 </head>
 <body>
@@ -513,6 +515,8 @@
                             <th class="num sortable" data-col="port">Port</th>
                             <th class="sortable" data-col="client">Client</th>
                             <th class="sortable" data-col="network">Network</th>
+                            <th class="sortable" data-col="asn">ASN</th>
+                            <th class="sortable" data-col="segment">Segment</th>
                             <th class="num sortable" data-col="pieces">Pieces</th>
                             <th class="num sortable" data-col="ahead">Ahead</th>
                             <th class="num sortable" data-col="finish">Finish</th>
@@ -559,22 +563,23 @@
                         if (net.city || net.country) {
                             netGeo = [net.city, net.country].filter(Boolean).join(', ');
                         }
-                        const tipParts = [];
-                        if (net.rdns) tipParts.push('rDNS: ' + net.rdns);
-                        if (net.asn) tipParts.push('AS' + net.asn + (net.asn_org ? ' ' + net.asn_org : ''));
-                        netTooltip = tipParts.join('&#10;');
+                        if (net.rdns) netTooltip = 'rDNS: ' + net.rdns;
                     }
                     const netLabel = netName && netGeo ? `${netName} · ${netGeo}`
                                    : netName ? netName
                                    : netGeo ? netGeo
                                    : '\u2014';
+                    const asnVal = net && net.asn ? net.asn : '';
+                    const segVal = net && net.bgp_prefix ? net.bgp_prefix : '';
                     thtml += `
-                        <tr class="${rowClass}" data-peer-key="${peerKey}">
+                        <tr class="${rowClass}" data-peer-key="${peerKey}" data-asn="${asnVal}" data-bgp-prefix="${segVal}">
                             <td class="num">${idx + 1}</td>
                             <td><code>${p.ip || '\u2014'}</code></td>
                             <td class="num">${p.port || '\u2014'}</td>
                             <td>${isContaminated ? '<span class="badge contaminated">CONTAMINATED</span> ' : ''}${p.client || '\u2014'}</td>
                             <td title="${netTooltip}">${netLabel}</td>
+                            <td class="asn-cell" title="${net && net.asn_org ? net.asn_org : ''}">${asnVal ? 'AS' + asnVal : '\u2014'}</td>
+                            <td class="seg-cell"><code>${segVal || '\u2014'}</code></td>
                             <td class="num">${p.pieces}</td>
                             <td class="num">${aheadStr}</td>
                             <td class="num">${finishStr}</td>
@@ -602,6 +607,14 @@
                                 va = (a.network && (a.network.provider || a.network.isp)) || '';
                                 vb = (b.network && (b.network.provider || b.network.isp)) || '';
                                 return dir * va.localeCompare(vb);
+                            case 'asn':
+                                va = (a.network && a.network.asn) || 0;
+                                vb = (b.network && b.network.asn) || 0;
+                                return dir * (va - vb);
+                            case 'segment':
+                                va = (a.network && a.network.bgp_prefix) || '';
+                                vb = (b.network && b.network.bgp_prefix) || '';
+                                return dir * va.localeCompare(vb);
                             case 'finish':
                                 va = a.finish_sec != null ? a.finish_sec : Infinity;
                                 vb = b.finish_sec != null ? b.finish_sec : Infinity;
@@ -611,9 +624,12 @@
                     });
                 }
                 container.innerHTML = html + renderTable(sorted);
+                if (highlightedKey) applyHighlights();
             }
 
             let highlightedKey = null;
+            let highlightedSegment = null;
+            let highlightedAsn = null;
 
             sortAndRender();
 
@@ -621,14 +637,40 @@
             const chartEl = document.getElementById('peer-progress-chart-plot')
                 || document.getElementById('peer-progress-chart');
 
-            function highlightPeer(peerKey) {
-                highlightedKey = (highlightedKey === peerKey) ? null : peerKey;
-
-                // Highlight table row
+            function applyHighlights() {
                 container.querySelectorAll('tbody tr').forEach(tr => {
-                    tr.classList.toggle('highlighted',
-                        highlightedKey !== null && tr.dataset.peerKey === highlightedKey);
+                    const isSelected = highlightedKey !== null && tr.dataset.peerKey === highlightedKey;
+                    tr.classList.toggle('highlighted', isSelected);
+
+                    const asnCell = tr.querySelector('.asn-cell');
+                    const segCell = tr.querySelector('.seg-cell');
+                    if (asnCell) asnCell.classList.remove('cell-highlight');
+                    if (segCell) segCell.classList.remove('cell-highlight');
+
+                    if (!isSelected && highlightedKey !== null) {
+                        const rowSeg = tr.dataset.bgpPrefix;
+                        const rowAsn = tr.dataset.asn;
+                        if (highlightedSegment && rowSeg && highlightedSegment === rowSeg && segCell)
+                            segCell.classList.add('cell-highlight');
+                        if (highlightedAsn && rowAsn && highlightedAsn === rowAsn && asnCell)
+                            asnCell.classList.add('cell-highlight');
+                    }
                 });
+            }
+
+            function highlightPeer(peerKey) {
+                if (highlightedKey === peerKey) {
+                    highlightedKey = null;
+                    highlightedSegment = null;
+                    highlightedAsn = null;
+                } else {
+                    highlightedKey = peerKey;
+                    const clickedRow = container.querySelector(`tbody tr[data-peer-key="${peerKey}"]`);
+                    highlightedSegment = (clickedRow && clickedRow.dataset.bgpPrefix) || null;
+                    highlightedAsn = (clickedRow && clickedRow.dataset.asn) || null;
+                }
+
+                applyHighlights();
 
                 // Highlight chart trace — bold the selected, restore others
                 const traceKeys = chartEl && chartEl._traceKeys;
@@ -653,12 +695,6 @@
                         sortAsc = col === 'ahead' || col === 'pieces' ? false : true;
                     }
                     sortAndRender();
-                    if (highlightedKey) {
-                        container.querySelectorAll('tbody tr').forEach(tr => {
-                            tr.classList.toggle('highlighted',
-                                tr.dataset.peerKey === highlightedKey);
-                        });
-                    }
                     return;
                 }
 

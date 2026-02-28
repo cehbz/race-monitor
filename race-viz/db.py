@@ -219,7 +219,7 @@ def fetch_ip_enrichment(conn, ips):
     try:
         placeholders = ','.join('?' * len(ips))
         cursor = conn.execute(f'''
-            SELECT d.ip, d.rdns, d.provider AS ip_provider,
+            SELECT d.ip, d.rdns, d.provider AS ip_provider, d.bgp_prefix,
                    n.asn, n.asn_org, n.isp, n.company_type,
                    n.is_datacenter, n.datacenter, n.provider AS net_provider,
                    n.city, n.region, n.country,
@@ -235,7 +235,9 @@ def fetch_ip_enrichment(conn, ips):
             provider = r['ip_provider'] or r['net_provider'] or ''
             result[r['ip']] = {
                 'rdns': r['rdns'] or '',
+                'bgp_prefix': r['bgp_prefix'] or '',
                 'provider': provider,
+                'ip_provider': r['ip_provider'] or '',
                 'isp': r['isp'] or '',
                 'city': r['city'] or '',
                 'country': r['country'] or '',
