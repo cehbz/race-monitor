@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/cehbz/qbittorrent"
+	"github.com/cehbz/qbittorrent/v2"
 	"github.com/cehbz/race-monitor/internal/race"
 )
 

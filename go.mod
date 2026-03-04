@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/cehbz/qbittorrent v1.11.0
+	github.com/cehbz/qbittorrent/v2 v2.0.0
 	github.com/cilium/ebpf v0.20.0
 	golang.org/x/sys v0.37.0
 	modernc.org/sqlite v1.29.1
