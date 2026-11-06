@@ -10,6 +10,10 @@ import (
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
+// msgMetadataUnavailable is logged when the metadata channel closes without
+// delivering a piece count.
+const msgMetadataUnavailable = "metadata unavailable, contamination detection inactive"
+
 // Grace period constants for post-download event capture.
 const (
 	graceFraction = 0.5
@@ -118,10 +122,12 @@ func processEvents(
 			return ctx.Err()
 
 		case pc, ok := <-metaChan:
+			metaChan = nil // one-shot: a closed channel is always ready, so stop selecting it
 			if ok {
 				pieceCount = pc
-				metaChan = nil // one-shot; stop selecting
 				logger.Info("metadata resolved", "hash", hash, "piece_count", pieceCount)
+			} else {
+				logger.Debug(msgMetadataUnavailable, "hash", hash)
 			}
 
 		case <-maxTimer.C:

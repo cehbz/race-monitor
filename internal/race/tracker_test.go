@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,65 @@ func setupTrackerTest(t *testing.T, hash string) (*storage.Store, int64, func())
 
 	cleanup := func() { store.Close() }
 	return store, raceID, cleanup
+}
+
+// countingHandler counts log records carrying one message. It observes how
+// often a tracker code path ran through the logger processEvents already takes.
+type countingHandler struct {
+	msg string
+	n   atomic.Int64
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler            { return h }
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.n.Add(1)
+	}
+	return nil
+}
+
+// TestProcessEvents_ClosedMetaChanNotReselected pins the fix for the select
+// spin: a metadata channel closed without a value is selected at most once.
+//
+// No clock is involved. events is unbuffered, so each accepted send proves one
+// more trip round the select. A closed channel that stays in the select is ready
+// on every trip, and select chooses uniformly among ready cases, so across 200
+// trips it fires at least about 100 times; firing at most once by chance has
+// probability around 2^-190.
+func TestProcessEvents_ClosedMetaChanNotReselected(t *testing.T) {
+	const hash = "closed_meta_test"
+	store, raceID, cleanup := setupTrackerTest(t, hash)
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	counter := &countingHandler{msg: msgMetadataUnavailable}
+	logger := slog.New(counter)
+
+	metaChan := make(chan int)
+	close(metaChan)
+	events := make(chan bpf.ProbeEvent)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- processEvents(ctx, store, logger, hash, raceID, metaChan, events, make(chan struct{}))
+	}()
+
+	const trips = 200
+	for i := range trips {
+		events <- &bpf.WeHaveEvent{PieceIndex: uint32(i), Timestamp: testTimestamp(time.Duration(i))}
+	}
+	close(events)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("processEvents returned error: %v", err)
+	}
+	if got := counter.n.Load(); got > 1 {
+		t.Errorf("closed metadata channel selected %d times across %d loop trips, want at most 1", got, trips)
+	}
 }
 
 func TestGraceDuration(t *testing.T) {
