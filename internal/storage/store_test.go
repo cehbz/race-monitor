@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -291,4 +292,96 @@ func TestInsertPacketEvents(t *testing.T) {
 			t.Fatalf("unexpected error for empty slice: %v", err)
 		}
 	})
+}
+
+// seedRace creates a race for torrentID with one connection, one packet event
+// and one race error.
+func seedRace(t *testing.T, store *storage.Store, torrentID int64) int64 {
+	t.Helper()
+	ctx := context.Background()
+	raceID, err := store.CreateRace(ctx, torrentID, 1)
+	if err != nil {
+		t.Fatalf("create race: %v", err)
+	}
+	connID, err := store.InsertConnection(ctx, raceID, "self", time.Now())
+	if err != nil {
+		t.Fatalf("insert connection: %v", err)
+	}
+	if err := store.InsertPacketEvents(ctx, []storage.Event{{
+		RaceID: raceID, ConnectionID: connID, Timestamp: 1,
+		EventType: storage.EventTypeHave, PieceIndex: 1,
+	}}); err != nil {
+		t.Fatalf("insert event: %v", err)
+	}
+	store.InsertRaceError(ctx, raceID, "test", "test")
+	return raceID
+}
+
+func countRaceRows(t *testing.T, store *storage.Store, table string, raceID int64) int {
+	t.Helper()
+	var n int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE race_id = ?`, raceID).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
+}
+
+func TestDeleteRace_RemovesOwnedRowsAndTorrent(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	torrentID := createTestTorrent(t, store, "hash_a", "A", 1, 1)
+	raceID := seedRace(t, store, torrentID)
+
+	if err := store.DeleteRace(ctx, raceID); err != nil {
+		t.Fatalf("DeleteRace: %v", err)
+	}
+
+	for _, table := range []string{"packet_events", "connections", "race_errors"} {
+		if n := countRaceRows(t, store, table, raceID); n != 0 {
+			t.Errorf("%s has %d rows for the race, want 0", table, n)
+		}
+	}
+	if _, err := store.GetRace(ctx, raceID); !errors.Is(err, storage.ErrRaceNotFound) {
+		t.Errorf("GetRace err = %v, want ErrRaceNotFound", err)
+	}
+	var torrents int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM torrents WHERE id = ?`, torrentID).Scan(&torrents); err != nil {
+		t.Fatalf("count torrents: %v", err)
+	}
+	if torrents != 0 {
+		t.Errorf("torrents row survived: %d", torrents)
+	}
+}
+
+func TestDeleteRace_KeepsTorrentOfOtherRaces(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	torrentID := createTestTorrent(t, store, "hash_a", "A", 1, 1)
+	earlier := seedRace(t, store, torrentID)
+	time.Sleep(2 * time.Millisecond) // races are unique on (torrent_id, started_at ms)
+	raceID := seedRace(t, store, torrentID)
+
+	if err := store.DeleteRace(ctx, raceID); err != nil {
+		t.Fatalf("DeleteRace: %v", err)
+	}
+
+	if _, err := store.GetRace(ctx, raceID); !errors.Is(err, storage.ErrRaceNotFound) {
+		t.Errorf("GetRace err = %v, want ErrRaceNotFound", err)
+	}
+	r, err := store.GetRace(ctx, earlier)
+	if err != nil {
+		t.Fatalf("earlier race: %v", err)
+	}
+	if r.Name != "A" {
+		t.Errorf("earlier race torrent name = %q, want A", r.Name)
+	}
+	for _, table := range []string{"packet_events", "connections", "race_errors"} {
+		if n := countRaceRows(t, store, table, earlier); n != 1 {
+			t.Errorf("%s has %d rows for the earlier race, want 1", table, n)
+		}
+	}
 }

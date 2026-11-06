@@ -300,14 +300,8 @@ Config: ~/.config/race-monitor/config.toml
 	// Create enrichment API client (optional)
 	var enrichAPI race.EnrichmentAPI
 	if webuiURL != "" {
-		api, err := newQBClient(webuiURL, webuiUser, webuiPass, logger)
-		if err != nil {
-			logger.Warn("webui_url set but failed to create qBittorrent client (enrichment disabled)",
-				"error", err)
-		} else if api != nil {
-			enrichAPI = api
-			logger.Info("API enrichment enabled", "webui_url", webuiURL)
-		}
+		enrichAPI = newQBClient(webuiURL, webuiUser, webuiPass, qbResponseTimeout)
+		logger.Info("API enrichment enabled", "webui_url", webuiURL)
 	}
 
 	// Start eBPF capture with calibrated offsets for identity-based peer dedup

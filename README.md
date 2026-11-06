@@ -136,10 +136,11 @@ Offsets cached by binary SHA256. Re-running `race-calibrate` is only needed afte
 
 ### Race Lifecycle
 
-1. `torrent::start()` fires — coordinator creates race, fetches metadata from qBittorrent API
-2. Events stream in — coordinator routes `we_have` by torrent pointer, `incoming_have` by peer connection pointer
-3. `torrent::finished()` fires — tracker starts a proportional grace period: 50% of download duration, clamped to [5s, 60s]
-4. Grace timer expires — race finalized, BPF dedup maps cleaned for peer/torrent rediscovery
+1. `torrent::start()` fires — coordinator creates a provisional race and queues it for the metadata resolver, which fetches name, size, piece count and addition date from the qBittorrent API off the event loop
+2. Classification — a race is a torrent added while being watched. If `addition_date` is more than 5s before the `torrent::start()` event (BPF ktime converted to wall clock), the torrent was restored from the session: the race is dropped, its rows are deleted and BPF dedup maps are cleaned as on completion. API failures are retried with backoff for up to 60s from when the race was queued; a race the API can't classify in that time is kept and the failure logged. Without `webui_url` every started torrent is kept
+3. Events stream in — coordinator routes `we_have` by torrent pointer, `incoming_have` by peer connection pointer
+4. `torrent::finished()` fires — tracker starts a proportional grace period: 50% of download duration, clamped to [5s, 60s]
+5. Grace timer expires — race finalized, BPF dedup maps cleaned for peer/torrent rediscovery
 
 ### Enrichment Pipeline
 

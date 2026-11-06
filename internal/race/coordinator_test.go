@@ -81,7 +81,7 @@ func makeTorrentStartEvent(ptr uint64, infoHashBytes []byte, infoHashOffset int)
 
 	event := &bpf.TorrentStartedEvent{
 		TorrentPtr: ptr,
-		Timestamp:  uint64(time.Now().UnixNano()),
+		Timestamp:  monotonicNow(),
 	}
 
 	copy(event.Data[infoHashOffset:infoHashOffset+20], infoHashBytes)

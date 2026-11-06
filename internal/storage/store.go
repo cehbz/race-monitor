@@ -307,6 +307,43 @@ func (s *Store) CreateRace(ctx context.Context, torrentID int64, startKtime int6
 	return result.LastInsertId()
 }
 
+// DeleteRace removes a race with its connections, packet events and race errors,
+// and its torrents row if no other race references it. The caller ensures nothing
+// is still writing to the race.
+func (s *Store) DeleteRace(ctx context.Context, raceID int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var torrentID int64
+	err = tx.QueryRowContext(ctx, `SELECT torrent_id FROM races WHERE id = ?`, raceID).Scan(&torrentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrRaceNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("finding race: %w", err)
+	}
+
+	// Foreign-key order: packet_events reference connections, both reference races.
+	for _, table := range []string{"packet_events", "connections", "race_errors"} {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE race_id = ?`, raceID); err != nil {
+			return fmt.Errorf("deleting from %s: %w", table, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM races WHERE id = ?`, raceID); err != nil {
+		return fmt.Errorf("deleting race: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM torrents WHERE id = ? AND NOT EXISTS (SELECT 1 FROM races WHERE torrent_id = ?)`,
+		torrentID, torrentID); err != nil {
+		return fmt.Errorf("deleting torrent: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // CompleteRace marks a race as completed.
 func (s *Store) CompleteRace(ctx context.Context, raceID int64) error {
 	_, err := s.db.ExecContext(ctx,
