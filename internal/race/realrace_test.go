@@ -2,6 +2,7 @@ package race
 
 import (
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -444,4 +445,69 @@ func TestStartStillPendingAtShutdownLeavesNoRecords(t *testing.T) {
 	close(eventsChan)
 	<-errChan
 	assertNoRaceRows(t, store)
+}
+
+// raceFinalized reports whether the race has a completed_at.
+func raceFinalized(t *testing.T, store *storage.Store, raceID int64) bool {
+	t.Helper()
+	var done sql.NullString
+	if err := store.DB().QueryRow(`SELECT completed_at FROM races WHERE id = ?`, raceID).Scan(&done); err != nil {
+		t.Fatalf("race %d completed_at: %v", raceID, err)
+	}
+	return done.Valid
+}
+
+// keepHeldRace starts a torrent added while watched, holds burst piece events
+// while it is pending and returns once it is a race: the tracker is then still
+// writing the held events.
+func keepHeldRace(t *testing.T, ctx context.Context, burst int, n int) (*storage.Store, chan<- bpf.ProbeEvent, <-chan error) {
+	t.Helper()
+	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerNew(burst + 10)}
+	c, store := newClassifyCoordinator(t, nil, "", api, nil)
+	eventsChan, errChan := startRun(c, ctx)
+	hashBytes, hash := testInfoHash(n)
+	eventsChan <- startedEvent(0x1000, hashBytes, raceStartKtime)
+	sendWeHaves(eventsChan, 0x1000, burst)
+	time.Sleep(settle)
+	close(api.gate)
+	waitRace(t, c, hash)
+	return store, eventsChan, errChan
+}
+
+func TestRequestedStopEndsEachRaceOnceEveryEventItReceivedIsWritten(t *testing.T) {
+	pending(t)
+	const burst = 5000
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	store, _, errChan := keepHeldRace(t, ctx, burst, 313)
+
+	cancel()
+	<-errChan
+
+	raceID := onlyRaceID(t, store)
+	if n := countPieceReceivedEvents(store, context.Background(), raceID); n != burst {
+		t.Errorf("race's piece events = %d, want %d", n, burst)
+	}
+	if !raceFinalized(t, store, raceID) {
+		t.Error("race not finalized at the stop")
+	}
+}
+
+func TestEventSourceClosingEndsEachRaceOnceEveryEventItReceivedIsWritten(t *testing.T) {
+	pending(t)
+	const burst = 30000 // takes longer than a second to write
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	store, eventsChan, errChan := keepHeldRace(t, ctx, burst, 314)
+
+	close(eventsChan)
+	<-errChan
+
+	raceID := onlyRaceID(t, store)
+	if n := countPieceReceivedEvents(store, context.Background(), raceID); n != burst {
+		t.Errorf("race's piece events = %d, want %d", n, burst)
+	}
+	if !raceFinalized(t, store, raceID) {
+		t.Error("race not finalized at the stop")
+	}
 }
