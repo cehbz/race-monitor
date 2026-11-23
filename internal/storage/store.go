@@ -26,11 +26,14 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+// tsLayout is the layout of every stored timestamp.
+const tsLayout = "2006-01-02T15:04:05.000Z"
+
 // formatTS formats a time.Time as RFC 3339 with millisecond precision.
 // Produces timestamps like "2026-02-09T05:18:37.753Z" directly parseable
 // by JavaScript's Date constructor and Python's datetime.
 func formatTS(t time.Time) string {
-	return t.UTC().Format("2006-01-02T15:04:05.000Z")
+	return t.UTC().Format(tsLayout)
 }
 
 // New creates a new SQLite store, running schema migration if needed.
@@ -88,6 +91,17 @@ func New(dbPath string) (*Store, error) {
 		message     TEXT NOT NULL)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating race_errors table: %w", err)
+	}
+
+	// Start errors — unidentified torrent starts, recorded instead of races.
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS start_errors (
+		id          INTEGER PRIMARY KEY AUTOINCREMENT,
+		torrent_ptr INTEGER NOT NULL,
+		detected_at TEXT NOT NULL,
+		dump        BLOB NOT NULL,
+		event_count INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("creating start_errors table: %w", err)
 	}
 
 	return s, nil
@@ -238,9 +252,49 @@ type StartError struct {
 	EventCount int
 }
 
+// InsertStartError records an unidentified torrent start and returns its ID.
+func (s *Store) InsertStartError(ctx context.Context, torrentPtr uint64, detectedAt time.Time, dump []byte) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO start_errors (torrent_ptr, detected_at, dump) VALUES (?, ?, ?)`,
+		int64(torrentPtr), formatTS(detectedAt), dump)
+	if err != nil {
+		return 0, fmt.Errorf("inserting start error: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// SetStartErrorEventCount records how many events an unidentified start produced.
+func (s *Store) SetStartErrorEventCount(ctx context.Context, id int64, n int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE start_errors SET event_count = ? WHERE id = ?`, n, id)
+	return err
+}
+
 // ListStartErrors returns the recorded unidentified starts, oldest first.
 func (s *Store) ListStartErrors(ctx context.Context) ([]StartError, error) {
-	return nil, nil
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT torrent_ptr, detected_at, dump, event_count FROM start_errors ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("querying start errors: %w", err)
+	}
+	defer rows.Close()
+
+	var out []StartError
+	for rows.Next() {
+		var (
+			ptr int64
+			at  string
+			se  StartError
+		)
+		if err := rows.Scan(&ptr, &at, &se.Dump, &se.EventCount); err != nil {
+			return nil, fmt.Errorf("scanning start error: %w", err)
+		}
+		se.TorrentPtr = uint64(ptr)
+		if se.DetectedAt, err = time.Parse(tsLayout, at); err != nil {
+			return nil, fmt.Errorf("parsing start error time %q: %w", at, err)
+		}
+		out = append(out, se)
+	}
+	return out, rows.Err()
 }
 
 // InsertRaceError records a daemon-detected anomaly for a race.

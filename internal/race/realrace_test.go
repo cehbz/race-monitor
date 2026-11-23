@@ -316,7 +316,6 @@ func TestWithoutTheAPIEveryStartOutsideASessionLoadIsARaceAtOnce(t *testing.T) {
 }
 
 func TestUnidentifiedStartIsRecordedAsAStartErrorAndNeverBecomesARace(t *testing.T) {
-	pending(t)
 	errs := &levelCounter{level: slog.LevelError}
 	api := &fakeEnrichAPI{answer: answerNew(100)}
 	c, store := newClassifyCoordinator(t, slog.New(errs), "", api, nil)

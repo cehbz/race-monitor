@@ -164,6 +164,9 @@ type Coordinator struct {
 	// torrentPtrs maps torrent_ptr (from we_have obj_ptr) → info_hash.
 	torrentPtrs map[uint64]string
 
+	// unidentified maps torrent_ptr → unidentified start.
+	unidentified map[uint64]*unidentifiedStart
+
 	// knownTorrentPtrs tracks all torrent* pointers we've seen.
 	knownTorrentPtrs map[uint64]bool
 
@@ -219,6 +222,7 @@ func NewCoordinator(
 		offsets:             offsets,
 		infoHashToRaceState: make(map[string]*raceState),
 		torrentPtrs:         make(map[uint64]string),
+		unidentified:        make(map[uint64]*unidentifiedStart),
 		knownTorrentPtrs:    make(map[uint64]bool),
 		connToRace:          make(map[uint64]string),
 		connEndpoints:       make(map[uint64]netip.AddrPort),
@@ -296,6 +300,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			cause := context.Cause(ctx)
 			c.logger.Info("coordinator shutting down", "cause", cause)
 			// ctx is done, so the trackers are waited for on a context that isn't.
+			c.writeStartErrorCounts(context.WithoutCancel(ctx))
 			if err := c.waitForTrackerCompletions(context.WithoutCancel(ctx)); err != nil {
 				return err
 			}
@@ -316,6 +321,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 		case ev, ok := <-events:
 			if !ok {
 				c.logger.Info("event channel closed")
+				c.writeStartErrorCounts(ctx)
 				return c.waitForTrackerCompletions(ctx)
 			}
 			switch e := ev.(type) {
@@ -324,7 +330,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			case *bpf.IncomingHaveEvent:
 				c.handleIncomingHave(e)
 			case *bpf.TorrentFinishedEvent:
-				c.handleTorrentFinished(e)
+				c.handleTorrentFinished(ctx, e)
 			case *bpf.TorrentStartedEvent:
 				c.handleTorrentStarted(ctx, e)
 			case *bpf.TorrentDetailsEvent:
@@ -336,6 +342,16 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 	}
 }
 
+// msgUnidentifiedStart is logged when a torrent starts with an all-zero info hash.
+const msgUnidentifiedStart = "torrent started with an all-zero info hash: recorded as a start error, not a race"
+
+// unidentifiedStart is a torrent start whose info hash read as all zeros. Its
+// events are counted, not stored.
+type unidentifiedStart struct {
+	id     int64 // its start_errors row; 0 when the insert failed
+	events int
+}
+
 // handleTorrentStarted extracts the info_hash from a torrent::start() dump
 // and creates a race.
 func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentStartedEvent) {
@@ -345,6 +361,9 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 	if _, known := c.torrentPtrs[ptr]; known {
 		return
 	}
+	if _, known := c.unidentified[ptr]; known {
+		return
+	}
 
 	hashBytes, ok := ExtractInfoHash(e.Data, c.offsets.InfoHashOffset)
 	if !ok {
@@ -352,9 +371,50 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 			"ptr", fmt.Sprintf("0x%x", ptr))
 		return
 	}
+	if isZeroHash(hashBytes) {
+		c.recordUnidentifiedStart(ctx, e)
+		return
+	}
 	hash := hex.EncodeToString(hashBytes)
 	c.mapTorrentPtr(ptr, hash)
 	c.startRace(ctx, hash, ptr, e.Timestamp)
+}
+
+func isZeroHash(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// recordUnidentifiedStart records a start whose info hash is all zeros: an
+// unknown failure, recorded with its struct dump and never made a race.
+func (c *Coordinator) recordUnidentifiedStart(ctx context.Context, e *bpf.TorrentStartedEvent) {
+	id, err := c.store.InsertStartError(ctx, e.TorrentPtr, c.ktimeToWall(e.Timestamp), e.Data[:])
+	if err != nil {
+		c.logger.Error("failed to record start error", "torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr), "error", err)
+	}
+	c.logger.Error(msgUnidentifiedStart, "torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr), "start_error_id", id)
+	c.unidentified[e.TorrentPtr] = &unidentifiedStart{id: id}
+}
+
+// writeStartErrorCount records how many events an unidentified start has produced.
+func (c *Coordinator) writeStartErrorCount(ctx context.Context, u *unidentifiedStart) {
+	if u.id == 0 {
+		return
+	}
+	if err := c.store.SetStartErrorEventCount(ctx, u.id, u.events); err != nil {
+		c.logger.Error("failed to record start error event count", "start_error_id", u.id, "error", err)
+	}
+}
+
+// writeStartErrorCounts records every unidentified start's event count.
+func (c *Coordinator) writeStartErrorCounts(ctx context.Context) {
+	for _, u := range c.unidentified {
+		c.writeStartErrorCount(ctx, u)
+	}
 }
 
 // handleTorrentDetails registers a torrent_ptr → info_hash mapping from
@@ -363,6 +423,9 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 func (c *Coordinator) handleTorrentDetails(e *bpf.TorrentDetailsEvent) {
 	ptr := e.TorrentPtr
 	if _, known := c.torrentPtrs[ptr]; known {
+		return
+	}
+	if _, ok := c.unidentified[ptr]; ok {
 		return
 	}
 
@@ -675,6 +738,10 @@ func (c *Coordinator) notifyDashboard(raceID int64) {
 
 // handleWeHave processes a we_have event. TorrentPtr is the torrent* pointer.
 func (c *Coordinator) handleWeHave(ctx context.Context, e *bpf.WeHaveEvent) {
+	if u, ok := c.unidentified[e.TorrentPtr]; ok {
+		u.events++
+		return
+	}
 	if hash, ok := c.torrentPtrs[e.TorrentPtr]; ok {
 		if state, ok := c.infoHashToRaceState[hash]; ok {
 			c.routeEvent(state, e)
@@ -702,7 +769,11 @@ func (c *Coordinator) handleIncomingHave(e *bpf.IncomingHaveEvent) {
 }
 
 // handleTorrentFinished signals download completion for a race.
-func (c *Coordinator) handleTorrentFinished(e *bpf.TorrentFinishedEvent) {
+func (c *Coordinator) handleTorrentFinished(ctx context.Context, e *bpf.TorrentFinishedEvent) {
+	if u, ok := c.unidentified[e.TorrentPtr]; ok {
+		c.writeStartErrorCount(ctx, u)
+		return
+	}
 	hash, ok := c.torrentPtrs[e.TorrentPtr]
 	if !ok {
 		c.logger.Debug("torrent_finished for unmapped ptr",
