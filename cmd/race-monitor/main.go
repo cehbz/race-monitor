@@ -18,10 +18,12 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"golang.org/x/sys/unix"
 
 	"github.com/cehbz/race-monitor/internal/capture"
 	"github.com/cehbz/race-monitor/internal/race"
@@ -48,12 +50,54 @@ type Config struct {
 	SessionLoadWindow time.Duration `toml:"session_load_window"`
 }
 
+// defaultSessionLoadWindow is how long after qBittorrent's process start a
+// torrent start counts as restored, when the config doesn't say.
+const defaultSessionLoadWindow = 10 * time.Second
+
+// processStartTime returns when process pid started: field 22 of
+// /proc/<pid>/stat, in clock ticks since boot, set against CLOCK_BOOTTIME. It
+// returns the zero time for pid 0, which watches any process.
+func processStartTime(pid int) (time.Time, error) {
+	if pid == 0 {
+		return time.Time{}, nil
+	}
+	path := fmt.Sprintf("/proc/%d/stat", pid)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, err
+	}
+	// Field 2, the command, is parenthesised and may hold spaces, so fields
+	// are counted from the last ')'. fields[0] is field 3.
+	s := string(b)
+	i := strings.LastIndexByte(s, ')')
+	if i < 0 {
+		return time.Time{}, fmt.Errorf("parsing %s: no ')' in %q", path, s)
+	}
+	fields := strings.Fields(s[i+1:])
+	const starttime = 22 - 3
+	if len(fields) <= starttime {
+		return time.Time{}, fmt.Errorf("parsing %s: %d fields after the command", path, len(fields))
+	}
+	ticks, err := strconv.ParseInt(fields[starttime], 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parsing %s starttime: %w", path, err)
+	}
+	var boot unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_BOOTTIME, &boot); err != nil {
+		return time.Time{}, fmt.Errorf("reading CLOCK_BOOTTIME: %w", err)
+	}
+	const userHZ = 100 // USER_HZ, fixed at 100 on Linux x86-64 and arm64
+	age := time.Duration(boot.Nano()) - time.Duration(ticks)*time.Second/userHZ
+	return time.Now().Add(-age), nil
+}
+
 // readConfig reads $HOME/.config/race-monitor/config.toml over the defaults.
 func readConfig() Config {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
 	cfg := Config{
-		RaceDB: filepath.Join(home, ".local", "share", "race-monitor", "races.db"),
+		RaceDB:            filepath.Join(home, ".local", "share", "race-monitor", "races.db"),
+		SessionLoadWindow: defaultSessionLoadWindow,
 	}
 
 	if _, err := os.Stat(configPath); err == nil {
@@ -309,6 +353,11 @@ Config: ~/.config/race-monitor/config.toml
 		logger.Info("API enrichment enabled", "webui_url", cfg.WebUIURL)
 	}
 
+	processStart, err := processStartTime(pid)
+	if err != nil {
+		return fmt.Errorf("reading qBittorrent's start time: %w", err)
+	}
+
 	// Start eBPF capture with calibrated offsets for identity-based peer dedup
 	probeCfg := &capture.ProbeConfig{
 		TorrentPtrOffset: uint32(offsets.TorrentPtrOffset),
@@ -320,6 +369,8 @@ Config: ~/.config/race-monitor/config.toml
 	}
 
 	coordinator := race.NewCoordinator(store, logger, cfg.DashboardURL, offsets, enrichAPI, handle)
+	coordinator.SetSessionLoad(processStart, cfg.SessionLoadWindow)
+	logger.Info("session load", "process_start", processStart, "window", cfg.SessionLoadWindow)
 	return stopResult(coordinator.Run(ctx, handle.Events))
 }
 

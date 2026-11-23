@@ -89,7 +89,6 @@ func waitRaceCompleted(t *testing.T, store *storage.Store, raceID int64, timeout
 }
 
 func TestStartDuringSessionLoadIsRestoredWithoutAskingTheAPI(t *testing.T) {
-	pending(t)
 	srv, notifies := dashboardCounter(t)
 	api := &fakeEnrichAPI{answer: answerNew(100)}
 	c, store := newClassifyCoordinator(t, nil, srv.URL, api, nil)
@@ -285,7 +284,6 @@ func TestOneUnclassifiableStartDoesNotDelayAnothersClassification(t *testing.T) 
 }
 
 func TestWithoutTheAPIEveryStartOutsideASessionLoadIsARaceAtOnce(t *testing.T) {
-	pending(t)
 	c, store := newClassifyCoordinator(t, nil, "", nil, nil)
 	c.SetSessionLoad(testBoot.Add(8*time.Second), 10*time.Second) // load ends at +18 s
 

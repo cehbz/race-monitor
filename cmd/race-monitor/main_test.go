@@ -112,7 +112,6 @@ func TestRequestedStopExitsCleanlyAndQBittorrentDyingExitsWithAnError(t *testing
 }
 
 func TestSessionLoadWindowDefaultsToTenSecondsAndIsReadFromTheConfig(t *testing.T) {
-	pending(t)
 	tmpDir := t.TempDir()
 	t.Setenv("HOME", tmpDir)
 

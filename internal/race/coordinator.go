@@ -201,6 +201,8 @@ type Coordinator struct {
 
 	// raceEventCap is the capacity of each race's event channel.
 	raceEventCap int
+
+	sessionLoadEnd time.Time // when qBittorrent's session load ends; zero when unknown
 }
 
 // NewCoordinator creates a race coordinator with pre-calibrated offsets.
@@ -239,8 +241,17 @@ func NewCoordinator(
 
 // SetSessionLoad tells the coordinator when the qBittorrent process started and
 // how long its session load lasts: a torrent started within that window was
-// restored. A zero processStart means no session load is known.
+// restored. A zero processStart means no session load is known. Call before Run.
 func (c *Coordinator) SetSessionLoad(processStart time.Time, window time.Duration) {
+	if processStart.IsZero() {
+		c.sessionLoadEnd = time.Time{}
+		return
+	}
+	c.sessionLoadEnd = processStart.Add(window)
+}
+
+func (c *Coordinator) duringSessionLoad(startedAt time.Time) bool {
+	return !c.sessionLoadEnd.IsZero() && startedAt.Before(c.sessionLoadEnd)
 }
 
 // QueryState returns a snapshot of the coordinator's internal state.
@@ -383,6 +394,10 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 		torrentPtr: ptr,
 		startKtime: e.Timestamp,
 		startedAt:  c.ktimeToWall(e.Timestamp),
+	}
+	if c.duringSessionLoad(p.startedAt) {
+		c.logger.Debug("torrent restored during session load", "hash", hash, "torrent_ptr", fmt.Sprintf("0x%x", ptr))
+		return
 	}
 	c.mapTorrentPtr(ptr, hash)
 	if c.enrichAPI == nil {
