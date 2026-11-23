@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -93,5 +95,16 @@ func TestGetConfigNoFile(t *testing.T) {
 	}
 	if gotDashboard != "" {
 		t.Errorf("dashboard_url = %q, want empty", gotDashboard)
+	}
+}
+
+func TestRequestedStopExitsCleanlyAndQBittorrentDyingExitsWithAnError(t *testing.T) {
+	pending(t)
+	if err := stopResult(stopRequested{sig: syscall.SIGTERM}); err != nil {
+		t.Errorf("requested stop: run returns %v, want nil", err)
+	}
+	died := fmt.Errorf("target qBittorrent process (PID %d) exited", 1338)
+	if err := stopResult(died); err == nil {
+		t.Error("qBittorrent dying: run returns nil, want an error")
 	}
 }

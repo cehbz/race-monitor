@@ -85,6 +85,13 @@ type TorrentMeta struct {
 	AddedAt    time.Time
 }
 
+// msgEventsDropped is logged when a race's event channel is full.
+const msgEventsDropped = "race event channel full, dropping"
+
+// raceErrorEventsDropped is the race error recording how many events a race
+// dropped; its message starts with the count.
+const raceErrorEventsDropped = "events_dropped"
+
 // msgClassifyFailed is logged when the API can't say whether a torrent is new.
 const msgClassifyFailed = "cannot classify race, keeping it"
 
@@ -189,6 +196,9 @@ type Coordinator struct {
 	// ktimeToWall converts a BPF event timestamp to wall-clock time.
 	ktimeToWall func(uint64) time.Time
 	metaRetry   retryPolicy
+
+	// raceEventCap is the capacity of each race's event channel.
+	raceEventCap int
 }
 
 // NewCoordinator creates a race coordinator with pre-calibrated offsets.
@@ -220,7 +230,14 @@ func NewCoordinator(
 		verdictChan:         make(chan raceVerdict),
 		ktimeToWall:         ktimeToWallClock,
 		metaRetry:           defaultMetaRetry,
+		raceEventCap:        10000,
 	}
+}
+
+// SetSessionLoad tells the coordinator when the qBittorrent process started and
+// how long its session load lasts: a torrent started within that window was
+// restored. A zero processStart means no session load is known.
+func (c *Coordinator) SetSessionLoad(processStart time.Time, window time.Duration) {
 }
 
 // QueryState returns a snapshot of the coordinator's internal state.
@@ -481,7 +498,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	metaChan := make(chan int, 1)
 	raceCtx, cancel := context.WithCancel(ctx)
 	state := &raceState{
-		eventChan:          make(chan bpf.ProbeEvent, 10000),
+		eventChan:          make(chan bpf.ProbeEvent, c.raceEventCap),
 		hash:               infoHash,
 		raceID:             raceID,
 		downloadCompleteCh: downloadCompleteCh,
@@ -795,7 +812,7 @@ func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
 	select {
 	case state.eventChan <- event:
 	default:
-		c.logger.Warn("race event channel full, dropping", "hash", state.hash)
+		c.logger.Warn(msgEventsDropped, "hash", state.hash)
 	}
 }
 

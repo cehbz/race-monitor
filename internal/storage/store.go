@@ -232,6 +232,20 @@ func (s *Store) Close() error {
 // enqueueEnrichment adds an IP to the enrichment queue and touches the sentinel
 // file to wake the enricher. Fire-and-forget: errors are silently ignored since
 // enrichment is best-effort and must not block the hot path.
+// StartError is an unidentified torrent start: one whose info hash read as all
+// zeros. It is recorded instead of a race.
+type StartError struct {
+	TorrentPtr uint64
+	DetectedAt time.Time
+	Dump       []byte
+	EventCount int
+}
+
+// ListStartErrors returns the recorded unidentified starts, oldest first.
+func (s *Store) ListStartErrors(ctx context.Context) ([]StartError, error) {
+	return nil, nil
+}
+
 // InsertRaceError records a daemon-detected anomaly for a race.
 // Best-effort: errors are logged but do not propagate to the caller.
 func (s *Store) InsertRaceError(ctx context.Context, raceID int64, errorType, message string) {

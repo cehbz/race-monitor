@@ -317,3 +317,14 @@ Config: ~/.config/race-monitor/config.toml
 	coordinator := race.NewCoordinator(store, logger, dashboardURL, offsets, enrichAPI, handle)
 	return coordinator.Run(ctx, handle.Events)
 }
+
+// stopRequested is the shutdown cause when a signal asks race-monitor to stop.
+type stopRequested struct{ sig os.Signal }
+
+func (s stopRequested) Error() string { return fmt.Sprintf("received signal: %v", s.sig) }
+
+// stopResult turns the coordinator's shutdown cause into run's result: nil for
+// a requested stop, the cause for anything else.
+func stopResult(cause error) error {
+	return cause
+}
