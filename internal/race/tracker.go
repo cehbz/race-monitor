@@ -82,7 +82,7 @@ func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, dow
 		have                = make(map[int]bool)
 		downloadCompleted   bool
 		downloadCompleteSel = downloadCompleteCh // local copy we nil after receiving
-		maxTimer            = time.NewTimer(maxDuration)
+		maxTimer            = time.NewTimer(max(0, maxDuration-time.Since(t.startedAt)))
 		eventBatch          = make([]storage.Event, 0, batchSize)
 
 		// contaminationCount tracks out-of-range piece_index events per source
@@ -93,7 +93,7 @@ func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, dow
 		totalEvents   uint64
 		weHaveCount   uint64
 		peerHaveCount uint64
-		startTime     = time.Now()
+		startTime     = t.startedAt
 		lastLogTime   = time.Now()
 		logInterval   = 30 * time.Second
 

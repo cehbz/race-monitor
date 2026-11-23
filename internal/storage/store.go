@@ -363,11 +363,11 @@ func (s *Store) CreateRace(ctx context.Context, torrentID int64, startKtime int6
 	if startKtime > 0 {
 		result, err = s.db.ExecContext(ctx,
 			`INSERT INTO races (torrent_id, started_at, start_ktime) VALUES (?, ?, ?)`,
-			torrentID, formatTS(time.Now()), startKtime)
+			torrentID, formatTS(startedAt), startKtime)
 	} else {
 		result, err = s.db.ExecContext(ctx,
 			`INSERT INTO races (torrent_id, started_at) VALUES (?, ?)`,
-			torrentID, formatTS(time.Now()))
+			torrentID, formatTS(startedAt))
 	}
 	if err != nil {
 		return 0, fmt.Errorf("inserting race: %w", err)

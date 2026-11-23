@@ -355,7 +355,6 @@ func TestUnidentifiedStartIsRecordedAsAStartErrorAndNeverBecomesARace(t *testing
 }
 
 func TestRaceIsTimedFromItsTorrentsStart(t *testing.T) {
-	pending(t)
 	// The torrent started 31 minutes ago, past the 30-minute cap.
 	started := func() time.Time { return time.Now().Add(-31 * time.Minute) }
 	api := &fakeEnrichAPI{answer: func(string, int) (TorrentMeta, error) {

@@ -552,7 +552,8 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		return
 	}
 
-	raceID, err := c.store.CreateRace(ctx, torrentID, int64(startKtime), time.Now())
+	startedAt := c.ktimeToWall(startKtime)
+	raceID, err := c.store.CreateRace(ctx, torrentID, int64(startKtime), startedAt)
 	if err != nil {
 		c.logger.Error("failed to create race record", "hash", infoHash, "error", err)
 		return
@@ -577,7 +578,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		logger:    c.logger,
 		hash:      infoHash,
 		raceID:    raceID,
-		startedAt: time.Now(),
+		startedAt: startedAt,
 		metaChan:  metaChan,
 		dropped:   &state.droppedEvents,
 	}
@@ -591,7 +592,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	c.pendingMeta = append(c.pendingMeta, metaRequest{
 		hash:      infoHash,
 		raceID:    raceID,
-		startedAt: c.ktimeToWall(startKtime),
+		startedAt: startedAt,
 		deadline:  time.Now().Add(c.metaRetry.budget),
 		metaChan:  metaChan,
 	})

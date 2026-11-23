@@ -294,7 +294,6 @@ func TestInsertPacketEvents(t *testing.T) {
 }
 
 func TestRaceStartsWhenItsTorrentStarted(t *testing.T) {
-	pending(t)
 	store, cleanup := newTestStore(t)
 	defer cleanup()
 	ctx := context.Background()
