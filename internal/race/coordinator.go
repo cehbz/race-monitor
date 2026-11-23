@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/cehbz/race-monitor/internal/bpf"
@@ -32,8 +33,9 @@ type raceState struct {
 	raceID             int64
 	downloadCompleteCh chan struct{} // closed by coordinator when torrent::finished() fires
 	cancel             context.CancelFunc
-	classified         bool // the restored-or-new verdict has arrived
-	dropped            bool // restored: eventChan is closed, rows go once the tracker exits
+	classified         bool         // the restored-or-new verdict has arrived
+	dropped            bool         // restored: eventChan is closed, rows go once the tracker exits
+	droppedEvents      atomic.Int64 // events dropped because the race fell behind
 }
 
 // metaRequest asks the resolver goroutine to classify a race and fetch its
@@ -570,10 +572,19 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 	}
 	c.infoHashToRaceState[infoHash] = state
 
-	go func(hash string, raceID int64, metaCh <-chan int, eventChan <-chan bpf.ProbeEvent, completeCh <-chan struct{}) {
-		err := processEvents(raceCtx, c.store, c.logger, hash, raceID, metaCh, eventChan, completeCh)
-		c.completeChan <- raceComplete{hash: hash, err: err}
-	}(infoHash, raceID, metaChan, state.eventChan, downloadCompleteCh)
+	t := &raceTracker{
+		store:     c.store,
+		logger:    c.logger,
+		hash:      infoHash,
+		raceID:    raceID,
+		startedAt: time.Now(),
+		metaChan:  metaChan,
+		dropped:   &state.droppedEvents,
+	}
+	go func() {
+		err := t.run(raceCtx, state.eventChan, downloadCompleteCh)
+		c.completeChan <- raceComplete{hash: infoHash, err: err}
+	}()
 
 	// Queue async classification and metadata resolution. Run feeds the queue
 	// to the resolver as it frees up.
@@ -876,7 +887,8 @@ func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete)
 	}
 }
 
-// routeEvent sends an event to an active race's channel.
+// routeEvent sends an event to an active race's channel. A full channel drops
+// the event and counts it; the first drop is logged.
 func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
 	if state.dropped {
 		return
@@ -884,11 +896,13 @@ func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
 	select {
 	case state.eventChan <- event:
 	default:
-		c.logger.Warn(msgEventsDropped, "hash", state.hash)
+		if state.droppedEvents.Add(1) == 1 {
+			c.logger.Warn(msgEventsDropped, "hash", state.hash, "race_id", state.raceID)
+		}
 	}
 }
 
-// waitForTrackerCompletions closes all race channels, waits for processEvents to
+// waitForTrackerCompletions closes all race channels, waits for the trackers to
 // flush and exit (up to 500ms per race), then returns.
 func (c *Coordinator) waitForTrackerCompletions(ctx context.Context) error {
 	n := len(c.infoHashToRaceState)

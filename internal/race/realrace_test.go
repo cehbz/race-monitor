@@ -378,7 +378,6 @@ func TestRaceIsTimedFromItsTorrentsStart(t *testing.T) {
 }
 
 func TestRaceThatDropsEventsRecordsOneRaceErrorWithTheirCount(t *testing.T) {
-	pending(t)
 	const sent = 5000
 	warns := &countingHandler{msg: msgEventsDropped}
 	c, store := newClassifyCoordinator(t, slog.New(warns), "", nil, nil)

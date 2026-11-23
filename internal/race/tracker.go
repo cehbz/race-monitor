@@ -45,34 +45,11 @@ type raceTracker struct {
 	startedAt  time.Time        // when the race's torrent started
 	pieceCount int              // 0 when unknown: contamination detection is off
 	backlog    []bpf.ProbeEvent // events held while the start was pending
+	metaChan   <-chan int       // piece count delivered after the race started; nil when none
 	dropped    *atomic.Int64    // events the coordinator dropped because the race fell behind
 }
 
-// run records the race until it is finalized, its events close or ctx ends.
-func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, downloadCompleteCh <-chan struct{}) error {
-	metaChan := make(chan int, 1)
-	if t.pieceCount > 0 {
-		metaChan <- t.pieceCount
-	}
-	close(metaChan)
-	return processEvents(ctx, t.store, t.logger, t.hash, t.raceID, metaChan, events, downloadCompleteCh)
-}
-
-// knownPieceCount takes a piece count already waiting on metaChan, so that it
-// applies to every event, and returns nil for a channel it has drained.
-func knownPieceCount(metaChan <-chan int) (int, <-chan int) {
-	select {
-	case pc, ok := <-metaChan:
-		if !ok {
-			return 0, nil
-		}
-		return pc, metaChan
-	default:
-		return 0, metaChan
-	}
-}
-
-// processEvents is the main event processing loop for a single race.
+// run is the main event processing loop for a single race.
 // It receives typed eBPF probe events, converts them to storage events, and
 // persists them in batches.
 //
@@ -80,16 +57,7 @@ func knownPieceCount(metaChan <-chan int) (int, <-chan int) {
 // completes (torrent::finished() event). After that, the tracker runs a
 // proportional grace period — 50% of the download duration, clamped to
 // [5s, 60s] — then finalizes unconditionally. The grace timer never resets.
-func processEvents(
-	ctx context.Context,
-	store *storage.Store,
-	logger *slog.Logger,
-	hash string,
-	raceID int64,
-	metaChan <-chan int,
-	events <-chan bpf.ProbeEvent,
-	downloadCompleteCh <-chan struct{},
-) error {
+func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, downloadCompleteCh <-chan struct{}) error {
 	const (
 		batchSize   = 100
 		maxDuration = 30 * time.Minute
@@ -106,9 +74,10 @@ func processEvents(
 		// selfConnID is the connection record for our own piece completions
 		selfConnID int64
 
-		// pieceCount is delivered asynchronously via metaChan. Zero until
-		// metadata resolves; contamination detection is inactive until then.
-		pieceCount int
+		// pieceCount starts at t.pieceCount; metaChan may set it later.
+		// Zero means unknown: contamination detection is inactive.
+		pieceCount = t.pieceCount
+		metaChan   = t.metaChan
 
 		have                = make(map[int]bool)
 		downloadCompleted   bool
@@ -135,11 +104,10 @@ func processEvents(
 	)
 
 	defer maxTimer.Stop()
-	pieceCount, metaChan = knownPieceCount(metaChan)
 
 	// Create a "self" connection record for our piece completions
 	var err error
-	selfConnID, err = store.InsertConnection(ctx, raceID, "self", time.Now())
+	selfConnID, err = t.store.InsertConnection(ctx, t.raceID, "self", time.Now())
 	if err != nil {
 		return fmt.Errorf("inserting self connection: %w", err)
 	}
@@ -148,7 +116,7 @@ func processEvents(
 		if len(eventBatch) == 0 {
 			return nil
 		}
-		if err := store.InsertPacketEvents(ctx, eventBatch); err != nil {
+		if err := t.store.InsertPacketEvents(ctx, eventBatch); err != nil {
 			return fmt.Errorf("inserting events: %w", err)
 		}
 		eventBatch = eventBatch[:0]
@@ -164,17 +132,17 @@ func processEvents(
 			metaChan = nil // one-shot: a closed channel is always ready, so stop selecting it
 			if ok {
 				pieceCount = pc
-				logger.Info("metadata resolved", "hash", hash, "piece_count", pieceCount)
+				t.logger.Info("metadata resolved", "hash", t.hash, "piece_count", pieceCount)
 			} else {
-				logger.Debug(msgMetadataUnavailable, "hash", hash)
+				t.logger.Debug(msgMetadataUnavailable, "hash", t.hash)
 			}
 
 		case <-maxTimer.C:
-			logger.Info("max duration reached", "hash", hash)
+			t.logger.Info("max duration reached", "hash", t.hash)
 			if err := flushEvents(); err != nil {
-				logger.Warn("failed to flush final events", "error", err)
+				t.logger.Warn("failed to flush final events", "error", err)
 			}
-			return finalize(ctx, store, logger, raceID)
+			return t.finalize(ctx)
 
 		case <-downloadCompleteSel:
 			// Download is complete. Start a proportional grace period.
@@ -184,12 +152,12 @@ func processEvents(
 
 			// No peers to monitor — finalize immediately
 			if len(connMap) == 0 {
-				logger.Info("download completed, no peers tracked",
-					"hash", hash, "elapsed", elapsed)
+				t.logger.Info("download completed, no peers tracked",
+					"hash", t.hash, "elapsed", elapsed)
 				if err := flushEvents(); err != nil {
-					logger.Warn("failed to flush final events", "error", err)
+					t.logger.Warn("failed to flush final events", "error", err)
 				}
-				return finalize(ctx, store, logger, raceID)
+				return t.finalize(ctx)
 			}
 
 			// Grace = 50% of download duration, clamped to [5s, 60s]
@@ -197,34 +165,34 @@ func processEvents(
 			graceTimer = time.NewTimer(grace)
 			graceTimerCh = graceTimer.C
 			defer graceTimer.Stop()
-			logger.Info("download completed, grace period started",
-				"hash", hash, "elapsed", elapsed,
+			t.logger.Info("download completed, grace period started",
+				"hash", t.hash, "elapsed", elapsed,
 				"grace", grace, "connections", len(connMap))
 
 		case <-graceTimerCh:
-			logger.Info("grace period expired",
-				"hash", hash, "connections", len(connMap))
+			t.logger.Info("grace period expired",
+				"hash", t.hash, "connections", len(connMap))
 			if err := flushEvents(); err != nil {
-				logger.Warn("failed to flush final events", "error", err)
+				t.logger.Warn("failed to flush final events", "error", err)
 			}
-			return finalize(ctx, store, logger, raceID)
+			return t.finalize(ctx)
 
 		case ev, ok := <-events:
 			if !ok {
-				logger.Debug("event channel closed",
+				t.logger.Debug("event channel closed",
 					"total_events", totalEvents,
 					"we_have", weHaveCount,
 					"peer_have", peerHaveCount)
 				if err := flushEvents(); err != nil {
-					logger.Warn("failed to flush final events", "error", err)
+					t.logger.Warn("failed to flush final events", "error", err)
 				}
-				return finalize(ctx, store, logger, raceID)
+				return t.finalize(ctx)
 			}
 
 			totalEvents++
 
 			var dbEvent storage.Event
-			dbEvent.RaceID = raceID
+			dbEvent.RaceID = t.raceID
 
 			switch e := ev.(type) {
 			case *bpf.WeHaveEvent:
@@ -232,12 +200,12 @@ func processEvents(
 					contaminationCount[e.TorrentPtr]++
 					n := contaminationCount[e.TorrentPtr]
 					if n == contaminationThreshold {
-						logger.Error("CONTAMINATION: sustained we_have piece_index out of range",
-							"hash", hash, "race_id", raceID,
+						t.logger.Error("CONTAMINATION: sustained we_have piece_index out of range",
+							"hash", t.hash, "race_id", t.raceID,
 							"piece_index", e.PieceIndex, "piece_count", pieceCount,
 							"torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr),
 							"count", n)
-						store.InsertRaceError(ctx, raceID, "piece_index_out_of_range",
+						t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
 							fmt.Sprintf("we_have piece_index %d >= piece_count %d from torrent_ptr 0x%x (%d events)",
 								e.PieceIndex, pieceCount, e.TorrentPtr, n))
 					}
@@ -255,12 +223,12 @@ func processEvents(
 					contaminationCount[e.ConnPtr]++
 					n := contaminationCount[e.ConnPtr]
 					if n == contaminationThreshold {
-						logger.Error("CONTAMINATION: sustained incoming_have piece_index out of range",
-							"hash", hash, "race_id", raceID,
+						t.logger.Error("CONTAMINATION: sustained incoming_have piece_index out of range",
+							"hash", t.hash, "race_id", t.raceID,
 							"piece_index", e.PieceIndex, "piece_count", pieceCount,
 							"conn_ptr", fmt.Sprintf("0x%x", e.ConnPtr),
 							"count", n)
-						store.InsertRaceError(ctx, raceID, "piece_index_out_of_range",
+						t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
 							fmt.Sprintf("incoming_have piece_index %d >= piece_count %d from conn_ptr 0x%x (%d events)",
 								e.PieceIndex, pieceCount, e.ConnPtr, n))
 					}
@@ -270,9 +238,9 @@ func processEvents(
 				connDBID, exists := connMap[e.ConnPtr]
 				if !exists {
 					connPtr := fmt.Sprintf("%x", e.ConnPtr)
-					connDBID, err = store.InsertConnection(ctx, raceID, connPtr, time.Now())
+					connDBID, err = t.store.InsertConnection(ctx, t.raceID, connPtr, time.Now())
 					if err != nil {
-						logger.Warn("failed to insert connection", "error", err, "ptr", e.ConnPtr)
+						t.logger.Warn("failed to insert connection", "error", err, "ptr", e.ConnPtr)
 						continue
 					}
 					connMap[e.ConnPtr] = connDBID
@@ -287,8 +255,8 @@ func processEvents(
 			}
 
 			if time.Since(lastLogTime) >= logInterval {
-				logger.Debug("race stats",
-					"hash", hash,
+				t.logger.Debug("race stats",
+					"hash", t.hash,
 					"elapsed", time.Since(startTime).Round(time.Second),
 					"total_events", totalEvents,
 					"we_have", weHaveCount,
@@ -303,11 +271,22 @@ func processEvents(
 
 			if len(eventBatch) >= batchSize {
 				if err := flushEvents(); err != nil {
-					logger.Warn("failed to flush event batch", "error", err)
+					t.logger.Warn("failed to flush event batch", "error", err)
 				}
 			}
 		}
 	}
+}
+
+// finalize records the race's dropped events, if any, then completes it.
+func (t *raceTracker) finalize(ctx context.Context) error {
+	if t.dropped != nil {
+		if n := t.dropped.Load(); n > 0 {
+			t.store.InsertRaceError(ctx, t.raceID, raceErrorEventsDropped,
+				fmt.Sprintf("%d events dropped: the race's event channel was full", n))
+		}
+	}
+	return finalize(ctx, t.store, t.logger, t.raceID)
 }
 
 func finalize(ctx context.Context, store *storage.Store, logger *slog.Logger, raceID int64) error {
