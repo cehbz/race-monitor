@@ -35,7 +35,7 @@ dashboard_url = "http://127.0.0.1:8081"   # optional: race-monitor notifies the 
 session_load_window = "10s"                # optional: starts this soon after qBittorrent's process start are restores
 ```
 
-Without `webui_url`, every started torrent is kept as a race (see [how it works](how-it-works.md#race-lifecycle)).
+Without `webui_url`, every start outside qBittorrent's session load is kept as a race (see [how it works](how-it-works.md#race-lifecycle)).
 
 `~/.config/race-monitor/viz.toml` (dashboard):
 

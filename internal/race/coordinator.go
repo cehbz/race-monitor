@@ -293,14 +293,18 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 	defer stopClassify()
 	c.classifyCtx = classifyCtx
 
+	// A stop cancels ctx, and a store call it interrupts mid-write makes
+	// database/sql drop the connection with its pragmas, so every store write
+	// goes through dbCtx. ctx carries the stop cause and bounds the waits.
+	dbCtx := context.WithoutCancel(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
 			cause := context.Cause(ctx)
 			c.logger.Info("coordinator shutting down", "cause", cause)
 			c.discardPending()
-			// ctx is done, so the start error counts are written on a context that isn't.
-			c.writeStartErrorCounts(context.WithoutCancel(ctx))
+			c.writeStartErrorCounts(dbCtx)
 			c.waitForTrackerCompletions()
 			return cause
 
@@ -308,7 +312,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			c.handleComplete(complete)
 
 		case v := <-c.verdictChan:
-			c.handleVerdict(ctx, v)
+			c.handleVerdict(dbCtx, v)
 
 		case q := <-c.stateQueryChan:
 			q.reply <- c.snapshotState()
@@ -317,23 +321,23 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			if !ok {
 				c.logger.Info("event channel closed")
 				c.discardPending()
-				c.writeStartErrorCounts(ctx)
+				c.writeStartErrorCounts(dbCtx)
 				c.waitForTrackerCompletions()
 				return nil
 			}
 			switch e := ev.(type) {
 			case *bpf.WeHaveEvent:
-				c.handleWeHave(ctx, e)
+				c.handleWeHave(dbCtx, e)
 			case *bpf.IncomingHaveEvent:
 				c.handleIncomingHave(e)
 			case *bpf.TorrentFinishedEvent:
-				c.handleTorrentFinished(ctx, e)
+				c.handleTorrentFinished(dbCtx, e)
 			case *bpf.TorrentStartedEvent:
-				c.handleTorrentStarted(ctx, e)
+				c.handleTorrentStarted(dbCtx, e)
 			case *bpf.TorrentDetailsEvent:
 				c.handleTorrentDetails(e)
 			case *bpf.PeerDetailsEvent:
-				c.handlePeerDetails(ctx, e)
+				c.handlePeerDetails(dbCtx, e)
 			}
 		}
 	}
@@ -647,9 +651,10 @@ func (c *Coordinator) startRace(ctx context.Context, p *pendingStart, meta Torre
 		"torrent_ptr", fmt.Sprintf("0x%x", p.torrentPtr), "held_events", len(p.events))
 	c.notifyDashboard(raceID)
 
-	// The tracker outlives Run's context: a stop closes its channel and waits
-	// for it to write what it holds; cancel is for the race's own end.
-	raceCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	// The tracker outlives a stop: it closes its channel and waits for it to
+	// write what it holds; cancel is for the race's own end. ctx is the
+	// caller's store context, which a stop never cancels.
+	raceCtx, cancel := context.WithCancel(ctx)
 	state := &raceState{
 		eventChan:          make(chan bpf.ProbeEvent, c.raceEventCap),
 		hash:               p.hash,
