@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -291,8 +292,8 @@ Config: ~/.config/race-monitor/config.toml
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
-		logger.Info("received shutdown signal")
-		cancel(fmt.Errorf("received signal: %v", sig))
+		logger.Info("received shutdown signal", "signal", sig)
+		cancel(stopRequested{sig: sig})
 	}()
 
 	// Watch for target process death — cancels context with pid error as cause
@@ -319,16 +320,19 @@ Config: ~/.config/race-monitor/config.toml
 	}
 
 	coordinator := race.NewCoordinator(store, logger, cfg.DashboardURL, offsets, enrichAPI, handle)
-	return coordinator.Run(ctx, handle.Events)
+	return stopResult(coordinator.Run(ctx, handle.Events))
+}
+
+// stopResult turns the coordinator's shutdown cause into run's result: nil for
+// a requested stop, the cause for anything else.
+func stopResult(cause error) error {
+	if errors.As(cause, new(stopRequested)) {
+		return nil
+	}
+	return cause
 }
 
 // stopRequested is the shutdown cause when a signal asks race-monitor to stop.
 type stopRequested struct{ sig os.Signal }
 
 func (s stopRequested) Error() string { return fmt.Sprintf("received signal: %v", s.sig) }
-
-// stopResult turns the coordinator's shutdown cause into run's result: nil for
-// a requested stop, the cause for anything else.
-func stopResult(cause error) error {
-	return cause
-}

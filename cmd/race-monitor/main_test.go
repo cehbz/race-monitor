@@ -102,7 +102,6 @@ func TestReadConfigNoFile(t *testing.T) {
 }
 
 func TestRequestedStopExitsCleanlyAndQBittorrentDyingExitsWithAnError(t *testing.T) {
-	pending(t)
 	if err := stopResult(stopRequested{sig: syscall.SIGTERM}); err != nil {
 		t.Errorf("requested stop: run returns %v, want nil", err)
 	}

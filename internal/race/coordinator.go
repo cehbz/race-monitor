@@ -295,7 +295,8 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 		case <-ctx.Done():
 			cause := context.Cause(ctx)
 			c.logger.Info("coordinator shutting down", "cause", cause)
-			if err := c.waitForTrackerCompletions(ctx); err != nil {
+			// ctx is done, so the trackers are waited for on a context that isn't.
+			if err := c.waitForTrackerCompletions(context.WithoutCancel(ctx)); err != nil {
 				return err
 			}
 			return cause
