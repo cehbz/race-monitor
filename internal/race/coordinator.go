@@ -33,27 +33,25 @@ type raceState struct {
 	raceID             int64
 	downloadCompleteCh chan struct{} // closed by coordinator when torrent::finished() fires
 	cancel             context.CancelFunc
-	classified         bool         // the restored-or-new verdict has arrived
-	dropped            bool         // restored: eventChan is closed, rows go once the tracker exits
 	droppedEvents      atomic.Int64 // events dropped because the race fell behind
 }
 
-// metaRequest asks the resolver goroutine to classify a race and fetch its
-// torrent metadata asynchronously, delivering pieceCount to the tracker.
-type metaRequest struct {
-	hash      string
-	raceID    int64
-	startedAt time.Time  // wall clock of the torrent::start() event
-	deadline  time.Time  // API retries stop here; set when the request is queued
-	metaChan  chan<- int // one-shot: delivers pieceCount to tracker, then closed
+// pendingStart is a started torrent awaiting classification. It holds the
+// events routed to it, in order, until its verdict.
+type pendingStart struct {
+	hash       string
+	torrentPtr uint64
+	startKtime uint64
+	startedAt  time.Time        // wall time of its torrent::start()
+	events     []bpf.ProbeEvent // we_have, incoming_have and peer details, in arrival order
+	finished   bool             // torrent::finished() fired while pending
 }
 
-// raceVerdict is the resolver's answer for one race. Run applies it, since only
-// Run changes coordinator state.
+// raceVerdict is a pending start's classification. Run applies it.
 type raceVerdict struct {
 	hash     string
-	raceID   int64
 	restored bool
+	meta     TorrentMeta // what the API answered; zero when it answered nothing
 }
 
 // StateSnapshot provides a point-in-time view of coordinator state.
@@ -70,8 +68,6 @@ type RaceSnap struct {
 	Hash    string
 	ChanLen int
 	RaceID  int64
-	// Classified reports that the restored-or-new verdict has reached Run.
-	Classified bool
 }
 
 type stateQuery struct {
@@ -108,9 +104,8 @@ func isRestored(addedAt, startedAt time.Time) bool {
 	return addedAt.Add(restoredTolerance).Before(startedAt)
 }
 
-// retryPolicy bounds the resolver's API retries. The budget runs from when a
-// request is queued, so an API that stays down costs a burst about one budget
-// in total, and one that comes back serves the whole queue.
+// retryPolicy bounds a start's classification retries. The budget runs from the
+// start, so an API that stays down holds each start's events about one budget.
 type retryPolicy struct {
 	budget  time.Duration
 	initial time.Duration
@@ -146,8 +141,9 @@ type SeenCache interface {
 // Coordinator manages race lifecycle using eBPF events from libtorrent uprobes.
 //
 // Design: All struct byte offsets are pre-calibrated and loaded at startup.
-// Races are created when torrent::start() fires (EVT_TORRENT_STARTED)
-// and completed when torrent::finished() fires (EVT_TORRENT_FINISHED).
+// A torrent::start() (EVT_TORRENT_STARTED) is pending until classified, then
+// becomes a race or is discarded; a race completes after torrent::finished()
+// fires (EVT_TORRENT_FINISHED).
 //
 // we_have events carry obj_ptr = torrent* and are routed via torrentPtrs.
 // incoming_have events carry obj_ptr = peer_connection* and are routed
@@ -185,12 +181,13 @@ type Coordinator struct {
 	// Nil when webui_url is not configured.
 	enrichAPI EnrichmentAPI
 
-	// metaReqChan feeds the metadata resolver goroutine from pendingMeta, the
-	// queue of requests it hasn't taken yet.
-	metaReqChan chan metaRequest
-	pendingMeta []metaRequest
+	// pending maps info_hash → pending start.
+	pending map[string]*pendingStart
 
-	// verdictChan carries the resolver's classifications back to Run.
+	// classifyCtx is set by Run and ends when Run returns.
+	classifyCtx context.Context
+
+	// verdictChan carries the classifiers' verdicts back to Run.
 	verdictChan chan raceVerdict
 
 	// seenCache manages BPF dedup map entries. Nil when not available
@@ -232,7 +229,7 @@ func NewCoordinator(
 		stateQueryChan:      make(chan stateQuery),
 		enrichAPI:           enrichAPI,
 		seenCache:           seenCache,
-		metaReqChan:         make(chan metaRequest),
+		pending:             make(map[string]*pendingStart),
 		verdictChan:         make(chan raceVerdict),
 		ktimeToWall:         ktimeToWallClock,
 		metaRetry:           defaultMetaRetry,
@@ -263,10 +260,9 @@ func (c *Coordinator) snapshotState() StateSnapshot {
 	}
 	for h, s := range c.infoHashToRaceState {
 		snap.ActiveRaces[h] = RaceSnap{
-			Hash:       s.hash,
-			ChanLen:    len(s.eventChan),
-			RaceID:     s.raceID,
-			Classified: s.classified,
+			Hash:    s.hash,
+			ChanLen: len(s.eventChan),
+			RaceID:  s.raceID,
 		}
 	}
 	return snap
@@ -282,25 +278,16 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 		"info_hash_offset", c.offsets.InfoHashOffset,
 		"torrent_ptr_offset", c.offsets.TorrentPtrOffset)
 
-	// Launch async metadata resolver — classifies races and fetches torrent
-	// name/size/pieceCount off the event loop, delivering pieceCount to trackers
-	// via channel and verdicts back here.
-	resolverCtx, stopResolver := context.WithCancel(ctx)
-	defer stopResolver()
-	go c.runMetaResolver(resolverCtx)
+	classifyCtx, stopClassify := context.WithCancel(ctx)
+	defer stopClassify()
+	c.classifyCtx = classifyCtx
 
 	for {
-		// metaOut stays nil, and its case never fires, while the queue is empty.
-		var metaOut chan<- metaRequest
-		var nextMeta metaRequest
-		if len(c.pendingMeta) > 0 {
-			metaOut, nextMeta = c.metaReqChan, c.pendingMeta[0]
-		}
-
 		select {
 		case <-ctx.Done():
 			cause := context.Cause(ctx)
 			c.logger.Info("coordinator shutting down", "cause", cause)
+			c.discardPending()
 			// ctx is done, so the trackers are waited for on a context that isn't.
 			c.writeStartErrorCounts(context.WithoutCancel(ctx))
 			if err := c.waitForTrackerCompletions(context.WithoutCancel(ctx)); err != nil {
@@ -309,10 +296,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			return cause
 
 		case complete := <-c.completeChan:
-			c.handleComplete(ctx, complete)
-
-		case metaOut <- nextMeta:
-			c.pendingMeta = c.pendingMeta[1:]
+			c.handleComplete(complete)
 
 		case v := <-c.verdictChan:
 			c.handleVerdict(ctx, v)
@@ -323,6 +307,7 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 		case ev, ok := <-events:
 			if !ok {
 				c.logger.Info("event channel closed")
+				c.discardPending()
 				c.writeStartErrorCounts(ctx)
 				return c.waitForTrackerCompletions(ctx)
 			}
@@ -344,6 +329,15 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 	}
 }
 
+// discardPending drops the starts still awaiting a verdict, with their events.
+func (c *Coordinator) discardPending() {
+	if len(c.pending) == 0 {
+		return
+	}
+	c.logger.Info("discarding starts still pending classification", "count", len(c.pending))
+	c.pending = make(map[string]*pendingStart)
+}
+
 // msgUnidentifiedStart is logged when a torrent starts with an all-zero info hash.
 const msgUnidentifiedStart = "torrent started with an all-zero info hash: recorded as a start error, not a race"
 
@@ -354,8 +348,8 @@ type unidentifiedStart struct {
 	events int
 }
 
-// handleTorrentStarted extracts the info_hash from a torrent::start() dump
-// and creates a race.
+// handleTorrentStarted extracts the info_hash from a torrent::start() dump and
+// makes the start pending, or a race at once when there is no API to classify it.
 func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentStartedEvent) {
 	ptr := e.TorrentPtr
 
@@ -378,8 +372,26 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 		return
 	}
 	hash := hex.EncodeToString(hashBytes)
+	if _, exists := c.infoHashToRaceState[hash]; exists {
+		return
+	}
+	if _, exists := c.pending[hash]; exists {
+		return
+	}
+	p := &pendingStart{
+		hash:       hash,
+		torrentPtr: ptr,
+		startKtime: e.Timestamp,
+		startedAt:  c.ktimeToWall(e.Timestamp),
+	}
 	c.mapTorrentPtr(ptr, hash)
-	c.startRace(ctx, hash, ptr, e.Timestamp)
+	if c.enrichAPI == nil {
+		c.startRace(ctx, p, TorrentMeta{})
+		return
+	}
+	c.pending[hash] = p
+	c.logger.Debug("torrent started, classifying", "hash", hash, "torrent_ptr", fmt.Sprintf("0x%x", ptr))
+	go c.classify(c.classifyCtx, hash, p.startedAt)
 }
 
 func isZeroHash(b []byte) bool {
@@ -476,17 +488,26 @@ func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsE
 		c.connEndpoints[e.ConnPtr] = addr
 	}
 
-	// Extract peer_id and decode client
+	if p, ok := c.pending[hash]; ok {
+		p.events = append(p.events, e)
+		return
+	}
+	state, active := c.infoHashToRaceState[hash]
+	if !active {
+		return
+	}
+	c.recordPeer(ctx, state, e)
+}
+
+// recordPeer stores a peer_connection dump's endpoint and peer ID on its race's
+// connection row.
+func (c *Coordinator) recordPeer(ctx context.Context, state *raceState, e *bpf.PeerDetailsEvent) {
+	hash := state.hash
+	addr, hasAddr := ExtractEndpoint(e.Data, c.offsets.SockaddrOffset)
 	peerID, hasPeerID := ExtractPeerID(e.Data, c.offsets.PeerIDOffset)
 	client := ""
 	if hasPeerID {
 		client = DecodePeerClient(peerID)
-	}
-
-	// Update DB with connection endpoint and peer info
-	state, active := c.infoHashToRaceState[hash]
-	if !active || state.dropped {
-		return
 	}
 
 	connPtr := fmt.Sprintf("%x", e.ConnPtr)
@@ -514,6 +535,7 @@ func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsE
 			"client", client,
 			"race_connections", raceConnCount)
 	} else {
+		torrentPtr, _ := ExtractTorrentPtr(e.Data, c.offsets.TorrentPtrOffset)
 		c.logger.Log(ctx, levelTrace, "mapped peer_conn → race",
 			"peer_conn", fmt.Sprintf("0x%x", e.ConnPtr),
 			"torrent", fmt.Sprintf("0x%x", torrentPtr),
@@ -523,132 +545,34 @@ func (c *Coordinator) handlePeerDetails(ctx context.Context, e *bpf.PeerDetailsE
 	}
 }
 
-// startRace creates a new race for the given info_hash and torrent_ptr.
-// startKtime is the BPF ktime from the torrent::start() event (0 if unavailable).
-// Idempotent: does nothing if a race already exists for this hash.
-//
-// The race is provisional until classified: the metadata resolver goroutine
-// fetches metadata (name, size, pieceCount, addition date) asynchronously to keep
-// the event loop fast, and handleVerdict drops the race if the torrent turns out
-// to be restored rather than added while being watched. With no enrichment API,
-// or an API that doesn't answer within its retry budget, the race is kept.
-func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr uint64, startKtime uint64) {
-	if _, exists := c.infoHashToRaceState[infoHash]; exists {
+// classify asks the API whether a pending start's torrent was added at its
+// start and sends the verdict to Run. Each pending start runs its own, so one
+// the API can't answer delays no other.
+func (c *Coordinator) classify(ctx context.Context, hash string, startedAt time.Time) {
+	meta, err := c.fetchMeta(ctx, hash, time.Now().Add(c.metaRetry.budget))
+	if ctx.Err() != nil {
 		return
 	}
-
-	c.logger.Info("race started", "hash", infoHash, "torrent_ptr", fmt.Sprintf("0x%x", torrentPtr))
-
-	// Ensure torrent_ptr mapping exists
-	if _, ok := c.torrentPtrs[torrentPtr]; !ok {
-		c.mapTorrentPtr(torrentPtr, infoHash)
-	}
-
-	// Create DB records immediately with placeholder metadata.
-	// The async resolver will UPSERT real values once available.
-	torrentID, err := c.store.CreateTorrent(ctx, infoHash, infoHash, 0, 0)
+	v := raceVerdict{hash: hash, meta: meta}
 	if err != nil {
-		c.logger.Error("failed to create torrent record", "hash", infoHash, "error", err)
-		return
+		c.logger.Warn(msgClassifyFailed, "hash", hash, "error", err)
+	} else {
+		v.restored = isRestored(meta.AddedAt, startedAt)
 	}
-
-	startedAt := c.ktimeToWall(startKtime)
-	raceID, err := c.store.CreateRace(ctx, torrentID, int64(startKtime), startedAt)
-	if err != nil {
-		c.logger.Error("failed to create race record", "hash", infoHash, "error", err)
-		return
+	select {
+	case c.verdictChan <- v:
+	case <-ctx.Done():
 	}
-
-	c.notifyDashboard(raceID)
-
-	downloadCompleteCh := make(chan struct{})
-	metaChan := make(chan int, 1)
-	raceCtx, cancel := context.WithCancel(ctx)
-	state := &raceState{
-		eventChan:          make(chan bpf.ProbeEvent, c.raceEventCap),
-		hash:               infoHash,
-		raceID:             raceID,
-		downloadCompleteCh: downloadCompleteCh,
-		cancel:             cancel,
-	}
-	c.infoHashToRaceState[infoHash] = state
-
-	t := &raceTracker{
-		store:     c.store,
-		logger:    c.logger,
-		hash:      infoHash,
-		raceID:    raceID,
-		startedAt: startedAt,
-		metaChan:  metaChan,
-		dropped:   &state.droppedEvents,
-	}
-	go func() {
-		err := t.run(raceCtx, state.eventChan, downloadCompleteCh)
-		c.completeChan <- raceComplete{hash: infoHash, err: err}
-	}()
-
-	// Queue async classification and metadata resolution. Run feeds the queue
-	// to the resolver as it frees up.
-	c.pendingMeta = append(c.pendingMeta, metaRequest{
-		hash:      infoHash,
-		raceID:    raceID,
-		startedAt: startedAt,
-		deadline:  time.Now().Add(c.metaRetry.budget),
-		metaChan:  metaChan,
-	})
-}
-
-// runMetaResolver processes metadata requests off the event loop.
-// Runs as a goroutine; exits when ctx is cancelled.
-func (c *Coordinator) runMetaResolver(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req := <-c.metaReqChan:
-			c.resolveMetadata(ctx, req)
-		}
-	}
-}
-
-// resolveMetadata classifies a race from the API's answer. A restored torrent
-// gets a drop verdict and no metadata update. Otherwise it updates the DB,
-// delivers pieceCount to the tracker and sends a keep verdict.
-func (c *Coordinator) resolveMetadata(ctx context.Context, req metaRequest) {
-	defer close(req.metaChan)
-
-	verdict := raceVerdict{hash: req.hash, raceID: req.raceID}
-	if c.enrichAPI == nil {
-		c.sendVerdict(ctx, verdict)
-		return
-	}
-
-	meta, err := c.fetchMeta(ctx, req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		c.logger.Warn(msgClassifyFailed, "hash", req.hash, "error", err)
-	} else if isRestored(meta.AddedAt, req.startedAt) {
-		verdict.restored = true
-		c.sendVerdict(ctx, verdict)
-		return
-	}
-
-	if meta != (TorrentMeta{}) {
-		c.applyMeta(ctx, req, meta)
-	}
-	c.sendVerdict(ctx, verdict)
 }
 
 // fetchMeta asks the API until it gives an answer that can classify the torrent
-// or req.deadline passes, backing off between attempts. On failure it returns
-// the last answer with the error, since an answer without a date still carries
+// or deadline passes, backing off between attempts. On failure it returns the
+// last answer with the error, since an answer without a date still carries
 // name, size and piece count.
-func (c *Coordinator) fetchMeta(ctx context.Context, req metaRequest) (TorrentMeta, error) {
+func (c *Coordinator) fetchMeta(ctx context.Context, hash string, deadline time.Time) (TorrentMeta, error) {
 	backoff := c.metaRetry.initial
 	for {
-		meta, err := c.enrichAPI.FetchTorrentMeta(req.hash)
+		meta, err := c.enrichAPI.FetchTorrentMeta(hash)
 		if err == nil && meta.AddedAt.Unix() <= 0 {
 			err = errNoAdditionDate
 		}
@@ -656,11 +580,11 @@ func (c *Coordinator) fetchMeta(ctx context.Context, req metaRequest) (TorrentMe
 			return meta, nil
 		}
 
-		wait := min(backoff, time.Until(req.deadline))
+		wait := min(backoff, time.Until(deadline))
 		if wait <= 0 {
 			return meta, err
 		}
-		c.logger.Debug("metadata fetch failed, retrying", "hash", req.hash, "error", err, "wait", wait)
+		c.logger.Debug("metadata fetch failed, retrying", "hash", hash, "error", err, "wait", wait)
 		select {
 		case <-ctx.Done():
 			return meta, ctx.Err()
@@ -670,65 +594,80 @@ func (c *Coordinator) fetchMeta(ctx context.Context, req metaRequest) (TorrentMe
 	}
 }
 
-func (c *Coordinator) sendVerdict(ctx context.Context, v raceVerdict) {
-	select {
-	case c.verdictChan <- v:
-	case <-ctx.Done():
+// handleVerdict applies a pending start's classification: restored, it is
+// discarded with its events; kept, it becomes a race.
+func (c *Coordinator) handleVerdict(ctx context.Context, v raceVerdict) {
+	p, ok := c.pending[v.hash]
+	if !ok {
+		return
 	}
+	delete(c.pending, v.hash)
+	if v.restored {
+		c.logger.Debug("torrent was restored, not a race", "hash", v.hash, "held_events", len(p.events))
+		c.forgetTorrent(v.hash)
+		return
+	}
+	c.startRace(ctx, p, v.meta)
 }
 
-// applyMeta stores fetched metadata and delivers pieceCount to the tracker.
-func (c *Coordinator) applyMeta(ctx context.Context, req metaRequest, meta TorrentMeta) {
-	// UPSERT updates placeholder values in the DB.
+// startRace makes a kept start a race: its rows, the dashboard notice, and its
+// tracker, which records the start's held events before live ones.
+func (c *Coordinator) startRace(ctx context.Context, p *pendingStart, meta TorrentMeta) {
 	name := meta.Name
 	if name == "" {
-		name = req.hash
+		name = p.hash
 	}
-	if _, err := c.store.CreateTorrent(ctx, req.hash, name, meta.Size, meta.PieceCount); err != nil {
-		c.logger.Warn("failed to update torrent metadata", "hash", req.hash, "error", err)
-	}
-
-	// Deliver pieceCount to tracker for contamination detection.
-	if meta.PieceCount > 0 {
-		req.metaChan <- meta.PieceCount
-	}
-}
-
-// handleVerdict applies the resolver's classification of a race. The tracker
-// writes to the race's rows, so they can only go once it has exited: closing
-// eventChan stops it, and handleComplete deletes the rows. A race whose tracker
-// already finished is deleted here. The context stays uncancelled because
-// cancelling it during a tracker transaction makes database/sql discard the
-// store's single connection, and with it the per-connection PRAGMAs.
-func (c *Coordinator) handleVerdict(ctx context.Context, v raceVerdict) {
-	state, active := c.infoHashToRaceState[v.hash]
-	active = active && state.raceID == v.raceID
-
-	if !v.restored {
-		if active {
-			state.classified = true
-		}
+	torrentID, err := c.store.CreateTorrent(ctx, p.hash, name, meta.Size, meta.PieceCount)
+	if err != nil {
+		c.logger.Error("failed to create torrent record", "hash", p.hash, "error", err)
+		c.forgetTorrent(p.hash)
 		return
 	}
-
-	c.logger.Info("dropping race: torrent was restored, not added", "hash", v.hash, "race_id", v.raceID)
-	if !active {
-		c.deleteDroppedRace(ctx, v.raceID)
+	raceID, err := c.store.CreateRace(ctx, torrentID, int64(p.startKtime), p.startedAt)
+	if err != nil {
+		c.logger.Error("failed to create race record", "hash", p.hash, "error", err)
+		c.forgetTorrent(p.hash)
 		return
 	}
-	state.classified = true
-	state.dropped = true
-	close(state.eventChan)
-}
-
-// deleteDroppedRace removes a dropped race's rows and tells the dashboard, which
-// reloads its race list on a notify.
-func (c *Coordinator) deleteDroppedRace(ctx context.Context, raceID int64) {
-	if err := c.store.DeleteRace(ctx, raceID); err != nil {
-		c.logger.Error("failed to delete dropped race", "race_id", raceID, "error", err)
-		return
-	}
+	c.logger.Info("race started", "hash", p.hash, "race_id", raceID,
+		"torrent_ptr", fmt.Sprintf("0x%x", p.torrentPtr), "held_events", len(p.events))
 	c.notifyDashboard(raceID)
+
+	raceCtx, cancel := context.WithCancel(ctx)
+	state := &raceState{
+		eventChan:          make(chan bpf.ProbeEvent, c.raceEventCap),
+		hash:               p.hash,
+		raceID:             raceID,
+		downloadCompleteCh: make(chan struct{}),
+		cancel:             cancel,
+	}
+	c.infoHashToRaceState[p.hash] = state
+
+	var backlog []bpf.ProbeEvent
+	for _, ev := range p.events {
+		if peer, ok := ev.(*bpf.PeerDetailsEvent); ok {
+			c.recordPeer(ctx, state, peer)
+			continue
+		}
+		backlog = append(backlog, ev)
+	}
+	t := &raceTracker{
+		store:      c.store,
+		logger:     c.logger,
+		hash:       p.hash,
+		raceID:     raceID,
+		startedAt:  p.startedAt,
+		pieceCount: meta.PieceCount,
+		backlog:    backlog,
+		dropped:    &state.droppedEvents,
+	}
+	go func() {
+		err := t.run(raceCtx, state.eventChan, state.downloadCompleteCh)
+		c.completeChan <- raceComplete{hash: p.hash, err: err}
+	}()
+	if p.finished {
+		close(state.downloadCompleteCh)
+	}
 }
 
 // notifyDashboard sends a fire-and-forget POST to the dashboard SSE endpoint.
@@ -755,9 +694,7 @@ func (c *Coordinator) handleWeHave(ctx context.Context, e *bpf.WeHaveEvent) {
 		return
 	}
 	if hash, ok := c.torrentPtrs[e.TorrentPtr]; ok {
-		if state, ok := c.infoHashToRaceState[hash]; ok {
-			c.routeEvent(state, e)
-		}
+		c.holdOrRoute(hash, e)
 		return
 	}
 
@@ -768,11 +705,8 @@ func (c *Coordinator) handleWeHave(ctx context.Context, e *bpf.WeHaveEvent) {
 
 // handleIncomingHave routes incoming_have events via exact routing only.
 func (c *Coordinator) handleIncomingHave(e *bpf.IncomingHaveEvent) {
-	if hash, ok := c.connToRace[e.ConnPtr]; ok {
-		if state, ok := c.infoHashToRaceState[hash]; ok {
-			c.routeEvent(state, e)
-			return
-		}
+	if hash, ok := c.connToRace[e.ConnPtr]; ok && c.holdOrRoute(hash, e) {
+		return
 	}
 
 	c.logger.Log(context.Background(), levelTrace, "incoming_have: dropped (unmapped peer_conn)",
@@ -790,6 +724,10 @@ func (c *Coordinator) handleTorrentFinished(ctx context.Context, e *bpf.TorrentF
 	if !ok {
 		c.logger.Debug("torrent_finished for unmapped ptr",
 			"ptr", fmt.Sprintf("0x%x", e.TorrentPtr))
+		return
+	}
+	if p, ok := c.pending[hash]; ok {
+		p.finished = true
 		return
 	}
 
@@ -815,7 +753,7 @@ func (c *Coordinator) mapTorrentPtr(ptr uint64, hash string) {
 }
 
 // handleComplete processes a race tracker completion signal.
-func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete) {
+func (c *Coordinator) handleComplete(complete raceComplete) {
 	if state, exists := c.infoHashToRaceState[complete.hash]; exists {
 		state.cancel()
 		delete(c.infoHashToRaceState, complete.hash)
@@ -823,15 +761,17 @@ func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete)
 			c.logger.Error("race tracking failed", "hash", complete.hash, "error", complete.err)
 		}
 		c.logger.Info("race tracking complete", "hash", complete.hash)
-		if state.dropped {
-			c.deleteDroppedRace(ctx, state.raceID)
-		}
 	}
+	c.forgetTorrent(complete.hash)
+}
 
+// forgetTorrent removes hash's routing and its BPF dedup entries, so its peers
+// and torrent can be rediscovered.
+func (c *Coordinator) forgetTorrent(hash string) {
 	// Collect torrent pointers for this race (needed for BPF cleanup)
 	var raceTorrentPtrs []uint64
 	for ptr, h := range c.torrentPtrs {
-		if h == complete.hash {
+		if h == hash {
 			raceTorrentPtrs = append(raceTorrentPtrs, ptr)
 		}
 	}
@@ -842,7 +782,7 @@ func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete)
 	if c.seenCache != nil && len(raceTorrentPtrs) > 0 {
 		var forgetCount int
 		for ptr, h := range c.connToRace {
-			if h != complete.hash {
+			if h != hash {
 				continue
 			}
 			endpoint, hasEndpoint := c.connEndpoints[ptr]
@@ -867,7 +807,7 @@ func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete)
 
 		if forgetCount > 0 {
 			c.logger.Debug("cleaned up BPF dedup entries",
-				"hash", complete.hash,
+				"hash", hash,
 				"peers_forgotten", forgetCount,
 				"torrents_forgotten", len(raceTorrentPtrs))
 		}
@@ -881,19 +821,30 @@ func (c *Coordinator) handleComplete(ctx context.Context, complete raceComplete)
 
 	// Clean up connToRace and connEndpoints for this race
 	for ptr, h := range c.connToRace {
-		if h == complete.hash {
+		if h == hash {
 			delete(c.connToRace, ptr)
 			delete(c.connEndpoints, ptr)
 		}
 	}
 }
 
+// holdOrRoute holds an event for hash's pending start or routes it to hash's
+// race. It reports whether either exists.
+func (c *Coordinator) holdOrRoute(hash string, ev bpf.ProbeEvent) bool {
+	if p, ok := c.pending[hash]; ok {
+		p.events = append(p.events, ev)
+		return true
+	}
+	if state, ok := c.infoHashToRaceState[hash]; ok {
+		c.routeEvent(state, ev)
+		return true
+	}
+	return false
+}
+
 // routeEvent sends an event to an active race's channel. A full channel drops
 // the event and counts it; the first drop is logged.
 func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
-	if state.dropped {
-		return
-	}
 	select {
 	case state.eventChan <- event:
 	default:
@@ -912,11 +863,6 @@ func (c *Coordinator) waitForTrackerCompletions(ctx context.Context) error {
 		cancels = append(cancels, state.cancel)
 	}
 	for hash, state := range c.infoHashToRaceState {
-		if state.dropped {
-			// Channel already closed. Delete on the way out, whatever the state of ctx.
-			defer c.deleteDroppedRace(context.WithoutCancel(ctx), state.raceID)
-			continue
-		}
 		close(state.eventChan)
 		c.logger.Debug("closed race tracker", "hash", hash)
 	}

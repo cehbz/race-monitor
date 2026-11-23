@@ -222,7 +222,6 @@ func TestKtimeToWallClock(t *testing.T) {
 // TestNewTorrentKept: an addition_date in the same second as the start event
 // keeps the race, with its metadata applied.
 func TestNewTorrentKept(t *testing.T) {
-	pending(t)
 	api := &fakeEnrichAPI{answer: answerAlways(newDate)}
 	c, store := newClassifyCoordinator(t, nil, "", api, nil)
 
@@ -252,7 +251,6 @@ func TestNewTorrentKept(t *testing.T) {
 // TestAPIFailureKeepsRace: an API that never answers is retried within the
 // budget, then the race is kept and the failure logged.
 func TestAPIFailureKeepsRace(t *testing.T) {
-	pending(t)
 	api := &fakeEnrichAPI{answer: func(string, int) (TorrentMeta, error) {
 		return TorrentMeta{}, errors.New("connection refused")
 	}}
@@ -322,7 +320,6 @@ func TestAPIRecoveryDropsRestored(t *testing.T) {
 // can't justify a drop. The client maps -1 to the zero time and an absent field
 // to the Unix epoch. The other metadata still applies.
 func TestMissingAdditionDateKeepsRace(t *testing.T) {
-	pending(t)
 	for name, date := range map[string]time.Time{"zero": {}, "epoch": time.Unix(0, 0)} {
 		t.Run(name, func(t *testing.T) {
 			api := &fakeEnrichAPI{answer: answerAlways(date)}

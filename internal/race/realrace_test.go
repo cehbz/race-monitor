@@ -121,7 +121,6 @@ func TestStartDuringSessionLoadIsRestoredWithoutAskingTheAPI(t *testing.T) {
 }
 
 func TestStartAddedWhileWatchedBecomesARaceHoldingEveryEventSinceItsStart(t *testing.T) {
-	pending(t)
 	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerNew(100)}
 	c, store := newClassifyCoordinator(t, nil, "", api, nil)
 
@@ -163,7 +162,6 @@ func TestStartAddedWhileWatchedBecomesARaceHoldingEveryEventSinceItsStart(t *tes
 }
 
 func TestStartRestoredByAdditionDateLeavesNoRecordsAndNoDashboardNotice(t *testing.T) {
-	pending(t)
 	srv, notifies := dashboardCounter(t)
 	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerAlways(restoredDate)}
 	c, store := newClassifyCoordinator(t, nil, srv.URL, api, nil)
@@ -195,7 +193,6 @@ func TestStartRestoredByAdditionDateLeavesNoRecordsAndNoDashboardNotice(t *testi
 }
 
 func TestTorrentFinishingWhilePendingBecomesARaceThatFinalizes(t *testing.T) {
-	pending(t)
 	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerNew(100)}
 	c, store := newClassifyCoordinator(t, nil, "", api, nil)
 
@@ -226,7 +223,6 @@ func TestTorrentFinishingWhilePendingBecomesARaceThatFinalizes(t *testing.T) {
 }
 
 func TestHeldBurstLargerThanARaceChannelLosesNoEvents(t *testing.T) {
-	pending(t)
 	const burst = 15000 // over the 10,000-event race channel
 	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerNew(20000)}
 	c, store := newClassifyCoordinator(t, nil, "", api, nil)
@@ -261,7 +257,6 @@ func TestHeldBurstLargerThanARaceChannelLosesNoEvents(t *testing.T) {
 }
 
 func TestOneUnclassifiableStartDoesNotDelayAnothersClassification(t *testing.T) {
-	pending(t)
 	stuckBytes, stuck := testInfoHash(306)
 	freshBytes, fresh := testInfoHash(307)
 	api := &fakeEnrichAPI{answer: func(hash string, _ int) (TorrentMeta, error) {
@@ -435,7 +430,6 @@ func TestRaceThatDropsEventsRecordsOneRaceErrorWithTheirCount(t *testing.T) {
 }
 
 func TestStartStillPendingAtShutdownLeavesNoRecords(t *testing.T) {
-	pending(t)
 	api := &fakeEnrichAPI{gate: make(chan struct{}), answer: answerNew(100)}
 	defer close(api.gate)
 	c, store := newClassifyCoordinator(t, nil, "", api, nil)

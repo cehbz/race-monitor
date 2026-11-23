@@ -61,7 +61,7 @@ func TestFetchTorrentMeta_LoginWaitsForAPI(t *testing.T) {
 }
 
 // TestFetchTorrentMeta_HungAPIReturns: a WebUI that accepts and never answers
-// must not stall the resolver.
+// must not stall its caller.
 func TestFetchTorrentMeta_HungAPIReturns(t *testing.T) {
 	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

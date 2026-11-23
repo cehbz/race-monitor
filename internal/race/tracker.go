@@ -11,10 +11,6 @@ import (
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
-// msgMetadataUnavailable is logged when the metadata channel closes without
-// delivering a piece count.
-const msgMetadataUnavailable = "metadata unavailable, contamination detection inactive"
-
 // Grace period constants for post-download event capture.
 const (
 	graceFraction = 0.5
@@ -45,7 +41,6 @@ type raceTracker struct {
 	startedAt  time.Time        // when the race's torrent started
 	pieceCount int              // 0 when unknown: contamination detection is off
 	backlog    []bpf.ProbeEvent // events held while the start was pending
-	metaChan   <-chan int       // piece count delivered after the race started; nil when none
 	dropped    *atomic.Int64    // events the coordinator dropped because the race fell behind
 }
 
@@ -74,10 +69,8 @@ func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, dow
 		// selfConnID is the connection record for our own piece completions
 		selfConnID int64
 
-		// pieceCount starts at t.pieceCount; metaChan may set it later.
 		// Zero means unknown: contamination detection is inactive.
 		pieceCount = t.pieceCount
-		metaChan   = t.metaChan
 
 		have                = make(map[int]bool)
 		downloadCompleted   bool
@@ -123,19 +116,103 @@ func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, dow
 		return nil
 	}
 
+	record := func(ev bpf.ProbeEvent) {
+		totalEvents++
+
+		var dbEvent storage.Event
+		dbEvent.RaceID = t.raceID
+
+		switch e := ev.(type) {
+		case *bpf.WeHaveEvent:
+			if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
+				contaminationCount[e.TorrentPtr]++
+				n := contaminationCount[e.TorrentPtr]
+				if n == contaminationThreshold {
+					t.logger.Error("CONTAMINATION: sustained we_have piece_index out of range",
+						"hash", t.hash, "race_id", t.raceID,
+						"piece_index", e.PieceIndex, "piece_count", pieceCount,
+						"torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr),
+						"count", n)
+					t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
+						fmt.Sprintf("we_have piece_index %d >= piece_count %d from torrent_ptr 0x%x (%d events)",
+							e.PieceIndex, pieceCount, e.TorrentPtr, n))
+				}
+				return
+			}
+			weHaveCount++
+			have[int(e.PieceIndex)] = true
+			dbEvent.EventType = storage.EventTypePieceReceived
+			dbEvent.ConnectionID = selfConnID
+			dbEvent.Timestamp = int64(e.Timestamp)
+			dbEvent.PieceIndex = int(e.PieceIndex)
+
+		case *bpf.IncomingHaveEvent:
+			if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
+				contaminationCount[e.ConnPtr]++
+				n := contaminationCount[e.ConnPtr]
+				if n == contaminationThreshold {
+					t.logger.Error("CONTAMINATION: sustained incoming_have piece_index out of range",
+						"hash", t.hash, "race_id", t.raceID,
+						"piece_index", e.PieceIndex, "piece_count", pieceCount,
+						"conn_ptr", fmt.Sprintf("0x%x", e.ConnPtr),
+						"count", n)
+					t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
+						fmt.Sprintf("incoming_have piece_index %d >= piece_count %d from conn_ptr 0x%x (%d events)",
+							e.PieceIndex, pieceCount, e.ConnPtr, n))
+				}
+				return
+			}
+			peerHaveCount++
+			connDBID, exists := connMap[e.ConnPtr]
+			if !exists {
+				connPtr := fmt.Sprintf("%x", e.ConnPtr)
+				connDBID, err = t.store.InsertConnection(ctx, t.raceID, connPtr, time.Now())
+				if err != nil {
+					t.logger.Warn("failed to insert connection", "error", err, "ptr", e.ConnPtr)
+					return
+				}
+				connMap[e.ConnPtr] = connDBID
+			}
+			dbEvent.EventType = storage.EventTypeHave
+			dbEvent.ConnectionID = connDBID
+			dbEvent.Timestamp = int64(e.Timestamp)
+			dbEvent.PieceIndex = int(e.PieceIndex)
+
+		default:
+			return
+		}
+
+		if time.Since(lastLogTime) >= logInterval {
+			t.logger.Debug("race stats",
+				"hash", t.hash,
+				"elapsed", time.Since(startTime).Round(time.Second),
+				"total_events", totalEvents,
+				"we_have", weHaveCount,
+				"peer_have", peerHaveCount,
+				"connections", len(connMap),
+				"pieces_done", len(have),
+				"download_completed", downloadCompleted)
+			lastLogTime = time.Now()
+		}
+
+		eventBatch = append(eventBatch, dbEvent)
+
+		if len(eventBatch) >= batchSize {
+			if err := flushEvents(); err != nil {
+				t.logger.Warn("failed to flush event batch", "error", err)
+			}
+		}
+	}
+
+	for _, ev := range t.backlog {
+		record(ev)
+	}
+	t.backlog = nil
+
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-
-		case pc, ok := <-metaChan:
-			metaChan = nil // one-shot: a closed channel is always ready, so stop selecting it
-			if ok {
-				pieceCount = pc
-				t.logger.Info("metadata resolved", "hash", t.hash, "piece_count", pieceCount)
-			} else {
-				t.logger.Debug(msgMetadataUnavailable, "hash", t.hash)
-			}
 
 		case <-maxTimer.C:
 			t.logger.Info("max duration reached", "hash", t.hash)
@@ -189,91 +266,7 @@ func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, dow
 				return t.finalize(ctx)
 			}
 
-			totalEvents++
-
-			var dbEvent storage.Event
-			dbEvent.RaceID = t.raceID
-
-			switch e := ev.(type) {
-			case *bpf.WeHaveEvent:
-				if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
-					contaminationCount[e.TorrentPtr]++
-					n := contaminationCount[e.TorrentPtr]
-					if n == contaminationThreshold {
-						t.logger.Error("CONTAMINATION: sustained we_have piece_index out of range",
-							"hash", t.hash, "race_id", t.raceID,
-							"piece_index", e.PieceIndex, "piece_count", pieceCount,
-							"torrent_ptr", fmt.Sprintf("0x%x", e.TorrentPtr),
-							"count", n)
-						t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
-							fmt.Sprintf("we_have piece_index %d >= piece_count %d from torrent_ptr 0x%x (%d events)",
-								e.PieceIndex, pieceCount, e.TorrentPtr, n))
-					}
-					continue
-				}
-				weHaveCount++
-				have[int(e.PieceIndex)] = true
-				dbEvent.EventType = storage.EventTypePieceReceived
-				dbEvent.ConnectionID = selfConnID
-				dbEvent.Timestamp = int64(e.Timestamp)
-				dbEvent.PieceIndex = int(e.PieceIndex)
-
-			case *bpf.IncomingHaveEvent:
-				if pieceCount > 0 && int(e.PieceIndex) >= pieceCount {
-					contaminationCount[e.ConnPtr]++
-					n := contaminationCount[e.ConnPtr]
-					if n == contaminationThreshold {
-						t.logger.Error("CONTAMINATION: sustained incoming_have piece_index out of range",
-							"hash", t.hash, "race_id", t.raceID,
-							"piece_index", e.PieceIndex, "piece_count", pieceCount,
-							"conn_ptr", fmt.Sprintf("0x%x", e.ConnPtr),
-							"count", n)
-						t.store.InsertRaceError(ctx, t.raceID, "piece_index_out_of_range",
-							fmt.Sprintf("incoming_have piece_index %d >= piece_count %d from conn_ptr 0x%x (%d events)",
-								e.PieceIndex, pieceCount, e.ConnPtr, n))
-					}
-					continue
-				}
-				peerHaveCount++
-				connDBID, exists := connMap[e.ConnPtr]
-				if !exists {
-					connPtr := fmt.Sprintf("%x", e.ConnPtr)
-					connDBID, err = t.store.InsertConnection(ctx, t.raceID, connPtr, time.Now())
-					if err != nil {
-						t.logger.Warn("failed to insert connection", "error", err, "ptr", e.ConnPtr)
-						continue
-					}
-					connMap[e.ConnPtr] = connDBID
-				}
-				dbEvent.EventType = storage.EventTypeHave
-				dbEvent.ConnectionID = connDBID
-				dbEvent.Timestamp = int64(e.Timestamp)
-				dbEvent.PieceIndex = int(e.PieceIndex)
-
-			default:
-				continue
-			}
-
-			if time.Since(lastLogTime) >= logInterval {
-				t.logger.Debug("race stats",
-					"hash", t.hash,
-					"elapsed", time.Since(startTime).Round(time.Second),
-					"total_events", totalEvents,
-					"we_have", weHaveCount,
-					"peer_have", peerHaveCount,
-					"connections", len(connMap),
-					"pieces_done", len(have),
-					"download_completed", downloadCompleted)
-				lastLogTime = time.Now()
-			}
-
-			eventBatch = append(eventBatch, dbEvent)
-
-			if len(eventBatch) >= batchSize {
-				if err := flushEvents(); err != nil {
-					t.logger.Warn("failed to flush event batch", "error", err)
-				}
-			}
+			record(ev)
 		}
 	}
 }
