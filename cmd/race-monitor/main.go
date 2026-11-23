@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -41,15 +42,18 @@ type Config struct {
 	WebUIURL     string `toml:"webui_url"`
 	WebUIUser    string `toml:"webui_user"`
 	WebUIPass    string `toml:"webui_pass"`
+	// SessionLoadWindow is how long after qBittorrent's process start a torrent
+	// start counts as restored by its session load.
+	SessionLoadWindow time.Duration `toml:"session_load_window"`
 }
 
-// getConfig reads configuration from $HOME/.config/race-monitor/config.toml.
-func getConfig() (binary, dbPath, dashboardURL, webuiURL, webuiUser, webuiPass string) {
+// readConfig reads $HOME/.config/race-monitor/config.toml over the defaults.
+func readConfig() Config {
 	home, _ := os.UserHomeDir()
 	configPath := filepath.Join(home, ".config", "race-monitor", "config.toml")
-	var cfg Config
-
-	cfg.RaceDB = filepath.Join(home, ".local", "share", "race-monitor", "races.db")
+	cfg := Config{
+		RaceDB: filepath.Join(home, ".local", "share", "race-monitor", "races.db"),
+	}
 
 	if _, err := os.Stat(configPath); err == nil {
 		if _, err := toml.DecodeFile(configPath, &cfg); err != nil {
@@ -57,7 +61,7 @@ func getConfig() (binary, dbPath, dashboardURL, webuiURL, webuiUser, webuiPass s
 		}
 	}
 
-	return cfg.Binary, cfg.RaceDB, cfg.DashboardURL, cfg.WebUIURL, cfg.WebUIUser, cfg.WebUIPass
+	return cfg
 }
 
 func ensureDBDir(dbPath string) error {
@@ -187,12 +191,12 @@ Config: ~/.config/race-monitor/config.toml
 
 	flagArgs := args[1:]
 
-	configBinary, dbPath, dashboardURL, webuiURL, webuiUser, webuiPass := getConfig()
+	cfg := readConfig()
 
 	fs := flag.NewFlagSet("race-monitor", flag.ExitOnError)
 	logLevel := fs.String("log-level", "info", "log level (trace, debug, info, warn, error)")
 	logFile := fs.String("log-file", "", "log file path (default: stderr)")
-	binary := fs.String("binary", configBinary, "path to qBittorrent binary")
+	binary := fs.String("binary", cfg.Binary, "path to qBittorrent binary")
 	detach := fs.Bool("detach", false, "run in background")
 	_ = fs.Parse(flagArgs)
 
@@ -267,11 +271,11 @@ Config: ~/.config/race-monitor/config.toml
 		"torrent_ptr_offset", offsets.TorrentPtrOffset)
 
 	// Ensure DB directory exists
-	if err := ensureDBDir(dbPath); err != nil {
+	if err := ensureDBDir(cfg.RaceDB); err != nil {
 		return fmt.Errorf("creating db directory: %w", err)
 	}
 
-	store, err := storage.New(dbPath)
+	store, err := storage.New(cfg.RaceDB)
 	if err != nil {
 		return fmt.Errorf("opening database: %w", err)
 	}
@@ -299,9 +303,9 @@ Config: ~/.config/race-monitor/config.toml
 
 	// Create enrichment API client (optional)
 	var enrichAPI race.EnrichmentAPI
-	if webuiURL != "" {
-		enrichAPI = newQBClient(webuiURL, webuiUser, webuiPass, qbResponseTimeout)
-		logger.Info("API enrichment enabled", "webui_url", webuiURL)
+	if cfg.WebUIURL != "" {
+		enrichAPI = newQBClient(cfg.WebUIURL, cfg.WebUIUser, cfg.WebUIPass, qbResponseTimeout)
+		logger.Info("API enrichment enabled", "webui_url", cfg.WebUIURL)
 	}
 
 	// Start eBPF capture with calibrated offsets for identity-based peer dedup
@@ -314,7 +318,7 @@ Config: ~/.config/race-monitor/config.toml
 		return fmt.Errorf("starting eBPF capture: %w", err)
 	}
 
-	coordinator := race.NewCoordinator(store, logger, dashboardURL, offsets, enrichAPI, handle)
+	coordinator := race.NewCoordinator(store, logger, cfg.DashboardURL, offsets, enrichAPI, handle)
 	return coordinator.Run(ctx, handle.Events)
 }
 

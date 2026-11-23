@@ -229,9 +229,6 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// enqueueEnrichment adds an IP to the enrichment queue and touches the sentinel
-// file to wake the enricher. Fire-and-forget: errors are silently ignored since
-// enrichment is best-effort and must not block the hot path.
 // StartError is an unidentified torrent start: one whose info hash read as all
 // zeros. It is recorded instead of a race.
 type StartError struct {
@@ -258,6 +255,9 @@ func (s *Store) InsertRaceError(ctx context.Context, raceID int64, errorType, me
 	}
 }
 
+// enqueueEnrichment adds an IP to the enrichment queue and touches the sentinel
+// file to wake the enricher. Fire-and-forget: errors are silently ignored since
+// enrichment is best-effort and must not block the hot path.
 func (s *Store) enqueueEnrichment(ctx context.Context, ip string) {
 	if ip == "" {
 		return
@@ -300,10 +300,10 @@ func (s *Store) CreateTorrent(ctx context.Context, infoHash, name string, size i
 
 // --- Race operations ---
 
-// CreateRace creates a new race record and returns its ID.
-// startKtime is the BPF ktime_get_ns timestamp from the torrent::start() event.
-// Pass 0 if no ktime is available (e.g. fallback race creation).
-func (s *Store) CreateRace(ctx context.Context, torrentID int64, startKtime int64) (int64, error) {
+// CreateRace creates a new race record and returns its ID. startedAt is when
+// the race's torrent started; startKtime is the BPF ktime_get_ns timestamp of
+// that torrent::start() event, or 0 if none is available.
+func (s *Store) CreateRace(ctx context.Context, torrentID int64, startKtime int64, startedAt time.Time) (int64, error) {
 	var result sql.Result
 	var err error
 	if startKtime > 0 {

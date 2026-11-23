@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/cehbz/race-monitor/internal/bpf"
@@ -32,6 +33,43 @@ func graceDuration(downloadElapsed time.Duration) time.Duration {
 		return graceMax
 	}
 	return d
+}
+
+// raceTracker records one race: the events held while its start was pending,
+// then live events, until it is finalized.
+type raceTracker struct {
+	store      *storage.Store
+	logger     *slog.Logger
+	hash       string
+	raceID     int64
+	startedAt  time.Time        // when the race's torrent started
+	pieceCount int              // 0 when unknown: contamination detection is off
+	backlog    []bpf.ProbeEvent // events held while the start was pending
+	dropped    *atomic.Int64    // events the coordinator dropped because the race fell behind
+}
+
+// run records the race until it is finalized, its events close or ctx ends.
+func (t *raceTracker) run(ctx context.Context, events <-chan bpf.ProbeEvent, downloadCompleteCh <-chan struct{}) error {
+	metaChan := make(chan int, 1)
+	if t.pieceCount > 0 {
+		metaChan <- t.pieceCount
+	}
+	close(metaChan)
+	return processEvents(ctx, t.store, t.logger, t.hash, t.raceID, metaChan, events, downloadCompleteCh)
+}
+
+// knownPieceCount takes a piece count already waiting on metaChan, so that it
+// applies to every event, and returns nil for a channel it has drained.
+func knownPieceCount(metaChan <-chan int) (int, <-chan int) {
+	select {
+	case pc, ok := <-metaChan:
+		if !ok {
+			return 0, nil
+		}
+		return pc, metaChan
+	default:
+		return 0, metaChan
+	}
 }
 
 // processEvents is the main event processing loop for a single race.
@@ -97,6 +135,7 @@ func processEvents(
 	)
 
 	defer maxTimer.Stop()
+	pieceCount, metaChan = knownPieceCount(metaChan)
 
 	// Create a "self" connection record for our piece completions
 	var err error

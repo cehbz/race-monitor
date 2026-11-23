@@ -2,7 +2,6 @@ package storage_test
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,7 +91,7 @@ func TestCreateRace(t *testing.T) {
 	t.Run("creates race with valid torrent", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "abc123hash", "Test.Torrent.2024", 1024*1024*1024, 1024)
 
-		id, err := store.CreateRace(ctx, torID, 0)
+		id, err := store.CreateRace(ctx, torID, 0, time.Now())
 		if err != nil {
 			t.Fatalf("failed to create race: %v", err)
 		}
@@ -104,9 +103,9 @@ func TestCreateRace(t *testing.T) {
 	t.Run("creates multiple races for same torrent", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "multi", "Multi", 100, 10)
 
-		id1, _ := store.CreateRace(ctx, torID, 0)
+		id1, _ := store.CreateRace(ctx, torID, 0, time.Now())
 		time.Sleep(2 * time.Millisecond) // ensure different started_at for UNIQUE constraint
-		id2, _ := store.CreateRace(ctx, torID, 0)
+		id2, _ := store.CreateRace(ctx, torID, 0, time.Now())
 
 		if id1 >= id2 {
 			t.Errorf("expected id1 < id2, got %d >= %d", id1, id2)
@@ -122,7 +121,7 @@ func TestGetRace(t *testing.T) {
 
 	t.Run("retrieves race with denormalized torrent data", func(t *testing.T) {
 		torID := createTestTorrent(t, store, "testhash", "Test.Torrent", 500, 50)
-		raceID, _ := store.CreateRace(ctx, torID, 0)
+		raceID, _ := store.CreateRace(ctx, torID, 0, time.Now())
 
 		race, err := store.GetRace(ctx, raceID)
 		if err != nil {
@@ -163,7 +162,7 @@ func TestCompleteRace(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID, 0)
+	raceID, _ := store.CreateRace(ctx, torID, 0, time.Now())
 
 	if err := store.CompleteRace(ctx, raceID); err != nil {
 		t.Fatalf("failed to complete race: %v", err)
@@ -194,7 +193,7 @@ func TestListRecentRaces(t *testing.T) {
 	t.Run("returns races within period", func(t *testing.T) {
 		for i, h := range []string{"h1", "h2", "h3"} {
 			torID := createTestTorrent(t, store, h, "Torrent"+h, int64((i+1)*100), (i+1)*10)
-			store.CreateRace(ctx, torID, 0)
+			store.CreateRace(ctx, torID, 0, time.Now())
 		}
 
 		races, err := store.ListRecentRaces(ctx, 7)
@@ -222,7 +221,7 @@ func TestInsertConnection(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID, 0)
+	raceID, _ := store.CreateRace(ctx, torID, 0, time.Now())
 	now := time.Now()
 
 	t.Run("inserts and returns ID", func(t *testing.T) {
@@ -260,7 +259,7 @@ func TestInsertPacketEvents(t *testing.T) {
 
 	ctx := context.Background()
 	torID := createTestTorrent(t, store, "hash", "Torrent", 100, 10)
-	raceID, _ := store.CreateRace(ctx, torID, 0)
+	raceID, _ := store.CreateRace(ctx, torID, 0, time.Now())
 	connID, _ := store.InsertConnection(ctx, raceID, "self", time.Now())
 
 	t.Run("inserts multiple events", func(t *testing.T) {
@@ -294,94 +293,23 @@ func TestInsertPacketEvents(t *testing.T) {
 	})
 }
 
-// seedRace creates a race for torrentID with one connection, one packet event
-// and one race error.
-func seedRace(t *testing.T, store *storage.Store, torrentID int64) int64 {
-	t.Helper()
+func TestRaceStartsWhenItsTorrentStarted(t *testing.T) {
+	pending(t)
+	store, cleanup := newTestStore(t)
+	defer cleanup()
 	ctx := context.Background()
-	raceID, err := store.CreateRace(ctx, torrentID, 1)
+
+	torID := createTestTorrent(t, store, "started_hash", "Started", 100, 10)
+	started := time.Now().Add(-45 * time.Second).Truncate(time.Millisecond)
+	raceID, err := store.CreateRace(ctx, torID, 1, started)
 	if err != nil {
 		t.Fatalf("create race: %v", err)
 	}
-	connID, err := store.InsertConnection(ctx, raceID, "self", time.Now())
+	r, err := store.GetRace(ctx, raceID)
 	if err != nil {
-		t.Fatalf("insert connection: %v", err)
+		t.Fatalf("get race: %v", err)
 	}
-	if err := store.InsertPacketEvents(ctx, []storage.Event{{
-		RaceID: raceID, ConnectionID: connID, Timestamp: 1,
-		EventType: storage.EventTypeHave, PieceIndex: 1,
-	}}); err != nil {
-		t.Fatalf("insert event: %v", err)
-	}
-	store.InsertRaceError(ctx, raceID, "test", "test")
-	return raceID
-}
-
-func countRaceRows(t *testing.T, store *storage.Store, table string, raceID int64) int {
-	t.Helper()
-	var n int
-	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE race_id = ?`, raceID).Scan(&n); err != nil {
-		t.Fatalf("count %s: %v", table, err)
-	}
-	return n
-}
-
-func TestDeleteRace_RemovesOwnedRowsAndTorrent(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	torrentID := createTestTorrent(t, store, "hash_a", "A", 1, 1)
-	raceID := seedRace(t, store, torrentID)
-
-	if err := store.DeleteRace(ctx, raceID); err != nil {
-		t.Fatalf("DeleteRace: %v", err)
-	}
-
-	for _, table := range []string{"packet_events", "connections", "race_errors"} {
-		if n := countRaceRows(t, store, table, raceID); n != 0 {
-			t.Errorf("%s has %d rows for the race, want 0", table, n)
-		}
-	}
-	if _, err := store.GetRace(ctx, raceID); !errors.Is(err, storage.ErrRaceNotFound) {
-		t.Errorf("GetRace err = %v, want ErrRaceNotFound", err)
-	}
-	var torrents int
-	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM torrents WHERE id = ?`, torrentID).Scan(&torrents); err != nil {
-		t.Fatalf("count torrents: %v", err)
-	}
-	if torrents != 0 {
-		t.Errorf("torrents row survived: %d", torrents)
-	}
-}
-
-func TestDeleteRace_KeepsTorrentOfOtherRaces(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-	ctx := context.Background()
-
-	torrentID := createTestTorrent(t, store, "hash_a", "A", 1, 1)
-	earlier := seedRace(t, store, torrentID)
-	time.Sleep(2 * time.Millisecond) // races are unique on (torrent_id, started_at ms)
-	raceID := seedRace(t, store, torrentID)
-
-	if err := store.DeleteRace(ctx, raceID); err != nil {
-		t.Fatalf("DeleteRace: %v", err)
-	}
-
-	if _, err := store.GetRace(ctx, raceID); !errors.Is(err, storage.ErrRaceNotFound) {
-		t.Errorf("GetRace err = %v, want ErrRaceNotFound", err)
-	}
-	r, err := store.GetRace(ctx, earlier)
-	if err != nil {
-		t.Fatalf("earlier race: %v", err)
-	}
-	if r.Name != "A" {
-		t.Errorf("earlier race torrent name = %q, want A", r.Name)
-	}
-	for _, table := range []string{"packet_events", "connections", "race_errors"} {
-		if n := countRaceRows(t, store, table, earlier); n != 1 {
-			t.Errorf("%s has %d rows for the earlier race, want 1", table, n)
-		}
+	if !r.StartedAt.Equal(started) {
+		t.Errorf("started_at = %v, want the torrent's start %v", r.StartedAt, started)
 	}
 }

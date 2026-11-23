@@ -41,7 +41,7 @@ func setupTrackerTest(t *testing.T, hash string) (*storage.Store, int64, func())
 		t.Fatalf("failed to create torrent: %v", err)
 	}
 
-	raceID, err := store.CreateRace(ctx, torID, 0)
+	raceID, err := store.CreateRace(ctx, torID, 0, time.Now())
 	if err != nil {
 		store.Close()
 		t.Fatalf("failed to create race: %v", err)
@@ -52,7 +52,7 @@ func setupTrackerTest(t *testing.T, hash string) (*storage.Store, int64, func())
 }
 
 // countingHandler counts log records carrying one message. It observes how
-// often a tracker code path ran through the logger processEvents already takes.
+// often a tracker code path ran through the logger the tracker already takes.
 type countingHandler struct {
 	msg string
 	n   atomic.Int64
@@ -66,48 +66,6 @@ func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
 		h.n.Add(1)
 	}
 	return nil
-}
-
-// TestProcessEvents_ClosedMetaChanNotReselected pins the fix for the select
-// spin: a metadata channel closed without a value is selected at most once.
-//
-// No clock is involved. events is unbuffered, so each accepted send proves one
-// more trip round the select. A closed channel that stays in the select is ready
-// on every trip, and select chooses uniformly among ready cases, so across 200
-// trips it fires at least about 100 times; firing at most once by chance has
-// probability around 2^-190.
-func TestProcessEvents_ClosedMetaChanNotReselected(t *testing.T) {
-	const hash = "closed_meta_test"
-	store, raceID, cleanup := setupTrackerTest(t, hash)
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	counter := &countingHandler{msg: msgMetadataUnavailable}
-	logger := slog.New(counter)
-
-	metaChan := make(chan int)
-	close(metaChan)
-	events := make(chan bpf.ProbeEvent)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- processEvents(ctx, store, logger, hash, raceID, metaChan, events, make(chan struct{}))
-	}()
-
-	const trips = 200
-	for i := range trips {
-		events <- &bpf.WeHaveEvent{PieceIndex: uint32(i), Timestamp: testTimestamp(time.Duration(i))}
-	}
-	close(events)
-
-	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
-	}
-	if got := counter.n.Load(); got > 1 {
-		t.Errorf("closed metadata channel selected %d times across %d loop trips, want at most 1", got, trips)
-	}
 }
 
 func TestGraceDuration(t *testing.T) {
@@ -136,7 +94,7 @@ func TestGraceDuration(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
+func TestTracker_WeHaveCreatesEvents(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "wehave_test")
 	defer cleanup()
 
@@ -149,7 +107,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "wehave_test", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "wehave_test", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send 3 we_have events for different pieces
@@ -165,7 +123,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// Verify all 3 we_have events were persisted as piece_received (event_type_id=2)
@@ -180,7 +138,7 @@ func TestProcessEvents_WeHaveCreatesEvents(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
+func TestTracker_IncomingHaveCreatesConnection(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "incoming_test")
 	defer cleanup()
 
@@ -193,7 +151,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "incoming_test", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "incoming_test", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send incoming_have events from two different peer connections
@@ -218,7 +176,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// Verify 2 peer connections created (0xdeadbeef + 0xcafebabe), plus "self"
@@ -244,7 +202,7 @@ func TestProcessEvents_IncomingHaveCreatesConnection(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_BatchFlush(t *testing.T) {
+func TestTracker_BatchFlush(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "batch_test")
 	defer cleanup()
 
@@ -257,7 +215,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "batch_test", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "batch_test", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send 150 events — first 100 should trigger a batch flush, remainder
@@ -272,7 +230,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// Verify all 150 events were persisted (batch flush at 100 + final flush of 50)
@@ -287,7 +245,7 @@ func TestProcessEvents_BatchFlush(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_ContextCancellation(t *testing.T) {
+func TestTracker_ContextCancellation(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "cancel_test")
 	defer cleanup()
 
@@ -299,10 +257,10 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "cancel_test", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "cancel_test", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
-	// Send one event so processEvents is active
+	// Send one event so the tracker is active
 	events <- &bpf.WeHaveEvent{
 		PieceIndex: 0,
 		Timestamp:  testTimestamp(0),
@@ -317,11 +275,11 @@ func TestProcessEvents_ContextCancellation(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(3 * time.Second):
-		t.Fatal("processEvents did not exit on context cancellation")
+		t.Fatal("tracker did not exit on context cancellation")
 	}
 }
 
-func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
+func TestTracker_DownloadCompleteSignal(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "downloadcomplete_test")
 	defer cleanup()
 
@@ -334,7 +292,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "downloadcomplete_test", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "downloadcomplete_test", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send some events
@@ -349,7 +307,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// Verify race was finalized
@@ -362,7 +320,7 @@ func TestProcessEvents_DownloadCompleteSignal(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
+func TestTracker_UnknownEventTypeIgnored(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "unknown_type")
 	defer cleanup()
 
@@ -375,7 +333,7 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "unknown_type", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "unknown_type", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send a TorrentFinishedEvent — the tracker only handles WeHave and
@@ -394,11 +352,11 @@ func TestProcessEvents_UnknownEventTypeIgnored(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 }
 
-func TestProcessEvents_ContaminationDetected(t *testing.T) {
+func TestTracker_ContaminationDetected(t *testing.T) {
 	const pieceCount = 100
 	store, raceID, cleanup := setupTrackerTest(t, "contamination_test")
 	defer cleanup()
@@ -413,14 +371,9 @@ func TestProcessEvents_ContaminationDetected(t *testing.T) {
 	var logBuf strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	// Pre-load pieceCount into a buffered channel so it's available immediately
-	metaChan := make(chan int, 1)
-	metaChan <- pieceCount
-	close(metaChan)
-
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "contamination_test", raceID, metaChan, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "contamination_test", raceID: raceID, startedAt: time.Now(), pieceCount: pieceCount}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Send valid events
@@ -453,7 +406,7 @@ func TestProcessEvents_ContaminationDetected(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// Verify ERROR was logged for both contamination sources at threshold
@@ -503,84 +456,7 @@ func TestProcessEvents_ContaminationDetected(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_MetadataArrivesMidRace(t *testing.T) {
-	const pieceCount = 50
-	store, raceID, cleanup := setupTrackerTest(t, "meta_midrace")
-	defer cleanup()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	events := make(chan bpf.ProbeEvent, 200)
-	downloadCompleteCh := make(chan struct{}, 1)
-
-	var logBuf strings.Builder
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	// Metadata channel — we'll send pieceCount mid-race
-	metaChan := make(chan int, 1)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- processEvents(ctx, store, logger, "meta_midrace", raceID, metaChan, events, downloadCompleteCh)
-	}()
-
-	// Send out-of-range events BEFORE metadata arrives — should be accepted
-	// (pieceCount == 0, validation inactive)
-	for i := 0; i < 5; i++ {
-		events <- &bpf.WeHaveEvent{
-			PieceIndex: uint32(100 + i),
-			Timestamp:  testTimestamp(time.Duration(i) * time.Millisecond),
-		}
-	}
-
-	// Allow events to be processed
-	time.Sleep(50 * time.Millisecond)
-
-	// Now deliver metadata
-	metaChan <- pieceCount
-	close(metaChan)
-
-	// Allow metadata to be processed
-	time.Sleep(50 * time.Millisecond)
-
-	// Send out-of-range events AFTER metadata — should be dropped
-	for i := 0; i < 5; i++ {
-		events <- &bpf.WeHaveEvent{
-			PieceIndex: uint32(200 + i),
-			Timestamp:  testTimestamp(time.Duration(10+i) * time.Millisecond),
-			TorrentPtr: 0xddd,
-		}
-	}
-
-	// Send a valid event
-	events <- &bpf.WeHaveEvent{PieceIndex: 1, Timestamp: testTimestamp(20 * time.Millisecond)}
-
-	close(events)
-
-	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
-	}
-
-	// Verify: 5 pre-metadata events + 1 valid post-metadata event = 6 persisted
-	var eventCount int
-	err := store.DB().QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM packet_events WHERE race_id = ?", raceID).Scan(&eventCount)
-	if err != nil {
-		t.Fatalf("failed to count events: %v", err)
-	}
-	if eventCount != 6 {
-		t.Errorf("expected 6 persisted events (5 pre-meta + 1 valid post-meta), got %d", eventCount)
-	}
-
-	// Verify "metadata resolved" was logged
-	logOutput := logBuf.String()
-	if !strings.Contains(logOutput, "metadata resolved") {
-		t.Errorf("expected 'metadata resolved' log, got: %s", logOutput)
-	}
-}
-
-func TestProcessEvents_GraceTimerTerminates(t *testing.T) {
+func TestTracker_GraceTimerTerminates(t *testing.T) {
 	// Verify that the grace timer fires and terminates the race even when
 	// events keep arriving (the old idle timer would reset and never fire).
 	store, raceID, cleanup := setupTrackerTest(t, "grace_terminates")
@@ -595,7 +471,7 @@ func TestProcessEvents_GraceTimerTerminates(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "grace_terminates", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "grace_terminates", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Establish a peer connection before download completes
@@ -631,7 +507,7 @@ func TestProcessEvents_GraceTimerTerminates(t *testing.T) {
 	select {
 	case err := <-errCh:
 		if err != nil {
-			t.Fatalf("processEvents returned error: %v", err)
+			t.Fatalf("tracker returned error: %v", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("race did not terminate — grace timer failed to fire")
@@ -648,7 +524,7 @@ func TestProcessEvents_GraceTimerTerminates(t *testing.T) {
 	}
 }
 
-func TestProcessEvents_EventsRecordedDuringGrace(t *testing.T) {
+func TestTracker_EventsRecordedDuringGrace(t *testing.T) {
 	store, raceID, cleanup := setupTrackerTest(t, "grace_events")
 	defer cleanup()
 
@@ -661,7 +537,7 @@ func TestProcessEvents_EventsRecordedDuringGrace(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- processEvents(ctx, store, logger, "grace_events", raceID, nil, events, downloadCompleteCh)
+		errCh <- (&raceTracker{store: store, logger: logger, hash: "grace_events", raceID: raceID, startedAt: time.Now()}).run(ctx, events, downloadCompleteCh)
 	}()
 
 	// Establish peer + send pre-completion event
@@ -685,7 +561,7 @@ func TestProcessEvents_EventsRecordedDuringGrace(t *testing.T) {
 	close(events)
 
 	if err := <-errCh; err != nil {
-		t.Fatalf("processEvents returned error: %v", err)
+		t.Fatalf("tracker returned error: %v", err)
 	}
 
 	// All 3 events from 0xaaa should be persisted (1 pre + 2 during grace)
@@ -709,7 +585,7 @@ func TestFinalize(t *testing.T) {
 
 	ctx := context.Background()
 	torID, _ := store.CreateTorrent(ctx, "finalize_test", "Finalize.Test", 500, 50)
-	raceID, _ := store.CreateRace(ctx, torID, 0)
+	raceID, _ := store.CreateRace(ctx, torID, 0, time.Now())
 
 	logger := trackerTestLogger()
 

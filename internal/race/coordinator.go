@@ -486,7 +486,7 @@ func (c *Coordinator) startRace(ctx context.Context, infoHash string, torrentPtr
 		return
 	}
 
-	raceID, err := c.store.CreateRace(ctx, torrentID, int64(startKtime))
+	raceID, err := c.store.CreateRace(ctx, torrentID, int64(startKtime), time.Now())
 	if err != nil {
 		c.logger.Error("failed to create race record", "hash", infoHash, "error", err)
 		return

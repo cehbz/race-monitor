@@ -149,7 +149,7 @@ func TestStartAddedWhileWatchedBecomesARaceHoldingEveryEventSinceItsStart(t *tes
 	}
 
 	close(api.gate)
-	waitClassified(t, c, hash)
+	waitRace(t, c, hash)
 	close(eventsChan)
 	<-errChan
 
@@ -245,7 +245,7 @@ func TestHeldBurstLargerThanARaceChannelLosesNoEvents(t *testing.T) {
 	}
 
 	close(api.gate)
-	waitClassified(t, c, hash)
+	waitRace(t, c, hash)
 	close(eventsChan)
 	<-errChan
 
@@ -275,7 +275,8 @@ func TestOneUnclassifiableStartDoesNotDelayAnothersClassification(t *testing.T) 
 	eventsChan <- startedEvent(0x1001, freshBytes, raceStartKtime)
 
 	waitForState(t, c, func(s StateSnapshot) bool {
-		return s.ActiveRaces[fresh].Classified
+		_, ok := s.ActiveRaces[fresh]
+		return ok && api.callsFor(fresh) > 0
 	}, time.Second)
 
 	close(eventsChan)

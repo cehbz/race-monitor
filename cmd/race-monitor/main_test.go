@@ -6,9 +6,10 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
-func TestGetConfig(t *testing.T) {
+func TestReadConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	origHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
@@ -64,7 +65,8 @@ dashboard_url = "http://localhost:9999"`,
 				os.Remove(configPath)
 			}
 
-			gotBinary, gotRaceDB, gotDashboard, _, _, _ := getConfig()
+			cfg := readConfig()
+			gotBinary, gotRaceDB, gotDashboard := cfg.Binary, cfg.RaceDB, cfg.DashboardURL
 
 			if gotBinary != tt.wantBinary {
 				t.Errorf("binary = %q, want %q", gotBinary, tt.wantBinary)
@@ -79,13 +81,14 @@ dashboard_url = "http://localhost:9999"`,
 	}
 }
 
-func TestGetConfigNoFile(t *testing.T) {
+func TestReadConfigNoFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	origHome := os.Getenv("HOME")
 	os.Setenv("HOME", tmpDir)
 	defer os.Setenv("HOME", origHome)
 
-	gotBinary, gotRaceDB, gotDashboard, _, _, _ := getConfig()
+	cfg := readConfig()
+	gotBinary, gotRaceDB, gotDashboard := cfg.Binary, cfg.RaceDB, cfg.DashboardURL
 
 	if gotBinary != "" {
 		t.Errorf("binary = %q, want empty", gotBinary)
@@ -106,5 +109,26 @@ func TestRequestedStopExitsCleanlyAndQBittorrentDyingExitsWithAnError(t *testing
 	died := fmt.Errorf("target qBittorrent process (PID %d) exited", 1338)
 	if err := stopResult(died); err == nil {
 		t.Error("qBittorrent dying: run returns nil, want an error")
+	}
+}
+
+func TestSessionLoadWindowDefaultsToTenSecondsAndIsReadFromTheConfig(t *testing.T) {
+	pending(t)
+	tmpDir := t.TempDir()
+	t.Setenv("HOME", tmpDir)
+
+	if got := readConfig().SessionLoadWindow; got != 10*time.Second {
+		t.Errorf("session load window without a config = %v, want 10s", got)
+	}
+
+	configDir := filepath.Join(tmpDir, ".config", "race-monitor")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("create config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(`session_load_window = "30s"`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if got := readConfig().SessionLoadWindow; got != 30*time.Second {
+		t.Errorf("session load window from the config = %v, want 30s", got)
 	}
 }
