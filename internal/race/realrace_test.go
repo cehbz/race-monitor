@@ -246,10 +246,16 @@ func TestHeldBurstLargerThanARaceChannelLosesNoEvents(t *testing.T) {
 
 	close(api.gate)
 	waitRace(t, c, hash)
+	raceID := onlyRaceID(t, store)
+	n := countPieceReceivedEvents(store, ctx, raceID)
+	for deadline := time.Now().Add(15 * time.Second); n < burst && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+		n = countPieceReceivedEvents(store, ctx, raceID)
+	}
 	close(eventsChan)
 	<-errChan
 
-	if n := countPieceReceivedEvents(store, ctx, onlyRaceID(t, store)); n != burst {
+	if n != burst {
 		t.Errorf("our piece events = %d, want %d", n, burst)
 	}
 }
