@@ -56,6 +56,7 @@ Offsets cached by binary SHA256. Re-running `race-calibrate` is only needed afte
 3. Events stream in: the coordinator routes `we_have` by torrent pointer and `incoming_have` by peer connection pointer to the race's tracker. An event arriving when the race's 10,000-event channel is full is dropped and counted: the first drop is logged, and the race records the count as one `events_dropped` race error when it is finalized.
 4. `torrent::finished()` fires: with no peer seen, the race is finalized at once; otherwise the tracker starts a grace period of 50% of download duration, clamped to [5s, 60s], which never resets.
 5. Grace timer expires, or 30 minutes pass: the race is finalized and BPF dedup maps are cleaned for peer/torrent rediscovery.
+6. race-monitor stops, requested or because its event source closed: every race is finalized once its tracker has written the events it holds. The stop waits for that, bounded by systemd's stop timeout.
 
 ## Enrichment Pipeline
 

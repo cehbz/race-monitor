@@ -299,11 +299,9 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 			cause := context.Cause(ctx)
 			c.logger.Info("coordinator shutting down", "cause", cause)
 			c.discardPending()
-			// ctx is done, so the trackers are waited for on a context that isn't.
+			// ctx is done, so the start error counts are written on a context that isn't.
 			c.writeStartErrorCounts(context.WithoutCancel(ctx))
-			if err := c.waitForTrackerCompletions(context.WithoutCancel(ctx)); err != nil {
-				return err
-			}
+			c.waitForTrackerCompletions()
 			return cause
 
 		case complete := <-c.completeChan:
@@ -320,7 +318,8 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 				c.logger.Info("event channel closed")
 				c.discardPending()
 				c.writeStartErrorCounts(ctx)
-				return c.waitForTrackerCompletions(ctx)
+				c.waitForTrackerCompletions()
+				return nil
 			}
 			switch e := ev.(type) {
 			case *bpf.WeHaveEvent:
@@ -648,7 +647,9 @@ func (c *Coordinator) startRace(ctx context.Context, p *pendingStart, meta Torre
 		"torrent_ptr", fmt.Sprintf("0x%x", p.torrentPtr), "held_events", len(p.events))
 	c.notifyDashboard(raceID)
 
-	raceCtx, cancel := context.WithCancel(ctx)
+	// The tracker outlives Run's context: a stop closes its channel and waits
+	// for it to write what it holds; cancel is for the race's own end.
+	raceCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	state := &raceState{
 		eventChan:          make(chan bpf.ProbeEvent, c.raceEventCap),
 		hash:               p.hash,
@@ -869,33 +870,23 @@ func (c *Coordinator) routeEvent(state *raceState, event bpf.ProbeEvent) {
 	}
 }
 
-// waitForTrackerCompletions closes all race channels, waits for the trackers to
-// flush and exit (up to 500ms per race), then returns.
-func (c *Coordinator) waitForTrackerCompletions(ctx context.Context) error {
-	n := len(c.infoHashToRaceState)
-	cancels := make([]context.CancelFunc, 0, n)
-	for _, state := range c.infoHashToRaceState {
-		cancels = append(cancels, state.cancel)
-	}
-	for hash, state := range c.infoHashToRaceState {
+// waitForTrackerCompletions closes every race's channel and waits for each
+// tracker to write the events it holds, finalize its race and report. It has
+// no timeout of its own: systemd's stop timeout bounds a stop that hangs.
+func (c *Coordinator) waitForTrackerCompletions() {
+	states := c.infoHashToRaceState
+	c.infoHashToRaceState = make(map[string]*raceState)
+	for hash, state := range states {
 		close(state.eventChan)
 		c.logger.Debug("closed race tracker", "hash", hash)
 	}
-	c.infoHashToRaceState = make(map[string]*raceState)
-
-	for range n {
-		select {
-		case <-c.completeChan:
-			continue
-		case <-time.After(500 * time.Millisecond):
-			for _, cancel := range cancels {
-				cancel()
-			}
-			c.logger.Warn("shutdown timeout waiting for trackers, forcing exit")
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+	for range states {
+		complete := <-c.completeChan
+		if complete.err != nil {
+			c.logger.Error("race tracking failed", "hash", complete.hash, "error", complete.err)
 		}
 	}
-	return nil
+	for _, state := range states {
+		state.cancel()
+	}
 }

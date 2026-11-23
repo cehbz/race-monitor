@@ -475,7 +475,6 @@ func keepHeldRace(t *testing.T, ctx context.Context, burst int, n int) (*storage
 }
 
 func TestRequestedStopEndsEachRaceOnceEveryEventItReceivedIsWritten(t *testing.T) {
-	pending(t)
 	const burst = 5000
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -494,7 +493,6 @@ func TestRequestedStopEndsEachRaceOnceEveryEventItReceivedIsWritten(t *testing.T
 }
 
 func TestEventSourceClosingEndsEachRaceOnceEveryEventItReceivedIsWritten(t *testing.T) {
-	pending(t)
 	const burst = 30000 // takes longer than a second to write
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
