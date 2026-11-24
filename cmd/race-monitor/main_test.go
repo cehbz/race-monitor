@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 )
 
 func TestReadConfig(t *testing.T) {
@@ -108,25 +107,5 @@ func TestRequestedStopExitsCleanlyAndQBittorrentDyingExitsWithAnError(t *testing
 	died := fmt.Errorf("target qBittorrent process (PID %d) exited", 1338)
 	if err := stopResult(died); err == nil {
 		t.Error("qBittorrent dying: run returns nil, want an error")
-	}
-}
-
-func TestSessionLoadWindowDefaultsToTenSecondsAndIsReadFromTheConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("HOME", tmpDir)
-
-	if got := readConfig().SessionLoadWindow; got != 10*time.Second {
-		t.Errorf("session load window without a config = %v, want 10s", got)
-	}
-
-	configDir := filepath.Join(tmpDir, ".config", "race-monitor")
-	if err := os.MkdirAll(configDir, 0755); err != nil {
-		t.Fatalf("create config dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(`session_load_window = "30s"`), 0644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	if got := readConfig().SessionLoadWindow; got != 30*time.Second {
-		t.Errorf("session load window from the config = %v, want 30s", got)
 	}
 }

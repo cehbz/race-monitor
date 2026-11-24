@@ -17,9 +17,9 @@ import (
 	"github.com/cehbz/race-monitor/internal/storage"
 )
 
-// Model-level tests for recording only real races: session load, pending
-// starts, per-start classification, race timing, dropped events and
-// unidentified starts.
+// Model-level tests for recording only real races: pending starts,
+// per-start classification, race timing, dropped events, unidentified starts,
+// stops and reused torrent addresses.
 
 // settle gives Run time to take every queued event before a state assertion.
 const settle = 200 * time.Millisecond
@@ -87,37 +87,6 @@ func waitRaceCompleted(t *testing.T, store *storage.Store, raceID int64, timeout
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func TestStartDuringSessionLoadIsRestoredWithoutAskingTheAPI(t *testing.T) {
-	srv, notifies := dashboardCounter(t)
-	api := &fakeEnrichAPI{answer: answerNew(100)}
-	c, store := newClassifyCoordinator(t, nil, srv.URL, api, nil)
-	c.SetSessionLoad(testBoot.Add(8*time.Second), 10*time.Second) // start at +8.7 s
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	eventsChan, errChan := startRun(c, ctx)
-
-	hashBytes, _ := testInfoHash(301)
-	eventsChan <- startedEvent(0x1000, hashBytes, raceStartKtime)
-	sendWeHaves(eventsChan, 0x1000, 5)
-	time.Sleep(settle)
-
-	if n := len(c.QueryState().ActiveRaces); n != 0 {
-		t.Errorf("active races = %d, want 0", n)
-	}
-	if n := api.distinctHashes(); n != 0 {
-		t.Errorf("API asked about %d torrents, want 0", n)
-	}
-	assertNoRaceRows(t, store)
-	if n := notifies.Load(); n != 0 {
-		t.Errorf("dashboard notified %d times, want 0", n)
-	}
-
-	close(eventsChan)
-	<-errChan
-	assertNoRaceRows(t, store)
 }
 
 func TestStartAddedWhileWatchedBecomesARaceHoldingEveryEventSinceItsStart(t *testing.T) {
@@ -278,31 +247,22 @@ func TestOneUnclassifiableStartDoesNotDelayAnothersClassification(t *testing.T) 
 	<-errChan
 }
 
-func TestWithoutTheAPIEveryStartOutsideASessionLoadIsARaceAtOnce(t *testing.T) {
+func TestWithoutTheAPIEveryStartIsARaceAtOnce(t *testing.T) {
 	c, store := newClassifyCoordinator(t, nil, "", nil, nil)
-	c.SetSessionLoad(testBoot.Add(8*time.Second), 10*time.Second) // load ends at +18 s
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	eventsChan, errChan := startRun(c, ctx)
 
-	insideBytes, inside := testInfoHash(308)
-	outsideBytes, outside := testInfoHash(309)
-	eventsChan <- startedEvent(0x1000, insideBytes, raceStartKtime)                         // +8.7 s
-	eventsChan <- startedEvent(0x1001, outsideBytes, raceStartKtime+uint64(20*time.Second)) // +28.7 s
+	firstBytes, first := testInfoHash(308)
+	laterBytes, later := testInfoHash(309)
+	eventsChan <- startedEvent(0x1000, firstBytes, raceStartKtime)
+	eventsChan <- startedEvent(0x1001, laterBytes, laterStart)
 
-	snap := waitForState(t, c, func(s StateSnapshot) bool {
-		_, ok := s.ActiveRaces[outside]
-		return ok
-	}, 3*time.Second)
-	time.Sleep(settle)
-	snap = c.QueryState()
-
-	if _, ok := snap.ActiveRaces[inside]; ok {
-		t.Error("start during the session load became a race")
-	}
-	if n := countRows(t, store, "races"); n != 1 {
-		t.Errorf("races has %d rows, want 1", n)
+	waitRace(t, c, first)
+	waitRace(t, c, later)
+	if n := countRows(t, store, "races"); n != 2 {
+		t.Errorf("races has %d rows, want 2", n)
 	}
 
 	close(eventsChan)
