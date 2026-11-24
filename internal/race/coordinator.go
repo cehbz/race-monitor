@@ -130,12 +130,11 @@ type EnrichmentAPI interface {
 	FetchTorrentMeta(hash string) (TorrentMeta, error)
 }
 
-// SeenCache allows the coordinator to manage BPF dedup map entries.
-// When a race completes, stale entries are removed so peers and torrents
-// can be rediscovered if they appear in a future race.
+// SeenCache is the BPF peer dedup, which emits a peer's struct dump once per
+// torrent address. A torrent's start forgets its address's peers, so a peer
+// an earlier torrent at the address had is seen again.
 type SeenCache interface {
-	ForgetPeer(torrentPtr uint64, endpoint netip.AddrPort) error
-	ForgetTorrent(ptr uint64) error
+	ForgetPeersAt(torrentPtr uint64) error
 }
 
 // Coordinator manages race lifecycle using eBPF events from libtorrent uprobes.
@@ -165,9 +164,6 @@ type Coordinator struct {
 	// unidentified maps torrent_ptr → unidentified start.
 	unidentified map[uint64]*unidentifiedStart
 
-	// knownTorrentPtrs tracks all torrent* pointers we've seen.
-	knownTorrentPtrs map[uint64]bool
-
 	// connToRace maps peer_connection* → info_hash for incoming_have routing.
 	connToRace map[uint64]string
 
@@ -190,9 +186,7 @@ type Coordinator struct {
 	// verdictChan carries the classifiers' verdicts back to Run.
 	verdictChan chan raceVerdict
 
-	// seenCache manages BPF dedup map entries. Nil when not available
-	// (e.g., in tests). Used to clean up seen_peers and seen_torrents
-	// entries when races complete, enabling rediscovery.
+	// seenCache is the BPF peer dedup; nil when not available (e.g., in tests).
 	seenCache SeenCache
 
 	// ktimeToWall converts a BPF event timestamp to wall-clock time.
@@ -206,8 +200,7 @@ type Coordinator struct {
 }
 
 // NewCoordinator creates a race coordinator with pre-calibrated offsets.
-// seenCache is optional (nil in tests); when provided, BPF dedup maps are
-// cleaned up on race completion to enable peer/torrent rediscovery.
+// seenCache is optional (nil in tests).
 func NewCoordinator(
 	store *storage.Store,
 	logger *slog.Logger,
@@ -224,7 +217,6 @@ func NewCoordinator(
 		infoHashToRaceState: make(map[string]*raceState),
 		torrentPtrs:         make(map[uint64]string),
 		unidentified:        make(map[uint64]*unidentifiedStart),
-		knownTorrentPtrs:    make(map[uint64]bool),
 		connToRace:          make(map[uint64]string),
 		connEndpoints:       make(map[uint64]netip.AddrPort),
 		completeChan:        make(chan raceComplete, 10),
@@ -334,8 +326,6 @@ func (c *Coordinator) Run(ctx context.Context, events <-chan bpf.ProbeEvent) err
 				c.handleTorrentFinished(dbCtx, e)
 			case *bpf.TorrentStartedEvent:
 				c.handleTorrentStarted(dbCtx, e)
-			case *bpf.TorrentDetailsEvent:
-				c.handleTorrentDetails(e)
 			case *bpf.PeerDetailsEvent:
 				c.handlePeerDetails(dbCtx, e)
 			}
@@ -366,14 +356,7 @@ type unidentifiedStart struct {
 // makes the start pending, or a race at once when there is no API to classify it.
 func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentStartedEvent) {
 	ptr := e.TorrentPtr
-
-	// Skip duplicate start events for the same torrent_ptr
-	if _, known := c.torrentPtrs[ptr]; known {
-		return
-	}
-	if _, known := c.unidentified[ptr]; known {
-		return
-	}
+	c.releaseAddress(ctx, ptr)
 
 	hashBytes, ok := ExtractInfoHash(e.Data, c.offsets.InfoHashOffset)
 	if !ok {
@@ -386,10 +369,10 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 		return
 	}
 	hash := hex.EncodeToString(hashBytes)
-	if _, exists := c.infoHashToRaceState[hash]; exists {
-		return
-	}
-	if _, exists := c.pending[hash]; exists {
+	_, racing := c.infoHashToRaceState[hash]
+	_, pending := c.pending[hash]
+	if racing || pending {
+		c.mapTorrentPtr(ptr, hash) // a repeated start of the same torrent
 		return
 	}
 	p := &pendingStart{
@@ -410,6 +393,22 @@ func (c *Coordinator) handleTorrentStarted(ctx context.Context, e *bpf.TorrentSt
 	c.pending[hash] = p
 	c.logger.Debug("torrent started, classifying", "hash", hash, "torrent_ptr", fmt.Sprintf("0x%x", ptr))
 	go c.classify(c.classifyCtx, hash, p.startedAt)
+}
+
+// releaseAddress frees a torrent address for the torrent starting at it: an
+// earlier torrent there was removed, so whatever held the address lets go of
+// it and the peers seen at it are forgotten.
+func (c *Coordinator) releaseAddress(ctx context.Context, ptr uint64) {
+	if u, ok := c.unidentified[ptr]; ok {
+		c.writeStartErrorCount(ctx, u)
+		delete(c.unidentified, ptr)
+	}
+	delete(c.torrentPtrs, ptr)
+	if c.seenCache != nil {
+		if err := c.seenCache.ForgetPeersAt(ptr); err != nil {
+			c.logger.Warn("failed to forget peers at torrent address", "torrent_ptr", fmt.Sprintf("0x%x", ptr), "error", err)
+		}
+	}
 }
 
 func isZeroHash(b []byte) bool {
@@ -447,28 +446,6 @@ func (c *Coordinator) writeStartErrorCounts(ctx context.Context) {
 	for _, u := range c.unidentified {
 		c.writeStartErrorCount(ctx, u)
 	}
-}
-
-// handleTorrentDetails registers a torrent_ptr → info_hash mapping from
-// a we_have torrent struct dump. This handles torrents that were already active
-// before the daemon started (torrent_start already fired before we attached).
-func (c *Coordinator) handleTorrentDetails(e *bpf.TorrentDetailsEvent) {
-	ptr := e.TorrentPtr
-	if _, known := c.torrentPtrs[ptr]; known {
-		return
-	}
-	if _, ok := c.unidentified[ptr]; ok {
-		return
-	}
-
-	hashBytes, ok := ExtractInfoHash(e.Data, c.offsets.InfoHashOffset)
-	if !ok {
-		return
-	}
-	hash := hex.EncodeToString(hashBytes)
-	c.mapTorrentPtr(ptr, hash)
-	c.logger.Debug("registered torrent_ptr from we_have dump",
-		"ptr", fmt.Sprintf("0x%x", ptr), "hash", hash)
 }
 
 // handlePeerDetails extracts torrent_ptr, sockaddr_in, and peer_id from
@@ -770,7 +747,6 @@ func (c *Coordinator) handleTorrentFinished(ctx context.Context, e *bpf.TorrentF
 // mapTorrentPtr records a torrent_ptr → info_hash mapping.
 func (c *Coordinator) mapTorrentPtr(ptr uint64, hash string) {
 	c.torrentPtrs[ptr] = hash
-	c.knownTorrentPtrs[ptr] = true
 }
 
 // handleComplete processes a race tracker completion signal.
@@ -786,61 +762,13 @@ func (c *Coordinator) handleComplete(complete raceComplete) {
 	c.forgetTorrent(complete.hash)
 }
 
-// forgetTorrent removes hash's routing and its BPF dedup entries, so its peers
-// and torrent can be rediscovered.
+// forgetTorrent removes hash's routing.
 func (c *Coordinator) forgetTorrent(hash string) {
-	// Collect torrent pointers for this race (needed for BPF cleanup)
-	var raceTorrentPtrs []uint64
 	for ptr, h := range c.torrentPtrs {
 		if h == hash {
-			raceTorrentPtrs = append(raceTorrentPtrs, ptr)
+			delete(c.torrentPtrs, ptr)
 		}
 	}
-
-	// Clean up BPF seen_peers entries for connections in this race.
-	// Reconstruct the BPF key from (torrent_ptr, endpoint) so the peer
-	// can be rediscovered if it appears in a future race.
-	if c.seenCache != nil && len(raceTorrentPtrs) > 0 {
-		var forgetCount int
-		for ptr, h := range c.connToRace {
-			if h != hash {
-				continue
-			}
-			endpoint, hasEndpoint := c.connEndpoints[ptr]
-			if !hasEndpoint {
-				continue
-			}
-			// Try each torrent pointer — normally there's only one per race
-			for _, tPtr := range raceTorrentPtrs {
-				if err := c.seenCache.ForgetPeer(tPtr, endpoint); err == nil {
-					forgetCount++
-				}
-			}
-		}
-
-		// Clean up BPF seen_torrents entries
-		for _, tPtr := range raceTorrentPtrs {
-			if err := c.seenCache.ForgetTorrent(tPtr); err != nil {
-				c.logger.Debug("failed to forget torrent in BPF map",
-					"ptr", fmt.Sprintf("0x%x", tPtr), "error", err)
-			}
-		}
-
-		if forgetCount > 0 {
-			c.logger.Debug("cleaned up BPF dedup entries",
-				"hash", hash,
-				"peers_forgotten", forgetCount,
-				"torrents_forgotten", len(raceTorrentPtrs))
-		}
-	}
-
-	// Clean up torrentPtrs and knownTorrentPtrs for the completed race
-	for _, ptr := range raceTorrentPtrs {
-		delete(c.torrentPtrs, ptr)
-		delete(c.knownTorrentPtrs, ptr)
-	}
-
-	// Clean up connToRace and connEndpoints for this race
 	for ptr, h := range c.connToRace {
 		if h == hash {
 			delete(c.connToRace, ptr)

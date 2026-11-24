@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -131,38 +130,38 @@ type ProbeConfig struct {
 
 // CaptureHandle wraps the event channel and BPF map handles returned by Capture.
 type CaptureHandle struct {
-	Events       <-chan bpf.ProbeEvent
-	seenPeers    *ebpf.Map
-	seenTorrents *ebpf.Map
+	Events    <-chan bpf.ProbeEvent
+	seenPeers *ebpf.Map
 }
 
-// ForgetPeer deletes a peer identity from the BPF seen_peers dedup map,
-// allowing the peer to be rediscovered if it appears in a future race.
-func (h *CaptureHandle) ForgetPeer(torrentPtr uint64, endpoint netip.AddrPort) error {
+// ForgetPeersAt deletes every seen_peers dedup entry of a torrent address,
+// so a peer that an earlier torrent at the address had emits a struct dump
+// again. A seen_peers key (struct peer_key, 16 bytes) starts with the
+// torrent pointer as a native little-endian u64.
+func (h *CaptureHandle) ForgetPeersAt(torrentPtr uint64) error {
 	if h.seenPeers == nil {
 		return nil
 	}
-	// Build key matching BPF struct peer_key layout (16 bytes):
-	//   u64 torrent_ptr (native LE)
-	//   u32 ip          (raw sin_addr bytes, network byte order)
-	//   u16 port        (raw sin_port bytes, network byte order)
-	//   u16 _pad        (zero)
-	var key [16]byte
-	binary.LittleEndian.PutUint64(key[0:], torrentPtr)
-	ip4 := endpoint.Addr().As4()
-	copy(key[8:12], ip4[:])
-	binary.BigEndian.PutUint16(key[12:14], endpoint.Port())
-	// key[14:16] already zero (padding)
-	return h.seenPeers.Delete(key[:])
-}
-
-// ForgetTorrent deletes a torrent pointer from the BPF seen_torrents dedup map,
-// allowing the torrent to emit a new struct dump if it restarts.
-func (h *CaptureHandle) ForgetTorrent(ptr uint64) error {
-	if h.seenTorrents == nil {
-		return nil
+	var (
+		key   [16]byte
+		value uint8
+		stale [][16]byte
+	)
+	iter := h.seenPeers.Iterate()
+	for iter.Next(&key, &value) {
+		if binary.LittleEndian.Uint64(key[0:8]) == torrentPtr {
+			stale = append(stale, key)
+		}
 	}
-	return h.seenTorrents.Delete(ptr)
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterating seen_peers: %w", err)
+	}
+	for _, k := range stale {
+		if err := h.seenPeers.Delete(k[:]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("deleting seen_peers entry: %w", err)
+		}
+	}
+	return nil
 }
 
 // Capture attaches eBPF uprobes to the qBittorrent binary and returns a
@@ -412,8 +411,7 @@ func Capture(ctx context.Context, logger *slog.Logger, binPath string, pid int, 
 	}()
 
 	return &CaptureHandle{
-		Events:       eventChan,
-		seenPeers:    objs.SeenPeers,
-		seenTorrents: objs.SeenTorrents,
+		Events:    eventChan,
+		seenPeers: objs.SeenPeers,
 	}, nil
 }

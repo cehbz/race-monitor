@@ -503,3 +503,182 @@ func TestEventSourceClosingEndsEachRaceOnceEveryEventItReceivedIsWritten(t *test
 		t.Error("race not finalized at the stop")
 	}
 }
+
+// detailsEvent is the struct dump a torrent's first piece completion yields
+// when its start wasn't seen or its routing was forgotten.
+// laterStart is a start a minute after raceStart, and laterDate its torrent's
+// whole-second addition date.
+var (
+	laterStart = raceStartKtime + uint64(time.Minute)
+	laterDate  = testKtimeClock(laterStart).Truncate(time.Second)
+)
+
+func detailsEvent(ptr uint64, hash []byte) *bpf.TorrentDetailsEvent {
+	ev := &bpf.TorrentDetailsEvent{TorrentPtr: ptr, Timestamp: raceStartKtime}
+	copy(ev.Data[classifyHashOffset:classifyHashOffset+20], hash)
+	return ev
+}
+
+func TestStartAtTheAddressOfARemovedRestoredTorrentBecomesARace(t *testing.T) {
+	restoredBytes, restored := testInfoHash(315)
+	addedBytes, added := testInfoHash(316)
+	api := &fakeEnrichAPI{answer: func(hash string, _ int) (TorrentMeta, error) {
+		if hash == restored {
+			return TorrentMeta{Name: "Restored", AddedAt: restoredDate}, nil
+		}
+		return TorrentMeta{Name: "Added", PieceCount: 100, AddedAt: laterDate}, nil
+	}}
+	c, store := newClassifyCoordinator(t, nil, "", api, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eventsChan, errChan := startRun(c, ctx)
+
+	// A restored torrent at 0x1000, still completing pieces after its verdict.
+	const torrentPtr = uint64(0x1000)
+	eventsChan <- startedEvent(torrentPtr, restoredBytes, raceStartKtime)
+	deadline := time.Now().Add(3 * time.Second)
+	for api.callsFor(restored) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(settle)
+	eventsChan <- detailsEvent(torrentPtr, restoredBytes)
+	time.Sleep(settle)
+
+	// It is removed, and a torrent added later reuses its address.
+	eventsChan <- startedEvent(torrentPtr, addedBytes, laterStart)
+	sendWeHaves(eventsChan, torrentPtr, 7)
+	waitForState(t, c, func(s StateSnapshot) bool {
+		_, ok := s.ActiveRaces[added]
+		return ok
+	}, 3*time.Second)
+
+	close(eventsChan)
+	<-errChan
+
+	if n := countPieceReceivedEvents(store, context.Background(), onlyRaceID(t, store)); n != 7 {
+		t.Errorf("added torrent's piece events = %d, want 7", n)
+	}
+}
+
+func TestStartAtTheAddressOfAnUnidentifiedStartBecomesARace(t *testing.T) {
+	api := &fakeEnrichAPI{answer: answerAlways(laterDate)}
+	c, store := newClassifyCoordinator(t, nil, "", api, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eventsChan, errChan := startRun(c, ctx)
+
+	const torrentPtr = uint64(0x3000)
+	eventsChan <- startedEvent(torrentPtr, make([]byte, 20), raceStartKtime)
+	sendWeHaves(eventsChan, torrentPtr, 3)
+
+	addedBytes, added := testInfoHash(317)
+	eventsChan <- startedEvent(torrentPtr, addedBytes, laterStart)
+	sendWeHaves(eventsChan, torrentPtr, 7)
+	waitForState(t, c, func(s StateSnapshot) bool {
+		_, ok := s.ActiveRaces[added]
+		return ok
+	}, 3*time.Second)
+
+	close(eventsChan)
+	<-errChan
+
+	if n := countPieceReceivedEvents(store, context.Background(), onlyRaceID(t, store)); n != 7 {
+		t.Errorf("added torrent's piece events = %d, want 7", n)
+	}
+	got, err := store.ListStartErrors(context.Background())
+	if err != nil {
+		t.Fatalf("list start errors: %v", err)
+	}
+	if len(got) != 1 || got[0].EventCount != 3 {
+		t.Errorf("start errors = %+v, want one with 3 events", got)
+	}
+}
+
+func TestStartAtTheAddressOfARaceWhoseTorrentWasRemovedBecomesARace(t *testing.T) {
+	firstBytes, first := testInfoHash(318)
+	laterBytes, later := testInfoHash(319)
+	api := &fakeEnrichAPI{answer: func(hash string, _ int) (TorrentMeta, error) {
+		if hash == first {
+			return TorrentMeta{Name: "First", PieceCount: 100, AddedAt: newDate}, nil
+		}
+		return TorrentMeta{Name: "Later", PieceCount: 100, AddedAt: laterDate}, nil
+	}}
+	c, store := newClassifyCoordinator(t, nil, "", api, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eventsChan, errChan := startRun(c, ctx)
+
+	// A race's torrent at 0x1000 is removed mid-race, and a torrent added
+	// later reuses its address.
+	const torrentPtr = uint64(0x1000)
+	eventsChan <- startedEvent(torrentPtr, firstBytes, raceStartKtime)
+	waitRace(t, c, first)
+	eventsChan <- startedEvent(torrentPtr, laterBytes, laterStart)
+	sendWeHaves(eventsChan, torrentPtr, 7)
+	waitRace(t, c, later)
+
+	close(eventsChan)
+	<-errChan
+
+	var laterID int64
+	if err := store.DB().QueryRow(`SELECT r.id FROM races r JOIN torrents t ON t.id = r.torrent_id WHERE t.info_hash = ?`, later).Scan(&laterID); err != nil {
+		t.Fatalf("later torrent's race: %v", err)
+	}
+	if n := countPieceReceivedEvents(store, context.Background(), laterID); n != 7 {
+		t.Errorf("later torrent's piece events = %d, want 7", n)
+	}
+}
+
+func TestTorrentStartForgetsThePeersSeenAtItsAddress(t *testing.T) {
+	seen := &fakeSeenCache{}
+	c, _ := newClassifyCoordinator(t, nil, "", &fakeEnrichAPI{answer: answerNew(100)}, seen)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eventsChan, errChan := startRun(c, ctx)
+
+	hashBytes, _ := testInfoHash(320)
+	eventsChan <- startedEvent(0x1000, hashBytes, raceStartKtime)
+	eventsChan <- startedEvent(0x3000, make([]byte, 20), raceStartKtime)
+	time.Sleep(settle)
+
+	close(eventsChan)
+	<-errChan
+
+	got := map[uint64]bool{}
+	for _, p := range seen.forgotten() {
+		got[p] = true
+	}
+	if !got[0x1000] || !got[0x3000] {
+		t.Errorf("peers forgotten at %#x, want 0x1000 and 0x3000", seen.forgotten())
+	}
+}
+
+func TestRepeatedStartOfARacesTorrentKeepsItsRaceRecording(t *testing.T) {
+	c, store := newClassifyCoordinator(t, nil, "", &fakeEnrichAPI{answer: answerNew(100)}, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	eventsChan, errChan := startRun(c, ctx)
+
+	hashBytes, hash := testInfoHash(321)
+	const torrentPtr = uint64(0x1000)
+	eventsChan <- startedEvent(torrentPtr, hashBytes, raceStartKtime)
+	waitRace(t, c, hash)
+	eventsChan <- startedEvent(torrentPtr, hashBytes, raceStartKtime+uint64(time.Second))
+	sendWeHaves(eventsChan, torrentPtr, 7)
+	time.Sleep(settle)
+
+	close(eventsChan)
+	<-errChan
+
+	if n := countRows(t, store, "races"); n != 1 {
+		t.Errorf("races has %d rows, want 1", n)
+	}
+	if n := countPieceReceivedEvents(store, context.Background(), onlyRaceID(t, store)); n != 7 {
+		t.Errorf("race's piece events = %d, want 7", n)
+	}
+}

@@ -617,9 +617,6 @@ func TestMapTorrentPtr(t *testing.T) {
 	if hash, ok := c.torrentPtrs[0x1234]; !ok || hash != "testhash" {
 		t.Error("expected torrent_ptr mapping to be recorded")
 	}
-	if !c.knownTorrentPtrs[0x1234] {
-		t.Error("expected knownTorrentPtrs to be set")
-	}
 }
 
 // --- Integration tests (Run in goroutine) ---

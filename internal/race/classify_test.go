@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"log/slog"
-	"net/netip"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -85,25 +84,23 @@ func answerAlways(addedAt time.Time) func(string, int) (TorrentMeta, error) {
 	}
 }
 
-// fakeSeenCache records BPF dedup removals.
+// fakeSeenCache records the addresses whose seen peers were forgotten.
 type fakeSeenCache struct {
-	mu       sync.Mutex
-	peers    []netip.AddrPort
-	torrents []uint64
+	mu      sync.Mutex
+	forgots []uint64
 }
 
-func (f *fakeSeenCache) ForgetPeer(_ uint64, endpoint netip.AddrPort) error {
+func (f *fakeSeenCache) ForgetPeersAt(torrentPtr uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.peers = append(f.peers, endpoint)
+	f.forgots = append(f.forgots, torrentPtr)
 	return nil
 }
 
-func (f *fakeSeenCache) ForgetTorrent(ptr uint64) error {
+func (f *fakeSeenCache) forgotten() []uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.torrents = append(f.torrents, ptr)
-	return nil
+	return append([]uint64(nil), f.forgots...)
 }
 
 func testInfoHash(i int) ([]byte, string) {
