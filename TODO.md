@@ -5,3 +5,4 @@
 - `race-enricher`'s ipapi.is lookups mostly fail: 350 this boot and 4,077 the last. Most are refused connections, with some 429s from the 30-a-day free limit. 60 are a parse error, since `company` can arrive as a string where `ipAPIResponse` expects an object.
 - `torrent::start` can produce an all-zero info hash (races 716 and 794, and again at the Nov 17 boot), cause unknown; such a start is now a `start_errors` row with its struct dump. Races 716 and 794, recorded before that, are still in the DB (716 holds 173,112 unidentified events).
 - Move the probes from the perf buffer to a BPF ring buffer (`BPF_MAP_TYPE_RINGBUF`): it keeps events in order across CPUs, which would remove the cross-CPU interleaving the contamination threshold tolerates, and loses fewer events in a burst.
+- Enrich the self row: enqueue `our_ip` for enrichment, since no connection carries it.
